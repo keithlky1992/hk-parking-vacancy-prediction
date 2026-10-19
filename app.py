@@ -82,11 +82,15 @@ if st.button("查詢較易泊車的地方"):
         if not result_df.empty:
             st.subheader("建議")
             top = result_df.iloc[0]
-            st.write(f"建議優先考慮 **{top['名稱']}**（{top['地區']}），預計約有 {top['預測空位']} 個空位。")
+            name = top["名稱"]
+            district_name = top["地區"]
+            vacancy = top["預測空位"]
             
-            if top["預測空位"] > 50:
-                st.success("空位較充足，較易泊車。")
-            elif top["預測空位"] > 10:
-                st.info("可能有空位，建議盡快前往。")
+            if vacancy > 50:
+                suggestion = f"根據目前預測，{district_name}的「{name}」在 {hour}:00 左右預計仍有較多空位（約 {vacancy} 個），相對容易找到車位，建議可優先考慮前往。"
+            elif vacancy > 10:
+                suggestion = f"{district_name}的「{name}」預計約有 {vacancy} 個空位。雖然不算很多，但仍有機會，建議盡快前往確認。"
             else:
-                st.warning("空位可能較少，建議考慮其他選擇。")
+                suggestion = f"目前預測 {district_name}的「{name}」空位較少（約 {vacancy} 個），可能較難泊車。建議考慮清單中的其他停車場，或稍後再查詢。"
+            
+            st.write(suggestion)
