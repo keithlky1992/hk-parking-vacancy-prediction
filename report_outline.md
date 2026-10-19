@@ -44,7 +44,7 @@
 - **Limited temporal coverage**: Only ~2 days of data so far. Patterns may not generalize to weekdays, holidays, or different weather conditions.
 - **Collection gaps**: Data collection depends on a continuously running Jupyter notebook. Overnight or when the computer sleeps, gaps appear (visible in the heatmap).
 - **Scope limitation**: Only car park vacancy (not individual on-street metered spaces). Results should not be claimed as covering all parking in the districts.
-- **Feature completeness**: Weather data has been tested but not yet systematically joined into the feature table for model training.
+- **Weather integration**: Temperature has been joined and shown slight MAE improvement (10.73 → 10.40). Rainfall and warning signals are collected but not yet used in models. More weather variation is needed for stronger impact.
 - **Model simplicity**: Current models use basic time and location features. More advanced time-series models or external event data were not included due to time constraints.
 - **Evaluation**: With short data period, the time-based split still has limited diversity; longer collection will improve reliability of MAE and F1.
 
