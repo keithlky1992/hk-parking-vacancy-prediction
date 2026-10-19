@@ -5,7 +5,7 @@ from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.preprocessing import LabelEncoder
 
 st.title("香港停車場空位預測")
-st.write("觀塘區 + 沙田區｜私家車")
+st.write("全港 18 區")
 
 @st.cache_data
 def load_data():
@@ -23,9 +23,9 @@ def load_data():
 
 df = load_data()
 
-hour = st.slider("選擇小時", 0, 23, 19)
+hour = st.slider("查詢時間", 0, 23, 19)
 dow = st.selectbox("星期", ["週一", "週二", "週三", "週四", "週五", "週六", "週日"], index=0)
-district = st.selectbox("選擇地區", ["全部", "觀塘區", "沙田區"])
+district = st.selectbox("選擇地區", ["全部"] + sorted(df["district"].dropna().unique().tolist()))
 dow_num = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"].index(dow)
 
 if st.button("查詢較易泊車的地方"):
@@ -58,8 +58,13 @@ if st.button("查詢較易泊車的地方"):
             })
         
         result_df = pd.DataFrame(results).sort_values("預測空位", ascending=False).head(10)
-        st.success(f"{dow} {hour}:00 {district} 較易泊車的停車場（前 10 名）")
-        st.dataframe(result_df, use_container_width=True)
+        st.success(f"{dow} {hour}:00 {district} 較易泊車的停車場")
+        st.dataframe(result_df, use_container_width=True, hide_index=True)
+        
+        # 加入橫向長條圖
+        st.subheader("預測空位比較")
+        chart_df = result_df.set_index("名稱")["預測空位"].sort_values()
+        st.bar_chart(chart_df, horizontal=True)
         
         # 加入簡單建議
         if not result_df.empty:
