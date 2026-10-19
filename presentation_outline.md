@@ -27,8 +27,10 @@
 
 ### Slide 5: Demo
 
-- Streamlit interface screenshot or live demo
-- Example recommendation
+- Streamlit interface with hour, day of week, and district selection
+- Shows top 10 car parks with predicted vacancies
+- Provides simple recommendation text
+- Example screenshot or live demo
 
 ### Slide 6: Limitations & Future Work
 
