@@ -55,3 +55,15 @@ if st.button("查詢較易泊車的地方"):
         result_df = pd.DataFrame(results).sort_values("預測空位", ascending=False).head(10)
         st.success(f"{dow} {hour}:00 較易泊車的停車場（前 10 名）")
         st.dataframe(result_df, use_container_width=True)
+        
+        # 加入簡單建議
+        st.subheader("建議")
+        top = result_df.iloc[0]
+        st.write(f"建議優先考慮 **{top['名稱']}**（{top['地區']}），預計約有 {top['預測空位']} 個空位。")
+        
+        if top["預測空位"] > 50:
+            st.success("空位較充足，較易泊車。")
+        elif top["預測空位"] > 10:
+            st.info("可能有空位，建議盡快前往。")
+        else:
+            st.warning("空位可能較少，建議考慮其他選擇。")
