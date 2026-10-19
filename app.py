@@ -25,11 +25,11 @@ df = load_data()
 
 hour = st.slider("選擇小時", 0, 23, 19)
 dow = st.selectbox("星期", ["週一", "週二", "週三", "週四", "週五", "週六", "週日"], index=0)
+district = st.selectbox("選擇地區", ["全部", "觀塘區", "沙田區"])
 dow_num = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"].index(dow)
 
 if st.button("查詢較易泊車的地方"):
     with st.spinner("正在預測..."):
-        # 簡單模型訓練（每次查詢時訓練，數據量小可接受）
         le = LabelEncoder()
         df["park_code"] = le.fit_transform(df["park_id"])
         
@@ -40,9 +40,14 @@ if st.button("查詢較易泊車的地方"):
         model = GradientBoostingRegressor(random_state=42, n_estimators=50)
         model.fit(X, y)
         
-        # 預測所有停車場
+        # 根據地區過濾
+        if district != "全部":
+            df_filtered = df[df["district"] == district]
+        else:
+            df_filtered = df
+        
         results = []
-        for park_id in df["park_id"].unique():
+        for park_id in df_filtered["park_id"].unique():
             park_code = le.transform([park_id])[0]
             pred = model.predict([[hour, dow_num, park_code]])[0]
             info = df[df["park_id"] == park_id].iloc[0]
@@ -53,17 +58,18 @@ if st.button("查詢較易泊車的地方"):
             })
         
         result_df = pd.DataFrame(results).sort_values("預測空位", ascending=False).head(10)
-        st.success(f"{dow} {hour}:00 較易泊車的停車場（前 10 名）")
+        st.success(f"{dow} {hour}:00 {district} 較易泊車的停車場（前 10 名）")
         st.dataframe(result_df, use_container_width=True)
         
         # 加入簡單建議
-        st.subheader("建議")
-        top = result_df.iloc[0]
-        st.write(f"建議優先考慮 **{top['名稱']}**（{top['地區']}），預計約有 {top['預測空位']} 個空位。")
-        
-        if top["預測空位"] > 50:
-            st.success("空位較充足，較易泊車。")
-        elif top["預測空位"] > 10:
-            st.info("可能有空位，建議盡快前往。")
-        else:
-            st.warning("空位可能較少，建議考慮其他選擇。")
+        if not result_df.empty:
+            st.subheader("建議")
+            top = result_df.iloc[0]
+            st.write(f"建議優先考慮 **{top['名稱']}**（{top['地區']}），預計約有 {top['預測空位']} 個空位。")
+            
+            if top["預測空位"] > 50:
+                st.success("空位較充足，較易泊車。")
+            elif top["預測空位"] > 10:
+                st.info("可能有空位，建議盡快前往。")
+            else:
+                st.warning("空位可能較少，建議考慮其他選擇。")
