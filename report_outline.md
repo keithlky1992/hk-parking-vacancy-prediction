@@ -21,17 +21,23 @@
 
 ### 4. Methodology
 
-- ETL + SQLite
-- Baseline: same weekday + same hour average
-- Models: Gradient Boosting (regression + classification)
-- Features: hour, day of week, park_id, district
-- GenAI: suggestion text generation
+- Data collection: Automated polling of Transport Department API every ~10 minutes, stored in SQLite (`vacancy_records` and `carparks` tables).
+- Scope: 149 car parks in 觀塘區 and 沙田區, private cars only.
+- Baseline: Historical average vacancy by park_id + hour + day of week.
+- Models:
+  - Gradient Boosting Regressor for vacancy count prediction
+  - Gradient Boosting Classifier for has_vacancy (vacancy > 0)
+- Features used: hour, day of week, is_weekend, park_id (encoded), district (encoded)
+- Evaluation: Time-based train/test split (70/30), MAE for regression, F1 for classification.
+- GenAI component: Rule-based suggestion text generation (to be enhanced with LLM later).
 
 ### 5. Analysis and Discussion
 
-- Results: MAE, F1
-- Visualizations: trends, heatmap
-- Insights: ...
+- Current data: ~3100+ records over 2 days.
+- Regression test MAE: ~10.73 (better than baseline ~17.84)
+- Classification F1: ~0.957
+- Visualizations produced: vacancy trend lines, district-hour heatmap, top-5 recommendation bar chart.
+- Observation: Night-time average vacancy higher than afternoon; Sha Tin shows higher night vacancy than Kwun Tong in current data.
 
 ### 6. Challenges and Limitations
 
