@@ -50,10 +50,14 @@
 
 ### 7. Future Work
 
-- Longer data collection
-- Weather + holiday features
-- Better interface / dashboard
-- ...
+- Continue data collection for at least 1–2 weeks to capture weekday/weekend and different weather patterns.
+- Systematically integrate weather features (temperature, rainfall, warning signals) from HKO API into the feature table and retrain models.
+- Add public holiday and special event flags.
+- Improve collection reliability (e.g., move from notebook loop to a scheduled script or cloud job).
+- Develop a simple web interface or Streamlit dashboard for the “今晚 7 點邊度較易泊？” query.
+- Enhance GenAI component: use an LLM to generate more natural, context-aware suggestions based on model output and confidence.
+- Explore classification of vacancy levels (low / medium / high) in addition to binary and regression.
+- Conduct error analysis on cases where the model performs poorly.
 
 ### 8. Conclusion
 
