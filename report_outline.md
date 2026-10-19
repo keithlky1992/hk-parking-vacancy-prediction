@@ -41,10 +41,12 @@
 
 ### 6. Challenges and Limitations
 
-- Limited data collection period
-- Collection gaps (notebook dependency)
-- Not real-time on-street meters
-- Weather features not yet fully integrated
+- **Limited temporal coverage**: Only ~2 days of data so far. Patterns may not generalize to weekdays, holidays, or different weather conditions.
+- **Collection gaps**: Data collection depends on a continuously running Jupyter notebook. Overnight or when the computer sleeps, gaps appear (visible in the heatmap).
+- **Scope limitation**: Only car park vacancy (not individual on-street metered spaces). Results should not be claimed as covering all parking in the districts.
+- **Feature completeness**: Weather data has been tested but not yet systematically joined into the feature table for model training.
+- **Model simplicity**: Current models use basic time and location features. More advanced time-series models or external event data were not included due to time constraints.
+- **Evaluation**: With short data period, the time-based split still has limited diversity; longer collection will improve reliability of MAE and F1.
 
 ### 7. Future Work
 
