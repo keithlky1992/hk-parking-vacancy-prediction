@@ -11,7 +11,7 @@ st.write("全港 18 區")
 def load_data():
     conn = sqlite3.connect("parking.db")
     df = pd.read_sql_query("""
-        SELECT v.park_id, v.vacancy, v.collected_at, c.name, c.district
+        SELECT v.park_id, v.vacancy, v.collected_at, c.name, c.district, c.latitude, c.longitude
         FROM vacancy_records v
         LEFT JOIN carparks c ON v.park_id = c.park_id
     """, conn)
@@ -61,10 +61,22 @@ if st.button("查詢較易泊車的地方"):
         st.success(f"{dow} {hour}:00 {district} 較易泊車的停車場")
         st.dataframe(result_df, use_container_width=True, hide_index=True)
         
-        # 加入橫向長條圖
-        st.subheader("預測空位比較")
-        chart_df = result_df.set_index("名稱")["預測空位"].sort_values()
-        st.bar_chart(chart_df, horizontal=True)
+        # # 加入地圖
+        # st.subheader("地圖位置")
+        # map_df = result_df.merge(
+        #     df[["name", "latitude", "longitude"]].drop_duplicates(),
+        #     left_on="名稱",
+        #     right_on="name",
+        #     how="left"
+        # )
+        # map_df = map_df.dropna(subset=["latitude", "longitude"])
+        # if not map_df.empty:
+        #     st.map(map_df[["latitude", "longitude"]], size=20)
+        
+        # # 加入橫向長條圖
+        # st.subheader("預測空位比較")
+        # chart_df = result_df.set_index("名稱")["預測空位"].sort_values()
+        # st.bar_chart(chart_df, horizontal=True)
         
         # 加入簡單建議
         if not result_df.empty:
