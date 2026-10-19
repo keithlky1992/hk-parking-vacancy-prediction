@@ -27,14 +27,14 @@
 - Models:
   - Gradient Boosting Regressor for vacancy count prediction
   - Gradient Boosting Classifier for has_vacancy (vacancy > 0)
-- Features used: hour, day of week, is_weekend, park_id (encoded), district (encoded)
+- Features used: hour, day of week, is_weekend, park_id (encoded), district (encoded), temperature
 - Evaluation: Time-based train/test split (70/30), MAE for regression, F1 for classification.
 - GenAI component: Rule-based suggestion text generation (to be enhanced with LLM later).
 
 ### 5. Analysis and Discussion
 
 - Current data: ~3100+ records over 2 days.
-- Regression test MAE: ~10.73 (better than baseline ~17.84)
+- Regression test MAE: ~10.40 (with temperature feature; previously ~10.73 without weather)
 - Classification F1: ~0.957
 - Visualizations produced: vacancy trend lines, district-hour heatmap, top-5 recommendation bar chart.
 - Observation: Night-time average vacancy higher than afternoon; Sha Tin shows higher night vacancy than Kwun Tong in current data.
