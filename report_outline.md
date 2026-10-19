@@ -33,7 +33,7 @@
 
 ### 5. Analysis and Discussion
 
-- Current data: ~3100+ records over 2 days.
+- Current data: ~4800 vacancy records and 6 weather records over 2 days.
 - Regression test MAE: ~10.40 (with temperature feature; previously ~10.73 without weather)
 - Classification F1: ~0.957
 - Visualizations produced: vacancy trend lines, district-hour heatmap, top-5 recommendation bar chart.
