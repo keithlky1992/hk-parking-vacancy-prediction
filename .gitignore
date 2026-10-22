@@ -2,8 +2,11 @@
 .env
 .env.*
 
-# Local / temporary
-.tmp_video/
+# Local / temporary (PDF／影片截圖等暫存，唔提交)
+.tmp_*/
+.tmp_*
+*.tmp
+.cursor/
 
 # Database (rebuild via collect.ipynb)
 parking.db
