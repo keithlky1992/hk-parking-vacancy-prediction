@@ -56,6 +56,16 @@ DISTRICT_SUBDISTRICTS: dict[str, dict[str, list[str]]] = {
     },
     "黃大仙區": {
         "黃大仙": ["黃大仙", "竹園", "雙鳳", "東頭"],
+        "彩雲／牛池灣": [
+            "彩雲(二)邨",
+            "彩雲邨",
+            "彩雲商場",
+            "彩雲A",
+            "彩雲B",
+            "牛池灣公園",
+            "牛池灣",
+            "彩雲",
+        ],
         "鑽石山": ["鑽石山", "鳳德"],
         "新蒲崗": ["新蒲崗", "AIRSIDE", "寶光", "五芳街"],
         "樂富": ["樂富", "橫頭磡"],
@@ -153,6 +163,9 @@ LOCATION_ALIASES: dict[str, str] = {
     "將軍澳": "將軍澳",
     "TKO": "將軍澳",
     "調景嶺": "將軍澳",
+    "彩雲": "彩雲／牛池灣",
+    "彩雲邨": "彩雲／牛池灣",
+    "牛池灣": "彩雲／牛池灣",
 }
 
 
@@ -317,5 +330,21 @@ def normalize_location_intent(raw: str | None) -> tuple[str, str]:
     hits = list(dict.fromkeys(hits))
     if len(hits) == 1:
         return "sub_district", hits[0]
+
+    # 長地址／geocode 結果（例如「香港新界天水圍」）內含已知子區名 → 取最長命中
+    contained_subs = [n for n in sub_names if n and n in text]
+    if contained_subs:
+        best = max(contained_subs, key=len)
+        return "sub_district", best
+
+    # 「彩雲邨」「牛池灣」等別名出現在長字串中
+    contained_aliases = [alias for alias in LOCATION_ALIASES if alias and alias in text]
+    if contained_aliases:
+        best_alias = max(contained_aliases, key=len)
+        return "sub_district", LOCATION_ALIASES[best_alias]
+
+    contained_districts = [n for n in districts if n and n in text]
+    if contained_districts:
+        return "district", max(contained_districts, key=len)
 
     return "unknown", text

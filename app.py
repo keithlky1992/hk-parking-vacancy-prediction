@@ -23,9 +23,9 @@ from zoneinfo import ZoneInfo
 from pyflac import StreamEncoder
 
 from sub_districts import (
+    all_district_names,
+    all_sub_district_names,
     ensure_carpark_sub_districts,
-    normalize_location_intent,
-    sub_district_prompt_summary,
 )
 
 WEEKDAY_CN = {0: "週一", 1: "週二", 2: "週三", 3: "週四", 4: "週五", 5: "週六", 6: "週日"}
@@ -50,6 +50,8 @@ CN_NUM = {
 }
 NUM_CN = {1: "一", 2: "兩", 3: "三", 4: "四", 5: "五", 6: "六", 7: "七", 8: "八", 9: "九", 10: "十"}
 DEFAULT_TOP_N = 10
+# 暫時隱藏預測建議書面文字；朗讀掣／自動播仍然保留。改 True 即可恢復顯示
+SHOW_WRITTEN_SUGGESTION = False
 
 load_dotenv()
 
@@ -71,6 +73,37 @@ DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
 # Google STT 需要 FLAC；不用 speech_recognition 內建的 x86_64 flac-mac。
 GOOGLE_STT_URL = "http://www.google.com/speech-api/v2/recognize"
 GOOGLE_STT_KEY = "AIzaSyBOti4mM-6x9WDnZIjIeyEU21OpBXqWBgw"
+
+# Google Maps Geocoding：用地名定位，再篩附近停車場。
+# 港九密度高，「附近」用較細半徑，避免 3km 內遠區大車場（如 AIRSIDE）蓋過目標地點門口車場。
+GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
+GOOGLE_GEOCODE_URL = "https://maps.googleapis.com/maps/api/geocode/json"
+NEARBY_RADIUS_KM = 1.2
+NEARBY_RADIUS_FALLBACK_KM = 2.0
+# 地標「附近」排序：空位 ÷ (1+距離)^冪，較近車場優先
+NEARBY_DISTANCE_SCORE_POWER = 2.0
+# 極近且名稱實質相同 → 視為同一停車場（運輸署常有兩套 park_id）
+EQUIVALENT_CARPARK_MAX_KM = 0.06
+
+# 政府停車場 API：基本資料（含收費規則）
+CARPARK_INFO_VACANCY_URL = "https://api.data.gov.hk/v1/carpark-info-vacancy"
+DOW_TO_EN = {
+    0: "MON",
+    1: "TUE",
+    2: "WED",
+    3: "THU",
+    4: "FRI",
+    5: "SAT",
+    6: "SUN",
+}
+DAY_CN_TO_EN = {name: DOW_TO_EN[num] for num, name in WEEKDAY_CN.items()}
+DAYNIGHT_FEE_LABEL = {
+    "day-park": "日泊",
+    "night-park": "夜泊",
+    "6-hours-park": "6小時",
+    "12-hours-park": "12小時",
+    "24-hours-park": "24小時",
+}
 
 
 def _pcm_from_audio(audio: dict) -> tuple[np.ndarray, int]:
@@ -269,6 +302,90 @@ def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return float(2 * r * np.arcsin(np.sqrt(a)))
 
 
+def geocode_place(place: str) -> dict | None:
+    """
+    用 Google Geocoding 搜尋香港地點。
+    成功回傳 {lat, lon, formatted_address}；找不到回 None。
+    無 API key 或 API 異常時 raise RuntimeError。
+    """
+    text = (place or "").strip()
+    if not text:
+        return None
+    if not GOOGLE_MAPS_API_KEY:
+        raise RuntimeError("missing_api_key")
+
+    params = {
+        "address": text,
+        "region": "hk",
+        "language": "zh-HK",
+        "components": "country:HK",
+        "key": GOOGLE_MAPS_API_KEY,
+    }
+    response = requests.get(GOOGLE_GEOCODE_URL, params=params, timeout=15)
+    response.raise_for_status()
+    data = response.json()
+    status = data.get("status")
+    if status == "ZERO_RESULTS":
+        return None
+    if status != "OK" or not data.get("results"):
+        raise RuntimeError(f"geocode_status:{status}")
+
+    top = data["results"][0]
+    loc = top.get("geometry", {}).get("location") or {}
+    lat, lng = loc.get("lat"), loc.get("lng")
+    if lat is None or lng is None:
+        return None
+    return {
+        "lat": float(lat),
+        "lon": float(lng),
+        "formatted_address": (top.get("formatted_address") or text).strip(),
+    }
+
+
+def _is_all_hong_kong(district) -> bool:
+    text = str(district or "").strip()
+    return text in ("", "全部", "全港", "香港", "null", "None")
+
+
+def attach_geocode_to_intent(intent: dict) -> str | None:
+    """
+    非全港地點一律用 Google Geocoding 定位，寫入 geo_lat / geo_lon / geo_label。
+    篩選停車場只靠此座標＋距離半徑；保留 district 原文作顯示／除錯。
+    成功回 None；失敗回傳給使用者看的錯誤訊息。
+    """
+    district = intent.get("district") or "全港"
+    if _is_all_hong_kong(district):
+        return None
+
+    place = str(district).strip()
+    try:
+        result = geocode_place(place)
+    except RuntimeError as exc:
+        msg = str(exc)
+        if msg == "missing_api_key":
+            return (
+                "尚未設定 Google Maps API Key。"
+                "請在專案根目錄 .env 加入 GOOGLE_MAPS_API_KEY=你的金鑰後重新啟動。"
+            )
+        return (
+            f"地點搜尋暫時無法使用（{msg}）。"
+            "請稍後再試，或重新輸入查詢。"
+        )
+    except requests.RequestException:
+        return "地點搜尋連線失敗，請稍後再試或重新輸入查詢。"
+
+    if result is None:
+        return (
+            f"找不到「{place}」這個地方。"
+            "請重新輸入更清楚的地名（例如商場、街道或地區名稱）。"
+        )
+
+    intent["geo_lat"] = result["lat"]
+    intent["geo_lon"] = result["lon"]
+    intent["geo_label"] = result["formatted_address"]
+    return None
+
+
 def _parse_hko_latest_csv(text: str) -> dict[str, float]:
     """解析天文台 latest_1min CSV → {英文站名: 數值}。"""
     readings: dict[str, float] = {}
@@ -309,7 +426,7 @@ def _nearest_hko_station(
 
 @st.cache_data
 def _carpark_district_points() -> list[tuple[str, float, float]]:
-    """停車場座標 → 子區對照（用於 GPS 反查地區）。"""
+    """停車場座標 → 子區對照（Google reverse geocode 失敗時後備）。"""
     ensure_carpark_sub_districts()
     conn = sqlite3.connect("parking.db")
     try:
@@ -324,8 +441,8 @@ def _carpark_district_points() -> list[tuple[str, float, float]]:
     return [(str(d), float(lat), float(lon)) for d, lat, lon in rows]
 
 
-def resolve_user_district(lat: float, lon: float) -> str | None:
-    """依最近停車場所屬子區，推斷使用者所在地區。"""
+def _resolve_user_district_from_carparks(lat: float, lon: float) -> str | None:
+    """依最近停車場所屬子區，推斷使用者所在地區（後備）。"""
     points = _carpark_district_points()
     if not points:
         return None
@@ -341,9 +458,115 @@ def resolve_user_district(lat: float, lon: float) -> str | None:
     return best_district
 
 
+_REVERSE_GEOCODE_SKIP_NAMES = {
+    "香港",
+    "Hong Kong",
+    "HK",
+    "中華人民共和國",
+    "China",
+    "People's Republic of China",
+}
+_REVERSE_GEOCODE_TYPE_PRIORITY = (
+    "neighborhood",
+    "sublocality_level_2",
+    "sublocality_level_1",
+    "sublocality",
+    "locality",
+    "administrative_area_level_2",
+    "administrative_area_level_1",
+)
+
+
+def _label_from_google_address_components(results: list) -> str | None:
+    """從 Google reverse geocode 結果抽出短地區名（優先對齊本系統子區／十八區）。"""
+    known_subs = all_sub_district_names()
+    known_districts = all_district_names()
+    components: list[tuple[str, set[str]]] = []
+    for result in results or []:
+        for comp in result.get("address_components") or []:
+            name = (comp.get("long_name") or comp.get("short_name") or "").strip()
+            if not name or name in _REVERSE_GEOCODE_SKIP_NAMES:
+                continue
+            types = set(comp.get("types") or [])
+            components.append((name, types))
+
+    # 1) 直接命中本系統子區／十八區名
+    for name, _types in components:
+        if name in known_subs:
+            return name
+    for name, _types in components:
+        if name in known_districts:
+            return name
+        if name.endswith("區") and name in known_districts:
+            return name
+        if f"{name}區" in known_districts:
+            return f"{name}區"
+
+    # 2) 依 Google 類型優先級取短名
+    for preferred in _REVERSE_GEOCODE_TYPE_PRIORITY:
+        for name, types in components:
+            if preferred in types:
+                return name
+
+    # 3) formatted_address 內找已知地名
+    for result in results or []:
+        formatted = (result.get("formatted_address") or "").strip()
+        if not formatted:
+            continue
+        for sub in known_subs:
+            if sub in formatted:
+                return sub
+        for district in known_districts:
+            if district in formatted:
+                return district
+
+    top = (results or [{}])[0]
+    formatted = (top.get("formatted_address") or "").strip()
+    if not formatted:
+        return None
+    # 去掉尾部「香港」等，取較短可讀片段
+    short = formatted.replace(", Hong Kong", "").replace("香港", "").strip(" ,")
+    return short or formatted
+
+
+def reverse_geocode_location_label(lat: float, lon: float) -> str | None:
+    """
+    用 Google Geocoding reverse geocode 把 GPS 轉成地區名。
+    無 API key 或 API 異常時 raise RuntimeError。
+    """
+    if not GOOGLE_MAPS_API_KEY:
+        raise RuntimeError("missing_api_key")
+
+    params = {
+        "latlng": f"{lat},{lon}",
+        "language": "zh-HK",
+        "key": GOOGLE_MAPS_API_KEY,
+    }
+    response = requests.get(GOOGLE_GEOCODE_URL, params=params, timeout=15)
+    response.raise_for_status()
+    data = response.json()
+    status = data.get("status")
+    if status == "ZERO_RESULTS":
+        return None
+    if status != "OK" or not data.get("results"):
+        raise RuntimeError(f"geocode_status:{status}")
+    return _label_from_google_address_components(data["results"])
+
+
+def resolve_user_district(lat: float, lon: float) -> str | None:
+    """優先用 Google Maps reverse geocode；失敗則用最近停車場子區。"""
+    try:
+        label = reverse_geocode_location_label(lat, lon)
+        if label:
+            return label
+    except Exception:
+        pass
+    return _resolve_user_district_from_carparks(lat, lon)
+
+
 @st.cache_data(ttl=60)
 def fetch_location_and_weather(lat: float, lon: float) -> dict:
-    """地區：最近停車場所屬子區；天氣：天文台 1 分鐘氣溫／濕度（最近測站）。"""
+    """地區：Google reverse geocode；天氣：天文台 1 分鐘氣溫／濕度（最近測站）。"""
     location_name = resolve_user_district(lat, lon)
     weather_text = None
 
@@ -397,9 +620,11 @@ def resolve_user_geolocation() -> None:
         st.session_state.user_geo_coords = (round(lat, 3), round(lon, 3))
 
 
-@st.fragment(run_every=timedelta(seconds=1))
 def render_header_context_panel() -> None:
-    """標題右欄：每秒更新香港時間；天氣依天文台 1 分鐘數據自動刷新。"""
+    """標題下資訊卡：時間由前端 JS 每秒改文字（唔用 fragment，避免閃爍）。
+
+    地區／天氣喺頁面自然 rerun 時更新（定位完成、查詢等）；天氣本身有 60s cache。
+    """
     hk_time = format_hong_kong_now()
     location_label = "定位中…"
     weather_label = "定位中…"
@@ -414,19 +639,21 @@ def render_header_context_panel() -> None:
         weather_label = info["weather"] or "暫時無法取得"
 
     rows = [
-        ("香港時間", hk_time),
-        ("你目前所在的地區", location_label),
-        ("天氣", weather_label),
+        ("香港時間", hk_time, "mzd-hk-time"),
+        ("你目前所在的地區", location_label, None),
+        ("天氣", weather_label, None),
     ]
-    cells = "".join(
-        f'<div style="min-width:0;flex:1 1 0;">'
-        f'<div style="font-size:0.75rem;opacity:0.65;margin-bottom:0.15rem;">'
-        f"{html.escape(label)}</div>"
-        f'<div style="font-size:{font_size_for_content(value, base="1.05rem", medium="0.95rem", small="0.85rem")};'
-        f'font-weight:600;line-height:1.35;'
-        f'word-break:break-word;">{html.escape(value)}</div></div>'
-        for label, value in rows
-    )
+    cells = []
+    for label, value, value_class in rows:
+        class_attr = f' class="{html.escape(value_class)}"' if value_class else ""
+        cells.append(
+            f'<div style="min-width:0;flex:1 1 0;">'
+            f'<div style="font-size:0.85rem;line-height:1.2;opacity:0.65;margin-bottom:0.15rem;">'
+            f"{html.escape(label)}</div>"
+            f'<div{class_attr} style="font-size:1.05rem;font-weight:600;line-height:1.35;'
+            f'word-break:break-word;">{html.escape(value)}</div></div>'
+        )
+    cells = "".join(cells)
     st.markdown(
         f'<div style="display:flex;gap:1.25rem;align-items:flex-start;'
         f'flex-wrap:wrap;padding:0.7rem 0.9rem;margin:0.15rem 0 0.85rem 0;'
@@ -1020,12 +1247,43 @@ def inject_layout_css() -> None:
     });
   }
 
+  // 與 format_hong_kong_now() 一致：只改 .mzd-hk-time 文字，唔重建 DOM
+  var MZD_WEEKDAY = { Sun: "日", Mon: "一", Tue: "二", Wed: "三", Thu: "四", Fri: "五", Sat: "六" };
+  function formatHongKongNow() {
+    var parts = {};
+    new Intl.DateTimeFormat("en-US", {
+      timeZone: "Asia/Hong_Kong",
+      year: "numeric",
+      month: "numeric",
+      day: "numeric",
+      weekday: "short",
+      hour: "numeric",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: true
+    }).formatToParts(new Date()).forEach(function (p) {
+      if (p.type !== "literal") parts[p.type] = p.value;
+    });
+    var wd = MZD_WEEKDAY[parts.weekday] || parts.weekday || "";
+    var hour = String(parseInt(parts.hour, 10) || 0);
+    var suffix = (parts.dayPeriod || "").toLowerCase().replace(/\\./g, "");
+    return parts.year + "年" + parts.month + "月" + parts.day + "日（" + wd + "）"
+      + hour + ":" + parts.minute + ":" + parts.second + suffix;
+  }
+  function tickHkClock() {
+    var el = doc.querySelector(".mzd-hk-time");
+    if (!el) return;
+    var text = formatHongKongNow();
+    if (el.textContent !== text) el.textContent = text;
+  }
+
   styleMicButtons();
   styleMicLikeActionButtons();
   collapseJsEvalIframes();
   bindQueryStopSpeech();
   bindSuggestionSpeechButtons();
   hideSpeechEndedSentinel();
+  tickHkClock();
   setInterval(function () {
     styleMicButtons();
     styleMicLikeActionButtons();
@@ -1033,6 +1291,7 @@ def inject_layout_css() -> None:
     bindQueryStopSpeech();
     bindSuggestionSpeechButtons();
     hideSpeechEndedSentinel();
+    tickHkClock();
   }, 400);
 })();
 </script>
@@ -1152,12 +1411,18 @@ render_voice_feedback("_voice_feedback")
 
 
 
+def _sub_district_layout_version() -> str:
+    """子區定義變更時令 load_data 快取失效（避免仍用舊 sub_district 標籤）。"""
+    return "|".join(sorted(all_sub_district_names()))
+
+
 @st.cache_data
-def load_data():
+def load_data(_layout_version: str = ""):
     ensure_carpark_sub_districts()
     conn = sqlite3.connect("parking.db")
     df = pd.read_sql_query("""
-        SELECT v.park_id, v.vacancy, v.collected_at, c.name, c.district, c.sub_district
+        SELECT v.park_id, v.vacancy, v.collected_at, c.name, c.district, c.sub_district,
+               c.latitude, c.longitude
         FROM vacancy_records v
         LEFT JOIN carparks c ON v.park_id = c.park_id
     """, conn)
@@ -1172,7 +1437,285 @@ def load_data():
     df["sub_district"] = df["sub_district"].fillna(df["district"])
     return df
 
-df = load_data()
+
+@st.cache_data(ttl=6 * 3600)
+def load_carpark_fee_rules() -> dict[str, dict]:
+    """
+    從政府 API 取得私家車收費規則。
+    回傳 park_id -> {hourlyCharges, dayNightParks}；多數車場可能無資料。
+    """
+    try:
+        response = requests.get(
+            CARPARK_INFO_VACANCY_URL,
+            params={
+                "data": "info",
+                "lang": "zh_TW",
+                "vehicleTypes": "privateCar",
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        results = response.json().get("results") or []
+    except Exception:
+        return {}
+
+    out: dict[str, dict] = {}
+    for item in results:
+        park_id = str(item.get("park_Id") or "").strip()
+        if not park_id:
+            continue
+        private_car = item.get("privateCar") or {}
+        hourly = private_car.get("hourlyCharges") or []
+        day_night = private_car.get("dayNightParks") or []
+        if hourly or day_night:
+            out[park_id] = {
+                "hourlyCharges": hourly,
+                "dayNightParks": day_night,
+            }
+    return out
+
+
+def _minutes_from_hhmm(value: str | None) -> int | None:
+    """將 '08:00'／'24:00' 轉成分鐘數（0–1440）。"""
+    if not value or not isinstance(value, str):
+        return None
+    parts = value.strip().split(":")
+    if len(parts) < 2:
+        return None
+    try:
+        hour, minute = int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+    if hour == 24 and minute == 0:
+        return 24 * 60
+    if 0 <= hour <= 23 and 0 <= minute <= 59:
+        return hour * 60 + minute
+    return None
+
+
+def _time_in_period(now_m: int, start_m: int, end_m: int) -> bool:
+    """判斷 now_m 是否落在 [start, end)（支援通宵時段）。"""
+    if start_m == end_m:
+        return True
+    if start_m < end_m:
+        return start_m <= now_m < end_m
+    return now_m >= start_m or now_m < end_m
+
+
+def _fee_rule_applies(rule: dict, weekday_en: str, now_m: int) -> bool:
+    weekdays = rule.get("weekdays") or []
+    if weekday_en not in weekdays:
+        return False
+    start_m = _minutes_from_hhmm(rule.get("periodStart") or "00:00")
+    end_m = _minutes_from_hhmm(rule.get("periodEnd") or "24:00")
+    if start_m is None or end_m is None:
+        return False
+    return _time_in_period(now_m, start_m, end_m)
+
+
+def _fee_period_length(rule: dict) -> int:
+    start_m = _minutes_from_hhmm(rule.get("periodStart") or "00:00")
+    end_m = _minutes_from_hhmm(rule.get("periodEnd") or "24:00")
+    if start_m is None or end_m is None:
+        return 24 * 60
+    if start_m < end_m:
+        return end_m - start_m
+    if start_m == end_m:
+        return 24 * 60
+    return (24 * 60 - start_m) + end_m
+
+
+def _format_hkd(price) -> str | None:
+    try:
+        amount = float(price)
+    except (TypeError, ValueError):
+        return None
+    if amount == int(amount):
+        return f"${int(amount)}"
+    return f"${amount:.1f}"
+
+
+def format_carpark_fee(
+    park_id: str,
+    day_cn: str,
+    hour: int,
+    minute: int,
+    fee_map: dict[str, dict] | None = None,
+) -> str:
+    """
+    依查詢星期／時間，取出適用時租（無則日夜泊套餐；再無則 —）。
+    """
+    rules = (fee_map if fee_map is not None else load_carpark_fee_rules()).get(
+        str(park_id)
+    )
+    if not rules:
+        return "未提供"
+
+    weekday_en = DAY_CN_TO_EN.get(day_cn) or DOW_TO_EN.get(
+        DAY_TO_NUM.get(day_cn, hong_kong_now().weekday()), "MON"
+    )
+    now_m = int(hour) * 60 + int(minute)
+
+    hourly_matches = [
+        rule
+        for rule in (rules.get("hourlyCharges") or [])
+        if _fee_rule_applies(rule, weekday_en, now_m)
+    ]
+    if hourly_matches:
+        hourly_matches.sort(key=_fee_period_length)
+        rule = hourly_matches[0]
+        price_str = _format_hkd(rule.get("price"))
+        if not price_str:
+            return "未提供"
+        unit = "半小時" if rule.get("type") == "half-hourly" else "小時"
+        return f"{price_str}／{unit}"
+
+    day_night_matches = [
+        rule
+        for rule in (rules.get("dayNightParks") or [])
+        if _fee_rule_applies(rule, weekday_en, now_m)
+    ]
+    if day_night_matches:
+        day_night_matches.sort(key=_fee_period_length)
+        rule = day_night_matches[0]
+        price_str = _format_hkd(rule.get("price"))
+        if not price_str:
+            return "未提供"
+        unit = DAYNIGHT_FEE_LABEL.get(rule.get("type") or "", "套餐")
+        return f"{price_str}／{unit}"
+
+    return "未提供"
+
+
+df = load_data(_layout_version=_sub_district_layout_version())
+
+
+def _normalize_park_name(name: str) -> str:
+    """正規化名稱以便比對重複車場（忽略大小寫、空白、停車場／車場後綴）。"""
+    s = (name or "").strip().lower()
+    s = re.sub(r"[\s\-_/·．.]+", "", s)
+    s = s.replace("停車場", "").replace("車場", "")
+    s = re.sub(r"parking|carpark", "", s, flags=re.I)
+    return s
+
+
+def _prefer_canonical_park_id(park_id: str) -> tuple:
+    """排序用：純數字 id 優先於 tdc*，其餘按字串。"""
+    pid = str(park_id)
+    return (0 if pid.isdigit() else 1, pid)
+
+
+def dedupe_equivalent_carparks(
+    parks: pd.DataFrame,
+    *,
+    id_col: str = "park_id",
+    name_col: str = "name",
+    lat_col: str = "latitude",
+    lon_col: str = "longitude",
+    max_distance_km: float = EQUIVALENT_CARPARK_MAX_KM,
+    prefer_higher_col: str | None = None,
+) -> pd.DataFrame:
+    """
+    合併極近且正規化名稱相同的重複紀錄，只保留一筆。
+    prefer_higher_col 有值時保留該欄較高者；否則偏好較「標準」的 park_id。
+    """
+    if parks.empty or lat_col not in parks.columns or lon_col not in parks.columns:
+        return parks.copy()
+
+    work = parks.dropna(subset=[lat_col, lon_col]).copy()
+    if work.empty:
+        return parks.iloc[0:0].copy()
+
+    work["_norm_name"] = work[name_col].map(_normalize_park_name)
+    work = work.reset_index(drop=True)
+    n = len(work)
+    parent = list(range(n))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i: int, j: int) -> None:
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[rj] = ri
+
+    lats = work[lat_col].astype(float).tolist()
+    lons = work[lon_col].astype(float).tolist()
+    norms = work["_norm_name"].tolist()
+    for i in range(n):
+        if not norms[i]:
+            continue
+        for j in range(i + 1, n):
+            if norms[i] != norms[j]:
+                continue
+            if _haversine_km(lats[i], lons[i], lats[j], lons[j]) <= max_distance_km:
+                union(i, j)
+
+    clusters: dict[int, list[int]] = {}
+    for i in range(n):
+        clusters.setdefault(find(i), []).append(i)
+
+    keep_indices: list[int] = []
+    for members in clusters.values():
+        if len(members) == 1:
+            keep_indices.append(members[0])
+            continue
+        group = work.iloc[members]
+        if prefer_higher_col and prefer_higher_col in group.columns:
+            best = group.sort_values(
+                prefer_higher_col, ascending=False, kind="mergesort"
+            ).iloc[0]
+            keep_indices.append(int(best.name))
+        else:
+            best_idx = min(
+                members,
+                key=lambda idx: _prefer_canonical_park_id(work.iloc[idx][id_col]),
+            )
+            keep_indices.append(best_idx)
+
+    out = work.iloc[sorted(keep_indices)].drop(columns=["_norm_name"])
+    return out.reset_index(drop=True)
+
+
+def carparks_near_coords(
+    lat: float,
+    lon: float,
+    *,
+    radius_km: float = NEARBY_RADIUS_KM,
+    fallback_km: float = NEARBY_RADIUS_FALLBACK_KM,
+) -> tuple[pd.DataFrame, float | None]:
+    """
+    依座標篩選附近唯一停車場（先 3km，沒有再放寬至 5km）。
+    回傳 (車場 DataFrame含 distance_km, 實際使用半徑)；仍無則半徑為 None。
+    """
+    parks = (
+        df[["park_id", "name", "district", "sub_district", "latitude", "longitude"]]
+        .drop_duplicates(subset=["park_id"])
+        .dropna(subset=["latitude", "longitude"])
+        .copy()
+    )
+    if parks.empty:
+        empty = parks.copy()
+        empty["distance_km"] = pd.Series(dtype=float)
+        return empty, None
+
+    parks["distance_km"] = [
+        _haversine_km(lat, lon, float(plat), float(plon))
+        for plat, plon in zip(parks["latitude"], parks["longitude"])
+    ]
+    for radius in (radius_km, fallback_km):
+        filtered = parks[parks["distance_km"] <= radius].sort_values(
+            "distance_km", kind="mergesort"
+        )
+        if not filtered.empty:
+            deduped = dedupe_equivalent_carparks(filtered)
+            return deduped.sort_values(
+                "distance_km", kind="mergesort"
+            ).reset_index(drop=True), float(radius)
+    return parks.iloc[0:0].copy(), None
 
 def call_deepseek(prompt: str) -> str:
     """呼叫 DeepSeek API"""
@@ -1417,6 +1960,29 @@ def select_top_with_ties(df: pd.DataFrame, top_n: int, value_col: str = "預測�
     return add_dense_ranks(sorted_df, value_col=value_col)
 
 
+def select_top_nearby_with_ties(
+    df: pd.DataFrame, top_n: int, value_col: str = "預測空位"
+) -> pd.DataFrame:
+    """
+    地標「附近」專用：以距離加權分數取前 top_n（仍顯示原本預測空位）。
+    分數 = 預測空位 / (1 + 距離)^power，避免遠距離大車場壟斷榜首。
+    排名按加權分數（推薦次序），唔係純空位多寡。
+    """
+    if df.empty or top_n <= 0:
+        return df.iloc[0:0].copy()
+    if "距離(公里)" not in df.columns:
+        return select_top_with_ties(df, top_n, value_col=value_col)
+
+    work = df.copy()
+    dist = pd.to_numeric(work["距離(公里)"], errors="coerce").fillna(
+        NEARBY_RADIUS_FALLBACK_KM
+    )
+    vac = pd.to_numeric(work[value_col], errors="coerce").fillna(0)
+    work["_nearby_score"] = vac / ((1.0 + dist) ** NEARBY_DISTANCE_SCORE_POWER)
+    ranked = select_top_with_ties(work, top_n, value_col="_nearby_score")
+    return ranked.drop(columns=["_nearby_score"], errors="ignore")
+
+
 RANK_SPOKEN_YUE = {
     "1st": "第一",
     "2nd": "第二",
@@ -1424,6 +1990,65 @@ RANK_SPOKEN_YUE = {
     "4th": "第四",
     "5th": "第五",
 }
+
+# 香港人慣常逐字母讀嘅英文縮寫（大小寫不拘）。其餘英文詞會讀成詞，唔拆字母。
+SPELL_OUT_LATIN_ACRONYMS = frozenset(
+    {
+        "TKO",
+        "APM",
+        "IFC",
+        "ICC",
+        "MTR",
+        "KTR",
+        "HKO",
+        "HKU",
+        "UST",
+        "CYT",
+        "CWB",
+    }
+)
+_ROMAN_NUMERAL_SPOKEN = {"II": "二", "III": "三", "IV": "四"}
+# 英文詞／縮寫＋可選尾隨數字（AIRSIDE、KTR350、apm）
+_LATIN_SPEECH_TOKEN_RE = re.compile(r"[A-Za-z]+(?:\+[A-Za-z]*)?\d*|\d+[A-Za-z]+")
+
+
+def _latin_token_to_hk_speech(token: str) -> str:
+    """將單個英文／縮寫 token 轉成符合香港口語習慣嘅朗讀形式。"""
+    if token.upper() == "M+" or token == "M+":
+        return "M plus"
+
+    letters = token
+    digits = ""
+    m = re.match(r"^([A-Za-z]+)(\d+)$", token)
+    if m:
+        letters, digits = m.group(1), m.group(2)
+
+    upper = letters.upper()
+    if upper in _ROMAN_NUMERAL_SPOKEN:
+        spoken = _ROMAN_NUMERAL_SPOKEN[upper]
+    elif upper in SPELL_OUT_LATIN_ACRONYMS:
+        # TKO / APM → "T K O"／"A P M"，逼 TTS 逐字母
+        spoken = " ".join(upper)
+    elif letters.isupper() and len(letters) >= 2:
+        # AIRSIDE → Airside，避免全大階被逐字母讀
+        spoken = letters.title()
+    else:
+        spoken = letters
+
+    if digits:
+        return f"{spoken} {digits}"
+    return spoken
+
+
+def prepare_spoken_text_for_tts(text: str) -> str:
+    """朗讀前處理英文名稱：跟香港人習慣讀詞或逐字母，唔改書面顯示。"""
+    text = (text or "").strip()
+    if not text:
+        return text
+    text = re.sub(r"\bM\+", "M plus", text, flags=re.IGNORECASE)
+    return _LATIN_SPEECH_TOKEN_RE.sub(
+        lambda m: _latin_token_to_hk_speech(m.group(0)), text
+    )
 
 
 def _suggestion_rank_groups(
@@ -1506,10 +2131,11 @@ def format_spoken_suggestion(result_df: pd.DataFrame, hour: int, minute: int = 0
 
     if total == 1:
         _, names, vacancy = groups[0]
-        return (
+        raw = (
             f"建議你喺{time_spoken}去{names[0]}，"
             f"預計大約有{vacancy}個空位。"
         )
+        return prepare_spoken_text_for_tts(raw)
 
     parts = [f"建議你喺{time_spoken}優先考慮以下停車場。"]
     for rank, names, vacancy in groups:
@@ -1524,7 +2150,7 @@ def format_spoken_suggestion(result_df: pd.DataFrame, hour: int, minute: int = 0
                 f"{rank_yue}有{len(names)}個選擇：{names_text}，"
                 f"每個預計大約有{vacancy}個空位。"
             )
-    return "".join(parts)
+    return prepare_spoken_text_for_tts("".join(parts))
 
 
 SPEECH_ENDED_SENTINEL_LABEL = "SPEECH_ENDED"
@@ -1532,7 +2158,7 @@ SPEECH_ENDED_SENTINEL_LABEL = "SPEECH_ENDED"
 
 def _sync_speech_text_to_browser(text: str, *, speaking: bool | None = None) -> None:
     """把建議朗讀稿／播放狀態同步到 parent。"""
-    text = (text or "").strip()
+    text = prepare_spoken_text_for_tts(text)
     if not text and speaking is None:
         return
     payload = json.dumps(text, ensure_ascii=False)
@@ -1565,7 +2191,7 @@ def _sync_speech_text_to_browser(text: str, *, speaking: bool | None = None) -> 
 
 def speak_text_zh_hk(text: str, *, force: bool = False) -> None:
     """透過 parent 常駐控制器朗讀（唔依賴會被 rerun 清掉嘅 iframe 生命週期）。"""
-    text = (text or "").strip()
+    text = prepare_spoken_text_for_tts(text)
     if not text:
         return
     if not force and st.session_state.get("_last_spoken_text") == text:
@@ -1633,11 +2259,13 @@ def render_text_with_speech(
     *,
     auto_speak: bool = True,
     button_key: str = "suggestion_speech_toggle",
+    show_written: bool = True,
 ) -> None:
     """顯示文字；可自動朗讀，並提供再聽／停止按鈕。"""
     written = (written or "").strip()
-    spoken = ((spoken or written) or "").strip()
-    if not written:
+    spoken = prepare_spoken_text_for_tts(((spoken or written) or "").strip())
+    # 冇書面稿亦要可朗讀（例如暫時隱藏建議文字）
+    if not written and not spoken:
         return
 
     if "_suggestion_speaking" not in st.session_state:
@@ -1659,30 +2287,41 @@ def render_text_with_speech(
 
     # 建議全文同一欄、以緊湊 HTML 渲染；按鈕置頂對齊第一行。
     # （舊做法把標題／列表拆開，中間再插語音 sync iframe，會留一大段空白）
-    text_col, btn_col = st.columns([3.6, 1.2], vertical_alignment="top")
-    with text_col:
-        compact_lines = []
-        for line in written.split("\n"):
-            line = line.strip()
-            if not line:
-                continue
-            if line.startswith("- "):
-                line = "• " + line[2:]
-            compact_lines.append(html.escape(line))
-        st.markdown(
-            '<div style="line-height:1.55;margin:0;padding:0;">'
-            + "<br>".join(compact_lines)
-            + "</div>",
-            unsafe_allow_html=True,
-        )
-    with btn_col:
-        toggle_label = "⏹ 停止播放" if speaking else "🔊 再聽一次"
-        toggled = st.button(
-            toggle_label,
-            key=button_key,
-            use_container_width=True,
-            type="secondary",
-        )
+    toggle_label = "⏹ 停止播放" if speaking else "🔊 再聽一次"
+    if show_written and written:
+        text_col, btn_col = st.columns([3.6, 1.2], vertical_alignment="top")
+        with text_col:
+            compact_lines = []
+            for line in written.split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith("- "):
+                    line = "• " + line[2:]
+                compact_lines.append(html.escape(line))
+            st.markdown(
+                '<div style="line-height:1.55;margin:0;padding:0;">'
+                + "<br>".join(compact_lines)
+                + "</div>",
+                unsafe_allow_html=True,
+            )
+        with btn_col:
+            toggled = st.button(
+                toggle_label,
+                key=button_key,
+                use_container_width=True,
+                type="secondary",
+            )
+    else:
+        # 書面建議隱藏時：朗讀掣靠右，對齊表格「預測空位」欄上方
+        _, btn_col = st.columns([3.6, 1.2], vertical_alignment="top")
+        with btn_col:
+            toggled = st.button(
+                toggle_label,
+                key=button_key,
+                use_container_width=True,
+                type="secondary",
+            )
 
     _sync_speech_text_to_browser(spoken, speaking=speaking)
 
@@ -1716,7 +2355,12 @@ def render_suggestion_with_speech(
     """顯示建議文字；可自動朗讀，並提供再聽／停止按鈕。"""
     written = written if written is not None else format_top_suggestion(result_df, hour, minute)
     spoken = spoken if spoken is not None else format_spoken_suggestion(result_df, hour, minute)
-    render_text_with_speech(written, spoken, auto_speak=auto_speak)
+    render_text_with_speech(
+        written,
+        spoken,
+        auto_speak=auto_speak,
+        show_written=SHOW_WRITTEN_SUGGESTION,
+    )
 
 
 def render_saved_prediction(payload: dict, *, auto_speak: bool = False) -> None:
@@ -1746,7 +2390,7 @@ def render_saved_prediction(payload: dict, *, auto_speak: bool = False) -> None:
         )
     else:
         st.success(f"{day} {time_str} {district_label} 較易泊車的停車場（前 {top_n} 名）")
-    render_ranked_table(result_df)
+    # 朗讀掣放喺表格外右上方（「預測空位」欄上方），唔入表格
     if not result_df.empty:
         render_suggestion_with_speech(
             result_df,
@@ -1756,6 +2400,7 @@ def render_saved_prediction(payload: dict, *, auto_speak: bool = False) -> None:
             written=payload.get("written"),
             spoken=payload.get("spoken"),
         )
+    render_ranked_table(result_df)
 
 
 def render_ranked_table(df: pd.DataFrame) -> None:
@@ -1837,13 +2482,10 @@ def resolve_relative_day(query: str, today=None):
 
 
 def district_display_name(district: str) -> str:
-    """未指定地區時顯示「全港」；否則顯示正規化後的子區／十八區名。"""
-    match_type, value = normalize_location_intent(district)
-    if match_type == "all":
+    """未指定地區時顯示「全港」；否則顯示地點原文（交由 Google 定位）。"""
+    if _is_all_hong_kong(district):
         return "全港"
-    if match_type in ("sub_district", "district"):
-        return value
-    return district or "全港"
+    return str(district or "").strip() or "全港"
 
 
 def date_for_weekday_cn(day_cn: str, today=None) -> datetime | None:
@@ -2025,7 +2667,6 @@ def parse_query_with_llm(query: str):
     day_tomorrow = WEEKDAY_CN[(today + timedelta(days=1)).weekday()]
     day_after = WEEKDAY_CN[(today + timedelta(days=2)).weekday()]
 
-    sub_summary = sub_district_prompt_summary()
     prompt = f"""
 你是一個香港停車場查詢助手。今天是 {today_str}（{today_day}）。
 請從以下句子提取資訊，並以 JSON 格式回傳。
@@ -2040,9 +2681,7 @@ def parse_query_with_llm(query: str):
 - query_type: 查詢類型（只在 related 為 true 時有意義）
   - "prediction"：想知邊度較易泊、某時某地空位、預測／推薦停車場等（即使沒寫「預測」二字）
   - "info"：與停車場有關，但不是在問空位預測。例如：某區有幾個停車場、係咪得一個、有冇停車場、叫咩名、本系統可以問咩
-- district: 地區／子區名稱。優先填子區（例如「天水圍」「九龍灣」「藍田」）；若只提到十八區則填十八區（例如「元朗區」「觀塘區」）；沒有提到就填「全港」。related 為 false 時填「全港」
-  可用子區參考：
-{sub_summary}
+- district: 地點名稱，會交 Google Maps 定位。優先填用戶提到的具體地名（屋邨、商場、街道、地區，例如「彩雲邨」「栢慧豪園」「天水圍」）；沒有提到就填「全港」。related 為 false 時填「全港」。不要改寫成內部代號或加「／」合併名
 - hour: 小時（0-23）。只在句子有具體鐘點時填數字（如「三點」「15:30」「晚上九點」）；沒有具體鐘點則填 null（「後晚／聽晚／今晚／嚟緊」單獨出現不算具體鐘點）。query_type 為 "info" 時通常填 null
 - minute: 分鐘，時間以半小時為單位，只允許 0 或 30。規則：
   - 「三點半／3:30／15:30」→ 30
@@ -2065,8 +2704,11 @@ def parse_query_with_llm(query: str):
 範例（後晚無具體鐘點 → hour/minute 為 null；日期＝{day_after}）：
 {{"related": true, "query_type": "prediction", "district": "全港", "hour": null, "minute": null, "day": "{day_after}", "top_n": 4}}
 
-範例（子區預測）：
+範例（地點預測）：
 {{"related": true, "query_type": "prediction", "district": "天水圍", "hour": 20, "minute": 0, "day": "{day_today}", "top_n": null}}
+
+範例（屋邨／地標）：
+{{"related": true, "query_type": "prediction", "district": "彩雲邨", "hour": 16, "minute": 30, "day": "{day_tomorrow}", "top_n": null}}
 
 範例（停車場資料／非預測）：
 {{"related": true, "query_type": "info", "district": "掃管笏", "hour": null, "minute": null, "day": "{day_today}", "top_n": null}}
@@ -2115,12 +2757,9 @@ def parse_query_with_llm(query: str):
     if resolved_day:
         intent["day"] = resolved_day
 
-    if intent.get("district") in ("全部", None, ""):
+    # 保留 LLM 抽出的地點原文予 Google Geocoding；只把「全部」等正規成全港
+    if _is_all_hong_kong(intent.get("district")):
         intent["district"] = "全港"
-    else:
-        _match_type, _normalized = normalize_location_intent(intent.get("district"))
-        if _match_type in ("sub_district", "district", "all"):
-            intent["district"] = _normalized
 
     if is_now_query(query):
         intent["day"] = WEEKDAY_CN[today.weekday()]
@@ -2171,14 +2810,23 @@ def _intent_display(value, fallback="未指定"):
 
 def render_intent_summary(intent: dict, *, info_mode: bool = False):
     """顯示 AI 理解的意圖（非 JSON）。"""
+    # 優先顯示 Google 定位結果；否則用地點原文
+    if _is_all_hong_kong(intent.get("district")):
+        place_label = "全港"
+    else:
+        place_label = (
+            intent.get("geo_label")
+            or intent.get("district")
+            or "未指定"
+        )
     if info_mode or not intent_wants_prediction(intent):
         intent_fields = [
-            ("地區", _intent_display(intent.get("district"))),
+            ("地區", _intent_display(place_label)),
             ("查詢類型", "停車場資料／說明"),
         ]
     else:
         intent_fields = [
-            ("地區", _intent_display(intent.get("district"))),
+            ("地區", _intent_display(place_label)),
             ("日期", format_intent_date(intent.get("day"))),
             ("時間", format_intent_time(intent.get("hour"), intent.get("minute"))),
             ("顯示數量", _intent_display(intent.get("top_n"))),
@@ -2202,34 +2850,46 @@ def render_intent_summary(intent: dict, *, info_mode: bool = False):
     )
 
 
-def unique_carparks_for_location(district: str) -> tuple[str, str, pd.DataFrame]:
+def unique_carparks_for_location(
+    district: str,
+    *,
+    geo_lat: float | None = None,
+    geo_lon: float | None = None,
+    geo_label: str | None = None,
+) -> tuple[str, str, pd.DataFrame]:
     """
-    依地區取出本系統有紀錄的停車場（去重）。
-    回傳 (match_type, district_label, DataFrame[名稱, 地區])。
+    取出本系統有紀錄的停車場（去重）。
+    非全港：一律以 Google 座標＋距離半徑篩選；全港則回傳全部。
+    回傳 (match_type, district_label, DataFrame)。
     """
-    match_type, matched_value = normalize_location_intent(district)
-    district_label = district_display_name(district)
-    parks = (
-        df[["park_id", "name", "district", "sub_district"]]
-        .drop_duplicates(subset=["park_id"])
-        .copy()
-    )
-    if match_type == "sub_district":
-        filtered = parks[parks["sub_district"] == matched_value]
-    elif match_type == "district":
-        filtered = parks[parks["district"] == matched_value]
-    elif match_type == "all":
-        filtered = parks
-    else:
-        filtered = parks.iloc[0:0]
+    if _is_all_hong_kong(district):
+        parks = (
+            df[["park_id", "name", "district", "sub_district", "latitude", "longitude"]]
+            .drop_duplicates(subset=["park_id"])
+            .copy()
+        )
+        filtered = dedupe_equivalent_carparks(parks)
+        rows = pd.DataFrame(
+            {
+                "名稱": filtered["name"].values,
+                "地區": filtered["sub_district"].fillna(filtered["district"]).values,
+            }
+        ).sort_values(["地區", "名稱"], kind="mergesort").reset_index(drop=True)
+        return "all", "全港", rows
 
+    district_label = geo_label or district or "該地點"
+    if geo_lat is None or geo_lon is None:
+        return "nearby", district_label, pd.DataFrame(columns=["名稱", "地區", "距離(公里)"])
+
+    nearby, _radius = carparks_near_coords(float(geo_lat), float(geo_lon))
     rows = pd.DataFrame(
         {
-            "名稱": filtered["name"].values,
-            "地區": filtered["sub_district"].fillna(filtered["district"]).values,
+            "名稱": nearby["name"].values,
+            "地區": nearby["sub_district"].fillna(nearby["district"]).values,
+            "距離(公里)": nearby["distance_km"].round(1).values,
         }
-    ).sort_values(["地區", "名稱"], kind="mergesort").reset_index(drop=True)
-    return match_type, district_label, rows
+    )
+    return "nearby", district_label, rows
 
 
 def _fallback_parking_info_answer(
@@ -2240,8 +2900,8 @@ def _fallback_parking_info_answer(
     names = parks_df["名稱"].tolist()
     if n == 0:
         written = (
-            f"本系統目前沒有「{district_label}」的停車場紀錄。"
-            f"你可以改試其他地區，或直接問空位預測"
+            f"本系統在「{district_label}」附近目前沒有停車場紀錄。"
+            f"你可以改試其他地點，或直接問空位預測"
             f"（例如：天水圍今晚八點邊度較易泊？）。"
         )
     elif n == 1:
@@ -2330,7 +2990,10 @@ def render_saved_info_answer(payload: dict, *, auto_speak: bool = False) -> None
         intent.get("district")
     )
     count = int(payload.get("count") or 0)
-    st.success(f"「{district_label}」本系統停車場資料（共 {count} 個）")
+    nearby_suffix = "附近" if intent.get("geo_lat") is not None else ""
+    st.success(
+        f"「{district_label}」{nearby_suffix}本系統停車場資料（共 {count} 個）"
+    )
     parks_df = pd.DataFrame(payload.get("park_records") or [])
     if not parks_df.empty and count <= 40:
         st.dataframe(parks_df, use_container_width=True, hide_index=True)
@@ -2347,10 +3010,25 @@ def render_saved_info_answer(payload: dict, *, auto_speak: bool = False) -> None
 def run_parking_info_answer(intent: dict, query_text: str) -> None:
     """處理與停車場有關、但非空位預測的查詢。"""
     district = intent.get("district", "全港")
-    match_type, district_label, parks_df = unique_carparks_for_location(district)
-    # 未知地區：仍用用戶字串作標籤
-    if match_type == "unknown":
-        district_label = district or "該地區"
+    geo_lat = intent.get("geo_lat")
+    geo_lon = intent.get("geo_lon")
+    geo_label = intent.get("geo_label")
+    match_type, district_label, parks_df = unique_carparks_for_location(
+        district,
+        geo_lat=geo_lat,
+        geo_lon=geo_lon,
+        geo_label=geo_label,
+    )
+    if match_type == "nearby":
+        district_label = geo_label or district or district_label
+
+    if match_type == "nearby" and parks_df.empty:
+        render_intent_summary(intent, info_mode=True)
+        st.warning(
+            f"「{district_label}」附近本系統沒有停車場紀錄。"
+            "請改試其他地點後重新輸入。"
+        )
+        return
 
     with st.spinner("正在根據本系統資料整理回覆..."):
         written, spoken = answer_parking_info_with_llm(
@@ -2389,6 +3067,9 @@ def resolve_top_n(query_text: str, intent: dict) -> int:
 def run_vacancy_prediction(intent: dict, query_text: str):
     """依意圖執行預測並顯示結果。"""
     district = intent.get("district", "全港")
+    geo_lat = intent.get("geo_lat")
+    geo_lon = intent.get("geo_lon")
+    geo_label = intent.get("geo_label")
     asking_now = is_now_query(query_text)
     now = hong_kong_now()
     day = intent.get("day", WEEKDAY_CN[now.weekday()])
@@ -2408,10 +3089,11 @@ def run_vacancy_prediction(intent: dict, query_text: str):
         )
         hour, minute = normalize_half_hour(hour, minute)
     half_hour = to_half_hour_slot(hour, minute)
-    match_type, matched_value = normalize_location_intent(district)
-    district_label = district_display_name(district)
     top_n = resolve_top_n(query_text, intent)
     dow_num = DAY_TO_NUM.get(day, 0)
+    dist_map: dict[str, float] = {}
+    match_type = "all"
+    district_label = "全港"
 
     le = LabelEncoder()
     df["park_code"] = le.fit_transform(df["park_id"])
@@ -2423,34 +3105,84 @@ def run_vacancy_prediction(intent: dict, query_text: str):
     model = GradientBoostingRegressor(random_state=42, n_estimators=50)
     model.fit(X, y)
 
-    if match_type == "sub_district":
-        df_filtered = df[df["sub_district"] == matched_value]
-        if df_filtered.empty:
-            df_filtered = df
-            district_label = "全港"
-    elif match_type == "district":
-        df_filtered = df[df["district"] == matched_value]
-        if df_filtered.empty:
-            df_filtered = df
-            district_label = "全港"
-    else:
+    # 非全港：一律 Google 座標＋半徑篩附近車場（不再用 sub_district）
+    if _is_all_hong_kong(district):
         df_filtered = df
+    elif geo_lat is not None and geo_lon is not None:
+        nearby, _radius = carparks_near_coords(float(geo_lat), float(geo_lon))
+        district_label = geo_label or district or "該地點"
+        if nearby.empty:
+            render_intent_summary(intent)
+            st.warning(
+                f"「{district_label}」附近本系統沒有停車場紀錄。"
+                "請改試其他地點後重新輸入。"
+            )
+            return
+        dist_map = {
+            str(pid): float(dist)
+            for pid, dist in zip(nearby["park_id"], nearby["distance_km"])
+        }
+        df_filtered = df[df["park_id"].astype(str).isin(list(dist_map.keys()))]
+        if df_filtered.empty:
+            render_intent_summary(intent)
+            st.warning(
+                f"「{district_label}」附近本系統沒有可用的空位預測資料。"
+                "請改試其他地點後重新輸入。"
+            )
+            return
+        match_type = "nearby"
+    else:
+        render_intent_summary(intent)
+        st.warning(
+            f"未能定位「{district_display_name(district)}」。"
+            "請重新輸入更清楚的地名。"
+        )
+        return
 
+    fee_map = load_carpark_fee_rules()
     results = []
     for park_id in df_filtered["park_id"].unique():
         park_code = le.transform([park_id])[0]
         pred = model.predict([[half_hour, dow_num, park_code]])[0]
         info = df[df["park_id"] == park_id].iloc[0]
-        results.append({
+        row = {
+            "park_id": park_id,
+            "name": info["name"],
+            "latitude": info.get("latitude"),
+            "longitude": info.get("longitude"),
             "名稱": info["name"],
             "地區": info.get("sub_district") or info["district"],
+            "收費": format_carpark_fee(park_id, day, hour, minute, fee_map),
             "預測空位": max(0, round(pred)),
-        })
+        }
+        pid_key = str(park_id)
+        if match_type == "nearby" and pid_key in dist_map:
+            row["距離(公里)"] = round(dist_map[pid_key], 1)
+        results.append(row)
 
-    result_df = select_top_with_ties(pd.DataFrame(results), top_n)
+    pred_df = pd.DataFrame(results)
+    if not pred_df.empty:
+        pred_df = dedupe_equivalent_carparks(
+            pred_df, prefer_higher_col="預測空位"
+        )
+        pred_df = pred_df.drop(
+            columns=["park_id", "name", "latitude", "longitude"], errors="ignore"
+        )
+    if match_type == "nearby":
+        result_df = select_top_nearby_with_ties(pred_df, top_n)
+        district_label = f"{district_label}附近"
+    else:
+        result_df = select_top_with_ties(pred_df, top_n)
+    # 欄位順序：排名、名稱、地區、（距離）、收費、預測空位
+    preferred = ["", "名稱", "地區", "距離(公里)", "收費", "預測空位"]
+    ordered = [c for c in preferred if c in result_df.columns]
+    ordered += [c for c in result_df.columns if c not in ordered]
+    result_df = result_df[ordered]
+
     shown = len(result_df)
     written = format_top_suggestion(result_df, hour, minute)
     spoken = format_spoken_suggestion(result_df, hour, minute)
+
     payload = {
         "intent": intent,
         "asking_now": asking_now,
@@ -2537,14 +3269,25 @@ if should_query and query_text:
             "請重新輸入與停車場空位有關的問題"
             "（例如：天水圍今晚八點邊度較易泊？）。"
         )
-    elif not intent_wants_prediction(intent):
-        run_parking_info_answer(intent, query_text)
-    elif needs_missing_time_reentry(intent, query_text):
-        render_missing_time_blocked(intent)
-    elif needs_past_time_followup(intent, query_text):
-        render_past_time_blocked(intent)
     else:
-        run_vacancy_prediction(intent, query_text)
+        geo_error = None
+        if not _is_all_hong_kong(intent.get("district")):
+            with st.spinner("正在用 Google Maps 搜尋地點..."):
+                geo_error = attach_geocode_to_intent(intent)
+        if geo_error:
+            render_intent_summary(
+                intent,
+                info_mode=not intent_wants_prediction(intent),
+            )
+            st.warning(geo_error)
+        elif not intent_wants_prediction(intent):
+            run_parking_info_answer(intent, query_text)
+        elif needs_missing_time_reentry(intent, query_text):
+            render_missing_time_blocked(intent)
+        elif needs_past_time_followup(intent, query_text):
+            render_past_time_blocked(intent)
+        else:
+            run_vacancy_prediction(intent, query_text)
 elif should_query:
     st.warning("請先輸入查詢內容。")
 

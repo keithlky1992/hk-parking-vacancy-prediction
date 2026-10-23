@@ -10,6 +10,7 @@
 
 # Database (rebuild via collect.ipynb)
 parking.db
+.carparks_last_update
 
 # Python
 __pycache__/
