@@ -442,9 +442,18 @@ def fetch_user_location_label(lat: float, lon: float) -> str | None:
     return resolve_user_district(lat, lon)
 
 
+def _format_temp_humidity(temp: float, humidity: float) -> str:
+    """對齊天文台 App：氣溫 + 相對濕度。"""
+    return f"{temp:.1f}°C｜相對濕度 {humidity:.0f}%"
+
+
 @st.cache_data(ttl=WEATHER_CACHE_TTL_SEC)
 def fetch_user_weather(lat: float, lon: float) -> str | None:
-    """天文台 1 分鐘氣溫／濕度（最近測站）。"""
+    """天文台 1 分鐘氣溫／相對濕度（對齊所在地區，類似天文台 App）。
+
+    部分測站只有氣溫、冇濕度（例如黃大仙）。優先揀附近同時有兩者嘅站；
+    否則分別用最近氣溫站 + 最近濕度站，確保地區天氣仍顯示完整。
+    """
     try:
         temp_resp = requests.get(HKO_TEMP_CSV_URL, timeout=10)
         temp_resp.raise_for_status()
@@ -456,24 +465,32 @@ def fetch_user_weather(lat: float, lon: float) -> str | None:
     except Exception:
         return None
 
-    # 以最近氣溫測站取天氣（與天文台 App 選站邏輯一致）；濕度僅用同站讀數
-    temp_candidates = [n for n in temps if n in HKO_AWS_STATIONS]
-    nearest = _nearest_hko_station(lat, lon, temp_candidates)
-    if nearest is None:
+    both_candidates = [
+        n for n in temps if n in HKO_AWS_STATIONS and n in hums
+    ]
+    nearest_both = _nearest_hko_station(lat, lon, both_candidates)
+    if nearest_both is not None and nearest_both[1] <= HKO_MAX_STATION_DISTANCE_KM:
+        station_en, _ = nearest_both
+        return _format_temp_humidity(temps[station_en], hums[station_en])
+
+    # 後備：氣溫、濕度分開揀最近有讀數嘅站（仍限香港範圍）
+    nearest_temp = _nearest_hko_station(
+        lat, lon, [n for n in temps if n in HKO_AWS_STATIONS]
+    )
+    nearest_hum = _nearest_hko_station(
+        lat, lon, [n for n in hums if n in HKO_AWS_STATIONS]
+    )
+    if (
+        nearest_temp is None
+        or nearest_hum is None
+        or nearest_temp[1] > HKO_MAX_STATION_DISTANCE_KM
+        or nearest_hum[1] > HKO_MAX_STATION_DISTANCE_KM
+    ):
         return None
 
-    station_en, dist_km = nearest
-    if dist_km > HKO_MAX_STATION_DISTANCE_KM:
-        return None
-
-    temp = temps.get(station_en)
-    humidity = hums.get(station_en)
-
-    if temp is not None and humidity is not None:
-        return f"{temp:.1f}°C｜濕度 {humidity:.0f}%"
-    if temp is not None:
-        return f"{temp:.1f}°C"
-    return None
+    return _format_temp_humidity(
+        temps[nearest_temp[0]], hums[nearest_hum[0]]
+    )
 
 
 def fetch_location_and_weather(lat: float, lon: float) -> dict:
@@ -918,6 +935,22 @@ def inject_layout_css() -> None:
       _cancelled: false,
       _lastText: "",
       _speakTimer: null,
+      _failTimer: null,
+      // iOS／部分手機瀏覽器：第一次 speak 必須喺使用者手勢內同步觸發，之後先可以自動播
+      unlock: function () {
+        var synth = getSynth();
+        var Utterance = getUtteranceCtor();
+        if (!synth || !Utterance) return;
+        try { synth.getVoices(); } catch (e) {}
+        if (root.__hkParkingSpeechUnlocked) return;
+        try {
+          var warm = new Utterance("");
+          warm.volume = 0;
+          warm.lang = "zh-HK";
+          synth.speak(warm);
+          root.__hkParkingSpeechUnlocked = true;
+        } catch (e) {}
+      },
       stop: function () {
         this._cancelled = true;
         this._token += 1;
@@ -925,22 +958,33 @@ def inject_layout_css() -> None:
           root.clearTimeout(this._speakTimer);
           this._speakTimer = null;
         }
+        if (this._failTimer) {
+          root.clearTimeout(this._failTimer);
+          this._failTimer = null;
+        }
         var synth = getSynth();
         if (!synth) return;
         try { synth.resume(); } catch (e) {}
         try { synth.cancel(); } catch (e) {}
         try { synth.cancel(); } catch (e) {}
       },
-      speak: function (text) {
+      speak: function (text, opts) {
         var self = this;
         var synth = getSynth();
         var Utterance = getUtteranceCtor();
         if (!synth || !Utterance || !text) return;
+        opts = opts || {};
+        // immediate：用戶剛撳掣；可縮短 delay，但仍要留極短間隔令 cancel 生效
+        var startDelay = opts.immediate ? 40 : 150;
 
         // 取消任何未開始嘅排程，再開新一次（同一函式內原子完成，避免同 stop iframe 搶跑）
         if (self._speakTimer) {
           root.clearTimeout(self._speakTimer);
           self._speakTimer = null;
+        }
+        if (self._failTimer) {
+          root.clearTimeout(self._failTimer);
+          self._failTimer = null;
         }
         self._cancelled = false;
         self._token += 1;
@@ -1006,7 +1050,15 @@ def inject_layout_css() -> None:
               synth.speak(u);
             }
           }, 400);
-        }, 150);
+
+          // 手機常見：未解鎖時 speak 會靜默失敗 → 還原掣面俾用戶手動播
+          self._failTimer = root.setTimeout(function () {
+            self._failTimer = null;
+            if (token !== self._token || self._cancelled) return;
+            if (synth.speaking || synth.pending) return;
+            clickSpeechEndedSentinel();
+          }, 700);
+        }, startDelay);
       }
     };
     root.__hkParkingSpeech = ctrl;
@@ -1020,6 +1072,10 @@ def inject_layout_css() -> None:
     root.__hkParkingSpeechSpeaking = !!speaking;
   }
   root.__hkParkingSetSpeechSpeakingUi = setSpeechSpeakingUi;
+
+  function unlockSpeechNow() {
+    speech.unlock();
+  }
 
   function stopSpeechNow() {
     speech.stop();
@@ -1037,9 +1093,11 @@ def inject_layout_css() -> None:
       stopSpeechNow();
       return;
     }
+    // 必須喺 pointerdown／click 手勢內先 unlock，iOS 先肯出聲
+    unlockSpeechNow();
     var text = root.__hkParkingSpeechLastText || (speech._lastText || "");
     if (!text) return;
-    speech.speak(text);
+    speech.speak(text, { immediate: true });
     setSpeechSpeakingUi(true);
   }
 
@@ -1070,7 +1128,7 @@ def inject_layout_css() -> None:
     doc.querySelectorAll('iframe[title*="streamlit_js_eval"]').forEach(collapseIframeContainer);
   }
 
-  // Streamlit 1.51：height=0 會被當成 falsy 而用預設 ~150px，撐開「再聽一次」下方空白。
+  // Streamlit 1.51：height=0 會被當成 falsy 而用預設 ~150px，撐開「播放建議」下方空白。
   // 標記用 height=1 的 speech sync／speak／stop iframe，一律收起。
   // 唔好收起 mic_recorder（語音掣）；佢可能短暫 height=0／未 setFrameHeight。
   function isMicRecorderIframe(iframe) {
@@ -1130,8 +1188,15 @@ def inject_layout_css() -> None:
       restoreMicIframeVisibility(iframe);
       if (!iframe.dataset.stopSpeechBound) {
         iframe.dataset.stopSpeechBound = "1";
-        iframe.addEventListener("pointerdown", stopSpeechNow, true);
-        iframe.addEventListener("click", stopSpeechNow, true);
+        // 語音掣手勢內解鎖 TTS，之後自動朗讀先會喺 iOS 出聲
+        iframe.addEventListener("pointerdown", function () {
+          unlockSpeechNow();
+          stopSpeechNow();
+        }, true);
+        iframe.addEventListener("click", function () {
+          unlockSpeechNow();
+          stopSpeechNow();
+        }, true);
       }
       try {
         var btn = iframe.contentDocument && iframe.contentDocument.querySelector("button");
@@ -1162,8 +1227,14 @@ def inject_layout_css() -> None:
 
         if (!btn.dataset.stopSpeechBound) {
           btn.dataset.stopSpeechBound = "1";
-          btn.addEventListener("click", stopSpeechNow, true);
-          btn.addEventListener("pointerdown", stopSpeechNow, true);
+          btn.addEventListener("click", function () {
+            unlockSpeechNow();
+            stopSpeechNow();
+          }, true);
+          btn.addEventListener("pointerdown", function () {
+            unlockSpeechNow();
+            stopSpeechNow();
+          }, true);
         }
       } catch (e) {}
     });
@@ -1201,6 +1272,7 @@ def inject_layout_css() -> None:
   function isMicLikeLabel(label) {
     return label.indexOf("查詢") !== -1
       || label.indexOf("停止播放") !== -1
+      || label.indexOf("播放建議") !== -1
       || label.indexOf("再聽一次") !== -1;
   }
 
@@ -1217,20 +1289,35 @@ def inject_layout_css() -> None:
     doc.querySelectorAll('div[data-testid="stFormSubmitButton"] button').forEach(function (btn) {
       if (btn.dataset.stopSpeechBound) return;
       btn.dataset.stopSpeechBound = "1";
-      btn.addEventListener("click", stopSpeechNow, true);
-      btn.addEventListener("pointerdown", stopSpeechNow, true);
+      // 查詢掣手勢內解鎖 TTS（空 utterance），結果頁自動朗讀先可喺 iOS／手機出聲
+      btn.addEventListener("pointerdown", function () {
+        unlockSpeechNow();
+        stopSpeechNow();
+      }, true);
+      btn.addEventListener("click", function () {
+        unlockSpeechNow();
+        stopSpeechNow();
+      }, true);
     });
+  }
+
+  function isSpeechToggleLabel(label) {
+    return label.indexOf("停止播放") !== -1
+      || label.indexOf("播放建議") !== -1
+      || label.indexOf("再聽一次") !== -1;
   }
 
   function bindSuggestionSpeechButtons() {
     doc.querySelectorAll("button").forEach(function (btn) {
       var label = (btn.textContent || "").replace(/\\s+/g, "");
-      if (label.indexOf("停止播放") === -1 && label.indexOf("再聽一次") === -1) return;
+      if (!isSpeechToggleLabel(label)) return;
       bindMicLikeHover(btn);
       if (btn.dataset.speechToggleBound) return;
       btn.dataset.speechToggleBound = "1";
       // 前端即時 stop／replay；唔 preventDefault，等 Streamlit 更新掣文字
       btn.addEventListener("pointerdown", toggleSuggestionSpeechNow, true);
+      // iOS 部分情況 pointerdown 唔夠；click 再補一次 unlock＋播
+      btn.addEventListener("click", toggleSuggestionSpeechNow, true);
     });
   }
 
@@ -2332,7 +2419,7 @@ def render_text_with_speech(
     # 建議全文同一欄、以緊湊 HTML 渲染；按鈕置頂對齊第一行。
     # 語音 sync／播／停 iframe 延後到結果表之後（flush_deferred_speech_browser_ops），
     # 避免撐開掣上下空隙（margin b／c）。
-    toggle_label = "⏹ 停止播放" if speaking else "🔊 再聽一次"
+    toggle_label = "⏹ 停止播放" if speaking else "🔊 播放建議"
     if show_written and written:
         text_col, btn_col = st.columns([3.6, 1.2], vertical_alignment="top")
         with text_col:
@@ -2375,7 +2462,7 @@ def render_text_with_speech(
             st.session_state.pop("_pending_speak_text", None)
             stop_requested = True
         else:
-            # 而家顯示「再聽一次」→ 用戶要再播（前端 pointerdown 已開始播）
+            # 而家顯示「播放建議」→ 用戶要播（前端 pointerdown／click 已開始播）
             st.session_state._suggestion_speaking = True
             st.session_state.pop("_pending_speak_text", None)
             st.session_state._last_spoken_text = spoken
