@@ -20,7 +20,7 @@ Can we predict whether a car park will have private-car vacancies (classificatio
 - `explore_api.ipynb`: Exploration, modeling, EDA, and functions
 - `collect.ipynb`: Continuous data collection
 - `parking.db`: SQLite database
-- `carparks_kwuntong_shatin.csv`: Target car park list
+- `app.py`: Streamlit interface
 - `report_outline.md`: Report structure and current findings
 
 ## Next Steps

@@ -22,11 +22,7 @@ from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 from pyflac import StreamEncoder
 
-from sub_districts import (
-    all_district_names,
-    all_sub_district_names,
-    ensure_carpark_sub_districts,
-)
+from google_areas import reverse_geocode_location_label
 
 WEEKDAY_CN = {0: "週一", 1: "週二", 2: "週三", 3: "週四", 4: "週五", 5: "週六", 6: "週日"}
 WEEKDAY_SHORT = {0: "一", 1: "二", 2: "三", 3: "四", 4: "五", 5: "六", 6: "日"}
@@ -52,6 +48,8 @@ NUM_CN = {1: "一", 2: "兩", 3: "三", 4: "四", 5: "五", 6: "六", 7: "七", 
 DEFAULT_TOP_N = 10
 # 暫時隱藏預測建議書面文字；朗讀掣／自動播仍然保留。改 True 即可恢復顯示
 SHOW_WRITTEN_SUGGESTION = False
+# 朗讀自然結束時由 JS 點擊；放頁頂並以 CSS 收起，唔插入結果區
+SPEECH_ENDED_SENTINEL_LABEL = "SPEECH_ENDED"
 
 load_dotenv()
 
@@ -424,152 +422,29 @@ def _nearest_hko_station(
     return best_name, best_dist
 
 
-@st.cache_data
-def _carpark_district_points() -> list[tuple[str, float, float]]:
-    """停車場座標 → 子區對照（Google reverse geocode 失敗時後備）。"""
-    ensure_carpark_sub_districts()
-    conn = sqlite3.connect("parking.db")
-    try:
-        rows = conn.execute(
-            "SELECT COALESCE(NULLIF(sub_district, ''), district), latitude, longitude "
-            "FROM carparks "
-            "WHERE latitude IS NOT NULL AND longitude IS NOT NULL "
-            "AND district IS NOT NULL AND district != ''"
-        ).fetchall()
-    finally:
-        conn.close()
-    return [(str(d), float(lat), float(lon)) for d, lat, lon in rows]
-
-
-def _resolve_user_district_from_carparks(lat: float, lon: float) -> str | None:
-    """依最近停車場所屬子區，推斷使用者所在地區（後備）。"""
-    points = _carpark_district_points()
-    if not points:
-        return None
-    best_district = None
-    best_dist = float("inf")
-    for district, plat, plon in points:
-        dist = _haversine_km(lat, lon, plat, plon)
-        if dist < best_dist:
-            best_dist = dist
-            best_district = district
-    if best_district is None or best_dist > HKO_MAX_STATION_DISTANCE_KM:
-        return None
-    return best_district
-
-
-_REVERSE_GEOCODE_SKIP_NAMES = {
-    "香港",
-    "Hong Kong",
-    "HK",
-    "中華人民共和國",
-    "China",
-    "People's Republic of China",
-}
-_REVERSE_GEOCODE_TYPE_PRIORITY = (
-    "neighborhood",
-    "sublocality_level_2",
-    "sublocality_level_1",
-    "sublocality",
-    "locality",
-    "administrative_area_level_2",
-    "administrative_area_level_1",
-)
-
-
-def _label_from_google_address_components(results: list) -> str | None:
-    """從 Google reverse geocode 結果抽出短地區名（優先對齊本系統子區／十八區）。"""
-    known_subs = all_sub_district_names()
-    known_districts = all_district_names()
-    components: list[tuple[str, set[str]]] = []
-    for result in results or []:
-        for comp in result.get("address_components") or []:
-            name = (comp.get("long_name") or comp.get("short_name") or "").strip()
-            if not name or name in _REVERSE_GEOCODE_SKIP_NAMES:
-                continue
-            types = set(comp.get("types") or [])
-            components.append((name, types))
-
-    # 1) 直接命中本系統子區／十八區名
-    for name, _types in components:
-        if name in known_subs:
-            return name
-    for name, _types in components:
-        if name in known_districts:
-            return name
-        if name.endswith("區") and name in known_districts:
-            return name
-        if f"{name}區" in known_districts:
-            return f"{name}區"
-
-    # 2) 依 Google 類型優先級取短名
-    for preferred in _REVERSE_GEOCODE_TYPE_PRIORITY:
-        for name, types in components:
-            if preferred in types:
-                return name
-
-    # 3) formatted_address 內找已知地名
-    for result in results or []:
-        formatted = (result.get("formatted_address") or "").strip()
-        if not formatted:
-            continue
-        for sub in known_subs:
-            if sub in formatted:
-                return sub
-        for district in known_districts:
-            if district in formatted:
-                return district
-
-    top = (results or [{}])[0]
-    formatted = (top.get("formatted_address") or "").strip()
-    if not formatted:
-        return None
-    # 去掉尾部「香港」等，取較短可讀片段
-    short = formatted.replace(", Hong Kong", "").replace("香港", "").strip(" ,")
-    return short or formatted
-
-
-def reverse_geocode_location_label(lat: float, lon: float) -> str | None:
-    """
-    用 Google Geocoding reverse geocode 把 GPS 轉成地區名。
-    無 API key 或 API 異常時 raise RuntimeError。
-    """
-    if not GOOGLE_MAPS_API_KEY:
-        raise RuntimeError("missing_api_key")
-
-    params = {
-        "latlng": f"{lat},{lon}",
-        "language": "zh-HK",
-        "key": GOOGLE_MAPS_API_KEY,
-    }
-    response = requests.get(GOOGLE_GEOCODE_URL, params=params, timeout=15)
-    response.raise_for_status()
-    data = response.json()
-    status = data.get("status")
-    if status == "ZERO_RESULTS":
-        return None
-    if status != "OK" or not data.get("results"):
-        raise RuntimeError(f"geocode_status:{status}")
-    return _label_from_google_address_components(data["results"])
-
-
 def resolve_user_district(lat: float, lon: float) -> str | None:
-    """優先用 Google Maps reverse geocode；失敗則用最近停車場子區。"""
+    """只用 Google Maps reverse geocode 把 GPS 轉成地區名。"""
     try:
-        label = reverse_geocode_location_label(lat, lon)
-        if label:
-            return label
+        return reverse_geocode_location_label(lat, lon)
     except Exception:
-        pass
-    return _resolve_user_district_from_carparks(lat, lon)
+        return None
 
 
-@st.cache_data(ttl=60)
-def fetch_location_and_weather(lat: float, lon: float) -> dict:
-    """地區：Google reverse geocode；天氣：天文台 1 分鐘氣溫／濕度（最近測站）。"""
-    location_name = resolve_user_district(lat, lon)
-    weather_text = None
+# 地區名變動較慢；天氣對齊天文台 1 分鐘更新
+LOCATION_CACHE_TTL_SEC = 10 * 60
+WEATHER_CACHE_TTL_SEC = 60
+HEADER_AUTO_REFRESH = timedelta(seconds=WEATHER_CACHE_TTL_SEC)
 
+
+@st.cache_data(ttl=LOCATION_CACHE_TTL_SEC)
+def fetch_user_location_label(lat: float, lon: float) -> str | None:
+    """Google reverse geocode → 地區名。"""
+    return resolve_user_district(lat, lon)
+
+
+@st.cache_data(ttl=WEATHER_CACHE_TTL_SEC)
+def fetch_user_weather(lat: float, lon: float) -> str | None:
+    """天文台 1 分鐘氣溫／濕度（最近測站）。"""
     try:
         temp_resp = requests.get(HKO_TEMP_CSV_URL, timeout=10)
         temp_resp.raise_for_status()
@@ -579,52 +454,59 @@ def fetch_location_and_weather(lat: float, lon: float) -> dict:
         hum_resp.raise_for_status()
         hums = _parse_hko_latest_csv(hum_resp.text)
     except Exception:
-        return {"location": location_name, "weather": None}
+        return None
 
     # 以最近氣溫測站取天氣（與天文台 App 選站邏輯一致）；濕度僅用同站讀數
     temp_candidates = [n for n in temps if n in HKO_AWS_STATIONS]
     nearest = _nearest_hko_station(lat, lon, temp_candidates)
     if nearest is None:
-        return {"location": location_name, "weather": None}
+        return None
 
     station_en, dist_km = nearest
     if dist_km > HKO_MAX_STATION_DISTANCE_KM:
-        return {"location": location_name, "weather": None}
+        return None
 
     temp = temps.get(station_en)
     humidity = hums.get(station_en)
 
     if temp is not None and humidity is not None:
-        weather_text = f"{temp:.1f}°C｜濕度 {humidity:.0f}%"
-    elif temp is not None:
-        weather_text = f"{temp:.1f}°C"
+        return f"{temp:.1f}°C｜濕度 {humidity:.0f}%"
+    if temp is not None:
+        return f"{temp:.1f}°C"
+    return None
 
-    return {"location": location_name, "weather": weather_text}
+
+def fetch_location_and_weather(lat: float, lon: float) -> dict:
+    """地區 + 天氣（分開 cache，避免為咗天氣每分鐘打 Google Geocode）。"""
+    return {
+        "location": fetch_user_location_label(lat, lon),
+        "weather": fetch_user_weather(lat, lon),
+    }
 
 
 def resolve_user_geolocation() -> None:
-    """向瀏覽器要 GPS，成功或失敗後寫入 session_state（只解析一次）。"""
-    if st.session_state.get("user_geo_coords") or st.session_state.get("user_geo_error"):
-        return
-
+    """向瀏覽器要 GPS；有新座標就更新，等緊回應時保留舊值。"""
     geo = get_geolocation()
     if geo is None:
         return
     if isinstance(geo, dict) and "error" in geo:
-        st.session_state.user_geo_error = True
+        # 已有座標就唔因單次失敗清掉（自動刷新期間短暫失敗）
+        if not st.session_state.get("user_geo_coords"):
+            st.session_state.user_geo_error = True
         return
     if isinstance(geo, dict) and geo.get("coords"):
         lat = float(geo["coords"]["latitude"])
         lon = float(geo["coords"]["longitude"])
         # 約 100m 精度，減少 GPS 微抖導致的 cache miss
         st.session_state.user_geo_coords = (round(lat, 3), round(lon, 3))
+        st.session_state.pop("user_geo_error", None)
 
 
+@st.fragment(run_every=HEADER_AUTO_REFRESH)
 def render_header_context_panel() -> None:
-    """標題下資訊卡：時間由前端 JS 每秒改文字（唔用 fragment，避免閃爍）。
+    """標題下資訊卡：時間由前端 JS 每秒改文字；地區／天氣每 60 秒自動刷新。"""
+    resolve_user_geolocation()
 
-    地區／天氣喺頁面自然 rerun 時更新（定位完成、查詢等）；天氣本身有 60s cache。
-    """
     hk_time = format_hong_kong_now()
     location_label = "定位中…"
     weather_label = "定位中…"
@@ -640,8 +522,8 @@ def render_header_context_panel() -> None:
 
     rows = [
         ("香港時間", hk_time, "mzd-hk-time"),
-        ("你目前所在的地區", location_label, None),
-        ("天氣", weather_label, None),
+        ("你目前所在的地區", location_label, "mzd-location"),
+        ("天氣", weather_label, "mzd-weather"),
     ]
     cells = []
     for label, value, value_class in rows:
@@ -822,8 +704,7 @@ def inject_layout_css() -> None:
   [data-testid="stCaption"] {
     margin-bottom: 0.35rem !important;
   }
-  /* get_geolocation 的 iframe 插在 caption 與資訊卡之間會撐開大空隙；
-     查詢後因已有座標而不再插入，間距才變緊。一律收起以固定為緊湊標準。 */
+  /* get_geolocation 的 iframe 會撐開空隙；資訊卡每 60s 刷新仍會插入，一律收起。 */
   iframe[title*="streamlit_js_eval"] {
     position: fixed !important;
     left: -10000px !important;
@@ -850,7 +731,8 @@ def inject_layout_css() -> None:
   div[data-testid="stTextInput"] {
     margin-bottom: 0 !important;
   }
-  div[data-testid="column"] > div {
+  div[data-testid="column"] > div,
+  div[data-testid="stColumn"] > div {
     width: 100%;
   }
   /* 查詢掣同語音掣：同一高度／圓角／對齊 */
@@ -914,6 +796,83 @@ def inject_layout_css() -> None:
     min-height: 2.5rem !important;
     border-radius: 0.5rem !important;
     box-sizing: border-box !important;
+  }
+  /* Alert／語音掣：唔加額外 margin（只留 VerticalBlock 預設 gap＝margin a） */
+  div[data-testid="stAlert"] {
+    margin-top: 0 !important;
+    margin-bottom: 0 !important;
+  }
+  div[data-testid="stHorizontalBlock"]:has(button[kind="secondary"]),
+  div[data-testid="stElementContainer"]:has(
+    div[data-testid="stHorizontalBlock"]:has(button[kind="secondary"])
+  ),
+  div[data-testid="stElementContainer"]:has(div[data-testid="stButton"] button[kind="secondary"]) {
+    margin-top: 0 !important;
+    margin-bottom: 0 !important;
+    padding-top: 0 !important;
+    padding-bottom: 0 !important;
+  }
+  div[data-testid="stHorizontalBlock"]:has(button[kind="secondary"])
+    [data-testid="stElementContainer"],
+  div[data-testid="stHorizontalBlock"]:has(button[kind="secondary"])
+    div[data-testid="stButton"],
+  div[data-testid="stHorizontalBlock"]:has(button[kind="secondary"])
+    div[data-testid="column"] > div,
+  div[data-testid="stHorizontalBlock"]:has(button[kind="secondary"])
+    div[data-testid="stColumn"] > div {
+    margin-top: 0 !important;
+    margin-bottom: 0 !important;
+    padding-top: 0 !important;
+    padding-bottom: 0 !important;
+  }
+  /* 手機 columns stack 時，空左欄唔好撐高 */
+  @media (max-width: 640px) {
+    div[data-testid="stHorizontalBlock"]:has(button[kind="secondary"])
+      > div[data-testid="column"]:not(:has(button)),
+    div[data-testid="stHorizontalBlock"]:has(button[kind="secondary"])
+      > div[data-testid="stColumn"]:not(:has(button)) {
+      display: none !important;
+    }
+  }
+  /* SPEECH_ENDED sentinel：錨點 + 下一粒掣，完全移出文件流 */
+  [data-testid="stElementContainer"]:has(.mzd-speech-ended-anchor),
+  [data-testid="stElementContainer"]:has(.mzd-speech-ended-anchor)
+    + [data-testid="stElementContainer"] {
+    position: absolute !important;
+    width: 0 !important;
+    height: 0 !important;
+    min-height: 0 !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    overflow: hidden !important;
+    opacity: 0 !important;
+    pointer-events: none !important;
+    border: none !important;
+  }
+  /* Streamlit 1.51 會把 height=0 當 falsy 回落 ~150px；用 height=1 再收起。
+     排除 mic_recorder，避免語音掣被一併藏起。 */
+  iframe[height="0"]:not([title*="mic_recorder"]),
+  iframe[height="1"]:not([title*="mic_recorder"]) {
+    position: absolute !important;
+    width: 0 !important;
+    height: 0 !important;
+    min-height: 0 !important;
+    border: none !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    opacity: 0 !important;
+    pointer-events: none !important;
+  }
+  [data-testid="stElementContainer"]:has(iframe[height="0"]:not([title*="mic_recorder"])),
+  [data-testid="stElementContainer"]:has(iframe[height="1"]:not([title*="mic_recorder"])) {
+    position: absolute !important;
+    width: 0 !important;
+    height: 0 !important;
+    min-height: 0 !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    overflow: hidden !important;
+    border: none !important;
   }
 </style>
         """,
@@ -1084,27 +1043,53 @@ def inject_layout_css() -> None:
     setSpeechSpeakingUi(true);
   }
 
+  function collapseIframeContainer(iframe) {
+    iframe.style.position = "fixed";
+    iframe.style.left = "-10000px";
+    iframe.style.top = "0";
+    iframe.style.width = "0";
+    iframe.style.height = "0";
+    iframe.style.minHeight = "0";
+    iframe.style.border = "none";
+    iframe.style.opacity = "0";
+    iframe.style.pointerEvents = "none";
+    var wrap = iframe.closest('[data-testid="stElementContainer"]');
+    if (wrap) {
+      wrap.style.position = "absolute";
+      wrap.style.width = "0";
+      wrap.style.height = "0";
+      wrap.style.minHeight = "0";
+      wrap.style.margin = "0";
+      wrap.style.padding = "0";
+      wrap.style.overflow = "hidden";
+      wrap.style.border = "none";
+    }
+  }
+
   function collapseJsEvalIframes() {
-    doc.querySelectorAll('iframe[title*="streamlit_js_eval"]').forEach(function (iframe) {
-      iframe.style.position = "fixed";
-      iframe.style.left = "-10000px";
-      iframe.style.top = "0";
-      iframe.style.width = "0";
-      iframe.style.height = "0";
-      iframe.style.minHeight = "0";
-      iframe.style.border = "none";
-      iframe.style.opacity = "0";
-      iframe.style.pointerEvents = "none";
-      var wrap = iframe.closest('[data-testid="stElementContainer"]');
-      if (wrap) {
-        wrap.style.position = "absolute";
-        wrap.style.width = "0";
-        wrap.style.height = "0";
-        wrap.style.minHeight = "0";
-        wrap.style.margin = "0";
-        wrap.style.padding = "0";
-        wrap.style.overflow = "hidden";
-      }
+    doc.querySelectorAll('iframe[title*="streamlit_js_eval"]').forEach(collapseIframeContainer);
+  }
+
+  // Streamlit 1.51：height=0 會被當成 falsy 而用預設 ~150px，撐開「再聽一次」下方空白。
+  // 標記用 height=1 的 speech sync／speak／stop iframe，一律收起。
+  // 唔好收起 mic_recorder（語音掣）；佢可能短暫 height=0／未 setFrameHeight。
+  function isMicRecorderIframe(iframe) {
+    var title = iframe.title || "";
+    return title.indexOf("mic_recorder") !== -1;
+  }
+  function collapseHiddenSpeechIframes() {
+    doc.querySelectorAll("iframe").forEach(function (iframe) {
+      if (isMicRecorderIframe(iframe)) return;
+      var srcdoc = "";
+      try { srcdoc = iframe.srcdoc || iframe.getAttribute("srcdoc") || ""; } catch (e) {}
+      var marker = srcdoc.indexOf("sync-speech-text:") !== -1
+        || srcdoc.indexOf("speak-nonce:") !== -1
+        || srcdoc.indexOf("stop-nonce:") !== -1
+        || srcdoc.indexOf("__hkParkingSpeech") !== -1;
+      var hAttr = parseInt(iframe.getAttribute("height") || "-1", 10);
+      var hStyle = parseInt(iframe.style.height || "-1", 10);
+      var tiny = (hAttr >= 0 && hAttr <= 1) || (hStyle >= 0 && hStyle <= 1);
+      if (marker || tiny) collapseIframeContainer(iframe);
     });
   }
 
@@ -1116,11 +1101,33 @@ def inject_layout_css() -> None:
     return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="1.05em" height="1.05em" fill="currentColor" aria-hidden="true" style="flex-shrink:0;display:block;"><rect x="6" y="6" width="12" height="12" rx="1.5"/></svg>';
   }
 
+  function restoreMicIframeVisibility(iframe) {
+    // 若先前被 collapseHiddenSpeechIframes 誤收起，還原可見性
+    iframe.style.position = "";
+    iframe.style.left = "";
+    iframe.style.top = "";
+    iframe.style.opacity = "";
+    iframe.style.pointerEvents = "";
+    iframe.style.border = "";
+    iframe.style.height = "2.5rem";
+    iframe.style.minHeight = "2.5rem";
+    iframe.style.width = "100%";
+    var wrap = iframe.closest('[data-testid="stElementContainer"]');
+    if (wrap) {
+      wrap.style.position = "";
+      wrap.style.width = "";
+      wrap.style.height = "";
+      wrap.style.minHeight = "";
+      wrap.style.margin = "";
+      wrap.style.padding = "";
+      wrap.style.overflow = "";
+      wrap.style.border = "";
+    }
+  }
+
   function styleMicButtons() {
     doc.querySelectorAll('iframe[title*="mic_recorder"]').forEach(function (iframe) {
-      iframe.style.height = "2.5rem";
-      iframe.style.minHeight = "2.5rem";
-      iframe.style.width = "100%";
+      restoreMicIframeVisibility(iframe);
       if (!iframe.dataset.stopSpeechBound) {
         iframe.dataset.stopSpeechBound = "1";
         iframe.addEventListener("pointerdown", stopSpeechNow, true);
@@ -1230,13 +1237,20 @@ def inject_layout_css() -> None:
   function hideSpeechEndedSentinel() {
     doc.querySelectorAll("button").forEach(function (btn) {
       if ((btn.textContent || "").trim() !== "SPEECH_ENDED") return;
-      var wrap = btn.closest('div[data-testid="stButton"]') || btn.parentElement;
-      if (wrap) {
-        wrap.style.position = "absolute";
-        wrap.style.width = "0";
-        wrap.style.height = "0";
-        wrap.style.overflow = "hidden";
-        wrap.style.opacity = "0";
+      var el = btn.closest('[data-testid="stElementContainer"]')
+        || btn.closest('div[data-testid="stButton"]')
+        || btn.parentElement;
+      if (el) {
+        el.style.position = "absolute";
+        el.style.width = "0";
+        el.style.height = "0";
+        el.style.minHeight = "0";
+        el.style.margin = "0";
+        el.style.padding = "0";
+        el.style.overflow = "hidden";
+        el.style.opacity = "0";
+        el.style.pointerEvents = "none";
+        el.style.border = "none";
       }
       btn.style.position = "fixed";
       btn.style.left = "-10000px";
@@ -1280,6 +1294,7 @@ def inject_layout_css() -> None:
   styleMicButtons();
   styleMicLikeActionButtons();
   collapseJsEvalIframes();
+  collapseHiddenSpeechIframes();
   bindQueryStopSpeech();
   bindSuggestionSpeechButtons();
   hideSpeechEndedSentinel();
@@ -1288,6 +1303,7 @@ def inject_layout_css() -> None:
     styleMicButtons();
     styleMicLikeActionButtons();
     collapseJsEvalIframes();
+    collapseHiddenSpeechIframes();
     bindQueryStopSpeech();
     bindSuggestionSpeechButtons();
     hideSpeechEndedSentinel();
@@ -1296,7 +1312,7 @@ def inject_layout_css() -> None:
 })();
 </script>
         """,
-        height=0,
+        height=1,
     )
 
 
@@ -1362,8 +1378,20 @@ def render_voice_feedback(feedback_key: str) -> None:
 
 inject_layout_css()
 
+# SPEECH_ENDED sentinel 放頁頂並以 CSS 收起，避免插入結果區撐開 margin b／c。
+# 唔好喺呢度 st.rerun()：撳掣本身已觸發重跑；若再 rerun 會中斷腳本，
+# 結果表（同標題／查詢列）未畫就消失。只改 session 狀態，讓本輪繼續畫完。
+if "_suggestion_speaking" not in st.session_state:
+    st.session_state._suggestion_speaking = False
+st.markdown(
+    '<span class="mzd-speech-ended-anchor" aria-hidden="true"></span>',
+    unsafe_allow_html=True,
+)
+if st.button(SPEECH_ENDED_SENTINEL_LABEL, key="_suggestion_speech_ended"):
+    st.session_state._suggestion_speaking = False
+    st.session_state.pop("_pending_speak_text", None)
+
 render_brand_header()
-resolve_user_geolocation()
 render_header_context_panel()
 
 # 語音結果必須喺 text_input(key="user_query") 之前套用
@@ -1411,17 +1439,11 @@ render_voice_feedback("_voice_feedback")
 
 
 
-def _sub_district_layout_version() -> str:
-    """子區定義變更時令 load_data 快取失效（避免仍用舊 sub_district 標籤）。"""
-    return "|".join(sorted(all_sub_district_names()))
-
-
 @st.cache_data
-def load_data(_layout_version: str = ""):
-    ensure_carpark_sub_districts()
+def load_data():
     conn = sqlite3.connect("parking.db")
     df = pd.read_sql_query("""
-        SELECT v.park_id, v.vacancy, v.collected_at, c.name, c.district, c.sub_district,
+        SELECT v.park_id, v.vacancy, v.collected_at, c.name, c.district, c.google_area,
                c.latitude, c.longitude
         FROM vacancy_records v
         LEFT JOIN carparks c ON v.park_id = c.park_id
@@ -1434,7 +1456,8 @@ def load_data(_layout_version: str = ""):
         + (df["collected_at"].dt.minute >= 30).astype(int)
     )
     df["dow"] = df["collected_at"].dt.dayofweek
-    df["sub_district"] = df["sub_district"].fillna(df["district"])
+    # 結果表「地區」：Google reverse geocode 短名；未填則退回十八區
+    df["sub_district"] = df["google_area"].fillna(df["district"])
     return df
 
 
@@ -1587,7 +1610,7 @@ def format_carpark_fee(
     return "未提供"
 
 
-df = load_data(_layout_version=_sub_district_layout_version())
+df = load_data()
 
 
 def _normalize_park_name(name: str) -> str:
@@ -1816,16 +1839,31 @@ def is_coming_soon_query(query: str) -> bool:
 
 
 def has_explicit_day_period(query: str) -> bool:
-    """句子是否已標明上／下午、夜晚、am/pm 等時段。"""
+    """句子是否已標明上／下午、夜晚、am/pm、嚟緊等時段。"""
     q = (query or "").replace(" ", "")
     return bool(
         re.search(
-            r"中午|午晝|正午|半夜|午夜|零晨|凌晨|夜晚|晚上|上午|下午|早上|朝早|傍晚|"
+            r"中午|午晝|正午|晏晝|半夜|午夜|零晨|凌晨|清晨|夜晚|晚上|深夜|"
+            r"上午|下午|上晝|下晝|早上|朝早|傍晚|黃昏|黄昏|"
+            r"嚟緊|黎緊|即將|就嚟|快將|快到|"
+            r"今早|今朝|今晨|聽朝|明早|今晚|聽晚|明晚|後晚|大後晚|今夜|明夜|"
             r"a\.?m\.?|p\.?m\.?",
             q,
             flags=re.I,
         )
     )
+
+
+def has_unambiguous_24h_clock(query: str) -> bool:
+    """是否為明確 24 小時制鐘點（如 15:30／15點），無需再標上午／下午。"""
+    q = (query or "").replace(" ", "")
+    m = re.search(r"(?<!\d)([0-2]?\d)[:：]\d{1,2}", q)
+    if m and int(m.group(1)) >= 13:
+        return True
+    m_digit = re.search(r"(?<!\d)([1-2]?\d)[點时時]", q)
+    if m_digit and int(m_digit.group(1)) >= 13:
+        return True
+    return False
 
 
 def coming_soon_hour_candidates(
@@ -2153,9 +2191,6 @@ def format_spoken_suggestion(result_df: pd.DataFrame, hour: int, minute: int = 0
     return prepare_spoken_text_for_tts("".join(parts))
 
 
-SPEECH_ENDED_SENTINEL_LABEL = "SPEECH_ENDED"
-
-
 def _sync_speech_text_to_browser(text: str, *, speaking: bool | None = None) -> None:
     """把建議朗讀稿／播放狀態同步到 parent。"""
     text = prepare_spoken_text_for_tts(text)
@@ -2185,8 +2220,24 @@ def _sync_speech_text_to_browser(text: str, *, speaking: bool | None = None) -> 
         </script>
         <!-- sync-speech-text:{nonce}:{len(text)}:{speaking_js} -->
         """,
-        height=0,
+        height=1,
     )
+
+
+def flush_deferred_speech_browser_ops() -> None:
+    """喺結果表之後先執行語音 sync／播／停，避免 iframe 撐開掣上下空隙。"""
+    payload = st.session_state.pop("_deferred_speech_sync", None)
+    if not payload:
+        return
+    if payload.get("stop"):
+        stop_speech_zh_hk()
+    spoken = payload.get("spoken") or ""
+    speaking = payload.get("speaking")
+    if spoken or speaking is not None:
+        _sync_speech_text_to_browser(spoken, speaking=speaking)
+    pending = payload.get("pending_speak")
+    if pending:
+        speak_text_zh_hk(pending, force=True)
 
 
 def speak_text_zh_hk(text: str, *, force: bool = False) -> None:
@@ -2224,7 +2275,7 @@ def speak_text_zh_hk(text: str, *, force: bool = False) -> None:
         </script>
         <!-- speak-nonce:{nonce} -->
         """,
-        height=0,
+        height=1,
     )
 
 
@@ -2249,7 +2300,7 @@ def stop_speech_zh_hk() -> None:
         </script>
         <!-- stop-nonce:{nonce} -->
         """,
-        height=0,
+        height=1,
     )
 
 
@@ -2260,23 +2311,22 @@ def render_text_with_speech(
     auto_speak: bool = True,
     button_key: str = "suggestion_speech_toggle",
     show_written: bool = True,
-) -> None:
-    """顯示文字；可自動朗讀，並提供再聽／停止按鈕。"""
+) -> bool:
+    """顯示文字；可自動朗讀，並提供再聽／停止按鈕。
+
+    回傳 True 表示掣狀態已變、呼叫端應喺畫完結果表後再 st.rerun()，
+    避免 rerun 太早令表格未畫就消失。
+    """
     written = (written or "").strip()
     spoken = prepare_spoken_text_for_tts(((spoken or written) or "").strip())
     # 冇書面稿亦要可朗讀（例如暫時隱藏建議文字）
     if not written and not spoken:
-        return
+        return False
 
     if "_suggestion_speaking" not in st.session_state:
         st.session_state._suggestion_speaking = False
 
-    # 隱藏 sentinel：朗讀自然結束時由 JS 點擊，切回「再聽一次」
-    if st.button(SPEECH_ENDED_SENTINEL_LABEL, key="_suggestion_speech_ended"):
-        st.session_state._suggestion_speaking = False
-        st.session_state.pop("_pending_speak_text", None)
-        st.rerun()
-
+    need_rerun = False
     should_auto_speak = auto_speak and st.session_state.get("_auto_speak_token") != spoken
     if should_auto_speak:
         st.session_state._suggestion_speaking = True
@@ -2286,7 +2336,8 @@ def render_text_with_speech(
     speaking = bool(st.session_state._suggestion_speaking)
 
     # 建議全文同一欄、以緊湊 HTML 渲染；按鈕置頂對齊第一行。
-    # （舊做法把標題／列表拆開，中間再插語音 sync iframe，會留一大段空白）
+    # 語音 sync／播／停 iframe 延後到結果表之後（flush_deferred_speech_browser_ops），
+    # 避免撐開掣上下空隙（margin b／c）。
     toggle_label = "⏹ 停止播放" if speaking else "🔊 再聽一次"
     if show_written and written:
         text_col, btn_col = st.columns([3.6, 1.2], vertical_alignment="top")
@@ -2313,34 +2364,38 @@ def render_text_with_speech(
                 type="secondary",
             )
     else:
-        # 書面建議隱藏時：朗讀掣靠右，對齊表格「預測空位」欄上方
-        _, btn_col = st.columns([3.6, 1.2], vertical_alignment="top")
-        with btn_col:
-            toggled = st.button(
-                toggle_label,
-                key=button_key,
-                use_container_width=True,
-                type="secondary",
-            )
+        # 書面建議隱藏時：唔用空 column（避免 stack／空隙），直接出掣
+        toggled = st.button(
+            toggle_label,
+            key=button_key,
+            use_container_width=True,
+            type="secondary",
+        )
 
-    _sync_speech_text_to_browser(spoken, speaking=speaking)
-
+    stop_requested = False
+    pending_speak = None
     if toggled:
         if speaking:
-            # 而家顯示「停止播放」→ 用戶要停
+            # 而家顯示「停止播放」→ 用戶要停（iframe 延後 flush）
             st.session_state._suggestion_speaking = False
             st.session_state.pop("_pending_speak_text", None)
-            stop_speech_zh_hk()
+            stop_requested = True
         else:
             # 而家顯示「再聽一次」→ 用戶要再播（前端 pointerdown 已開始播）
             st.session_state._suggestion_speaking = True
             st.session_state.pop("_pending_speak_text", None)
             st.session_state._last_spoken_text = spoken
-        st.rerun()
+        need_rerun = True
     else:
-        pending = st.session_state.pop("_pending_speak_text", None)
-        if pending:
-            speak_text_zh_hk(pending, force=True)
+        pending_speak = st.session_state.pop("_pending_speak_text", None)
+
+    st.session_state["_deferred_speech_sync"] = {
+        "spoken": spoken,
+        "speaking": bool(st.session_state._suggestion_speaking),
+        "pending_speak": pending_speak,
+        "stop": stop_requested,
+    }
+    return need_rerun
 
 
 def render_suggestion_with_speech(
@@ -2351,11 +2406,11 @@ def render_suggestion_with_speech(
     auto_speak: bool = True,
     written: str | None = None,
     spoken: str | None = None,
-) -> None:
-    """顯示建議文字；可自動朗讀，並提供再聽／停止按鈕。"""
+) -> bool:
+    """顯示建議文字；可自動朗讀，並提供再聽／停止按鈕。回傳是否需要延後 rerun。"""
     written = written if written is not None else format_top_suggestion(result_df, hour, minute)
     spoken = spoken if spoken is not None else format_spoken_suggestion(result_df, hour, minute)
-    render_text_with_speech(
+    return render_text_with_speech(
         written,
         spoken,
         auto_speak=auto_speak,
@@ -2391,8 +2446,10 @@ def render_saved_prediction(payload: dict, *, auto_speak: bool = False) -> None:
     else:
         st.success(f"{day} {time_str} {district_label} 較易泊車的停車場（前 {top_n} 名）")
     # 朗讀掣放喺表格外右上方（「預測空位」欄上方），唔入表格
+    # 語音掣若要 rerun，等結果表畫完先執行，避免表消失
+    need_rerun = False
     if not result_df.empty:
-        render_suggestion_with_speech(
+        need_rerun = render_suggestion_with_speech(
             result_df,
             hour,
             minute,
@@ -2401,6 +2458,10 @@ def render_saved_prediction(payload: dict, *, auto_speak: bool = False) -> None:
             spoken=payload.get("spoken"),
         )
     render_ranked_table(result_df)
+    # 語音 iframe 放表後，令 success→掣→表 只各隔一個預設 gap（同 margin a）
+    flush_deferred_speech_browser_ops()
+    if need_rerun:
+        st.rerun()
 
 
 def render_ranked_table(df: pd.DataFrame) -> None:
@@ -2446,7 +2507,7 @@ def render_ranked_table(df: pd.DataFrame) -> None:
         body_rows.append(f"<tr>{''.join(cells)}</tr>")
 
     table_html = f"""
-<div style="width:100%;overflow-x:auto;margin:0.25rem 0 0.75rem 0;
+<div style="width:100%;overflow-x:auto;margin:0 0 0.75rem 0;
   border:1px solid rgba(128,128,128,0.28);border-radius:0.6rem;">
   <table style="width:100%;border-collapse:collapse;font-size:0.95rem;">
     <thead><tr>{header_cells}</tr></thead>
@@ -2999,12 +3060,16 @@ def render_saved_info_answer(payload: dict, *, auto_speak: bool = False) -> None
         st.dataframe(parks_df, use_container_width=True, hide_index=True)
     elif count > 40:
         st.caption(f"該範圍共有 {count} 個停車場，名單較長，以上方文字說明為準。")
-    render_text_with_speech(
+    # 語音掣若要 rerun，等資料表畫完先執行
+    need_rerun = render_text_with_speech(
         payload.get("written") or "",
         payload.get("spoken") or "",
         auto_speak=auto_speak,
         button_key="info_speech_toggle",
     )
+    flush_deferred_speech_browser_ops()
+    if need_rerun:
+        st.rerun()
 
 
 def run_parking_info_answer(intent: dict, query_text: str) -> None:
@@ -3210,6 +3275,24 @@ def needs_missing_time_reentry(intent: dict, query_text: str) -> bool:
     return is_future_day(day) and not intent_has_clock_time(intent.get("hour"))
 
 
+def needs_ambiguous_ampm_reentry(intent: dict, query_text: str) -> bool:
+    """有鐘點但未標明上午／下午等時段 → 不執行預測，要求重新輸入。
+
+    例如「星期日三點」曖昧；「下午三點」「嚟緊三點」「15點」則可接受。
+    """
+    if is_now_query(query_text):
+        return False
+    if not has_explicit_clock_time(query_text):
+        return False
+    if has_explicit_day_period(query_text):
+        return False
+    if is_coming_soon_query(query_text):
+        return False
+    if has_unambiguous_24h_clock(query_text):
+        return False
+    return True
+
+
 def needs_past_time_followup(intent: dict, query_text: str) -> bool:
     """今日（或最近該日）且鐘點已過去 → 不執行預測，要求重新輸入。"""
     if is_now_query(query_text):
@@ -3225,6 +3308,18 @@ def render_missing_time_blocked(intent: dict):
     st.warning(
         f"你想查詢的是 **{format_intent_date(day)}**，但未提供具體時間。"
         f"請重新輸入查詢內容（例如：灣仔大後日下午三點邊度較易泊？）。"
+    )
+
+
+def render_ambiguous_ampm_blocked(intent: dict):
+    """有鐘點但未標上午／下午：顯示意圖並要求重新輸入完整查詢。"""
+    # 唔顯示 LLM 臆測嘅 am/pm，避免誤導
+    display_intent = {**intent, "hour": None, "minute": None}
+    render_intent_summary(display_intent)
+    st.warning(
+        "你提供了鐘點，但未標明是上午還是下午"
+        "（例如：上午／下午／上晝／下晝／朝早／夜晚／凌晨／嚟緊）。"
+        "請重新輸入查詢內容（例如：天晴邨附近星期日下午三點邊度較易泊？）。"
     )
 
 
@@ -3284,6 +3379,8 @@ if should_query and query_text:
             run_parking_info_answer(intent, query_text)
         elif needs_missing_time_reentry(intent, query_text):
             render_missing_time_blocked(intent)
+        elif needs_ambiguous_ampm_reentry(intent, query_text):
+            render_ambiguous_ampm_blocked(intent)
         elif needs_past_time_followup(intent, query_text):
             render_past_time_blocked(intent)
         else:
