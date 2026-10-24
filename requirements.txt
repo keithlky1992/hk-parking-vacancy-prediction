@@ -1,0 +1,10 @@
+streamlit
+streamlit-mic-recorder
+streamlit-js-eval
+pandas
+scikit-learn
+numpy
+requests
+python-dotenv
+supabase>=2
+pyflac

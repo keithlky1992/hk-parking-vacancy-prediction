@@ -9,23 +9,56 @@ Can we predict whether a car park will have private-car vacancies (classificatio
 ## Current Status
 
 - Data collection running (every ~10 min) via `collect.ipynb`
-- SQLite database with `vacancy_records` and `carparks` tables
-- ~150 car parks in 觀塘區 + 沙田區
+- Local SQLite `parking.db` **and** mirrored Supabase Postgres (`carparks`, `vacancy_records`, `weather_records`)
+- ~587 car parks territory-wide; historical vacancy snapshots from mid-Oct 2026
 - Baseline and Gradient Boosting models implemented
-- Basic EDA visualizations and recommendation query function
+- Streamlit app「咪再兜」with recommendation query
 - Report outline drafted
+
+## Supabase
+
+Project: `keithlky1992's Project` (`onxvxtaigqimuishfddp`, region `ap-south-1`).
+
+| Table | Role |
+|-------|------|
+| `carparks` | Static park metadata (PK `park_id`) |
+| `vacancy_records` | Time-series vacancy snapshots |
+| `weather_records` | HKO weather snapshots |
+
+RLS: public **SELECT** for `anon` / `authenticated`; writes require **service role**.
+
+`.env` keys:
+
+```
+SUPABASE_URL=https://onxvxtaigqimuishfddp.supabase.co
+SUPABASE_ANON_KEY=...                 # app.py 讀取
+SUPABASE_SERVICE_ROLE_KEY=...         # 採集寫入（Dashboard → Settings → API）
+```
+
+```bash
+# App（讀雲端）
+streamlit run app.py
+
+# 採集（寫雲端，每 10 分鐘）
+python scripts/collect_to_supabase.py
+# 或跑 collect.ipynb
+
+# 一次性由本機 SQLite 匯入（已做過可略）
+python scripts/migrate_sqlite_to_supabase.py
+```
 
 ## Key Files
 
-- `explore_api.ipynb`: Exploration, modeling, EDA, and functions
-- `collect.ipynb`: Continuous data collection
-- `parking.db`: SQLite database
-- `app.py`: Streamlit interface
-- `report_outline.md`: Report structure and current findings
+- `app.py`: Streamlit「咪再兜」（讀 Supabase）
+- `parking_db.py`: Supabase 讀寫共用層
+- `scripts/collect_to_supabase.py` / `collect.ipynb`: 每 10 分鐘採集寫入雲端
+- `scripts/migrate_sqlite_to_supabase.py`: 一次性 SQLite → Supabase
+- `explore_api.ipynb`: 建模／EDA
+- `parking.db`: 本機備份（可選）
+- `report_outline.md`: 報告大綱
 
 ## Next Steps
 
-- Continue data collection
-- Integrate weather features
-- Build simple interface
+- Scheduled cloud collection（Edge Function / Cron，唔靠本機常開）
+- Persist trained models（Supabase Storage）
 - Complete final report and presentation

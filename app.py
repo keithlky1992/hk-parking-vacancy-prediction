@@ -1,6 +1,5 @@
 import streamlit as st
 import streamlit.components.v1 as components
-import sqlite3
 import pandas as pd
 from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.preprocessing import LabelEncoder
@@ -23,6 +22,7 @@ from zoneinfo import ZoneInfo
 from pyflac import StreamEncoder
 
 from google_areas import reverse_geocode_location_label
+from parking_db import load_vacancy_frame
 
 WEEKDAY_CN = {0: "週一", 1: "週二", 2: "週三", 3: "週四", 4: "週五", 5: "週六", 6: "週日"}
 WEEKDAY_SHORT = {0: "一", 1: "二", 2: "三", 3: "四", 4: "五", 5: "六", 6: "日"}
@@ -1439,16 +1439,10 @@ render_voice_feedback("_voice_feedback")
 
 
 
-@st.cache_data
+@st.cache_data(ttl=600, show_spinner="")
 def load_data():
-    conn = sqlite3.connect("parking.db")
-    df = pd.read_sql_query("""
-        SELECT v.park_id, v.vacancy, v.collected_at, c.name, c.district, c.google_area,
-               c.latitude, c.longitude
-        FROM vacancy_records v
-        LEFT JOIN carparks c ON v.park_id = c.park_id
-    """, conn)
-    conn.close()
+    """從 Supabase 載入空位歷史（香港時間；cache 10 分鐘）。"""
+    df = load_vacancy_frame()
     df["collected_at"] = pd.to_datetime(df["collected_at"])
     # 半小時槽位：0=12:00am … 30=3:00pm、31=3:30pm … 47=11:30pm
     df["half_hour"] = (
