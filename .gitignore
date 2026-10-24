@@ -1,6 +1,7 @@
 # Secrets
 .env
 .env.*
+.streamlit/secrets.toml
 
 # Local / temporary (PDF／影片截圖等暫存，唔提交)
 .tmp_*/

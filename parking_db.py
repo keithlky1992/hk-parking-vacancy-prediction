@@ -16,37 +16,60 @@ load_dotenv()
 HK_TZ = ZoneInfo("Asia/Hong_Kong")
 PAGE_SIZE = 1000
 
-SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
-SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+
+def get_secret(name: str) -> str:
+    """Read from env (.env / Streamlit Cloud) or st.secrets."""
+    val = (os.getenv(name) or "").strip()
+    if val:
+        return val
+    try:
+        import streamlit as st
+
+        if name in st.secrets:
+            return str(st.secrets[name]).strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _supabase_url() -> str:
+    return get_secret("SUPABASE_URL").rstrip("/")
+
+
+def _supabase_anon_key() -> str:
+    return get_secret("SUPABASE_ANON_KEY")
+
+
+def _supabase_service_role_key() -> str:
+    return get_secret("SUPABASE_SERVICE_ROLE_KEY")
 
 
 def _require_url_and_key(key: str, *, what: str) -> tuple[str, str]:
-    if not SUPABASE_URL or not key:
+    url = _supabase_url()
+    if not url or not key:
         raise RuntimeError(
-            f"缺少 Supabase 設定（{what}）。請在 .env 設定 "
+            f"缺少 Supabase 設定（{what}）。請在 .env 或 Streamlit Secrets 設定 "
             "SUPABASE_URL 以及對應的 key。"
         )
-    return SUPABASE_URL, key
+    return url, key
 
 
 def get_read_client() -> Client:
-    url, key = _require_url_and_key(SUPABASE_ANON_KEY, what="讀取 / anon")
+    url, key = _require_url_and_key(_supabase_anon_key(), what="讀取 / anon")
     return create_client(url, key)
 
 
 def get_write_client() -> Client:
     """Prefer service_role; fall back to anon + SECURITY DEFINER RPCs."""
-    if SUPABASE_SERVICE_ROLE_KEY:
-        url, key = _require_url_and_key(
-            SUPABASE_SERVICE_ROLE_KEY, what="寫入 / service_role"
-        )
+    service = _supabase_service_role_key()
+    if service:
+        url, key = _require_url_and_key(service, what="寫入 / service_role")
         return create_client(url, key)
     return get_read_client()
 
 
 def uses_service_role() -> bool:
-    return bool(SUPABASE_SERVICE_ROLE_KEY)
+    return bool(_supabase_service_role_key())
 
 
 def _fetch_all(

@@ -22,7 +22,7 @@ from zoneinfo import ZoneInfo
 from pyflac import StreamEncoder
 
 from google_areas import reverse_geocode_location_label
-from parking_db import load_vacancy_frame
+from parking_db import get_secret, load_vacancy_frame
 
 WEEKDAY_CN = {0: "週一", 1: "週二", 2: "週三", 3: "週四", 4: "週五", 5: "週六", 6: "週日"}
 WEEKDAY_SHORT = {0: "一", 1: "二", 2: "三", 3: "四", 4: "五", 5: "六", 6: "日"}
@@ -65,7 +65,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+DEEPSEEK_API_KEY = get_secret("DEEPSEEK_API_KEY") or None
 DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
 
 # Google STT 需要 FLAC；不用 speech_recognition 內建的 x86_64 flac-mac。
@@ -74,7 +74,7 @@ GOOGLE_STT_KEY = "AIzaSyBOti4mM-6x9WDnZIjIeyEU21OpBXqWBgw"
 
 # Google Maps Geocoding：用地名定位，再篩附近停車場。
 # 港九密度高，「附近」用較細半徑，避免 3km 內遠區大車場（如 AIRSIDE）蓋過目標地點門口車場。
-GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
+GOOGLE_MAPS_API_KEY = get_secret("GOOGLE_MAPS_API_KEY") or None
 GOOGLE_GEOCODE_URL = "https://maps.googleapis.com/maps/api/geocode/json"
 NEARBY_RADIUS_KM = 1.2
 NEARBY_RADIUS_FALLBACK_KM = 2.0
