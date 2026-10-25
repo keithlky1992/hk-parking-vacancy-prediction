@@ -6,6 +6,7 @@ from sklearn.preprocessing import LabelEncoder
 from streamlit_mic_recorder import mic_recorder
 from streamlit_js_eval import get_geolocation
 from dotenv import load_dotenv
+import asyncio
 import base64
 import html
 import io
@@ -752,7 +753,7 @@ def inject_layout_css() -> None:
   div[data-testid="stColumn"] > div {
     width: 100%;
   }
-  /* 查詢掣同語音掣：同一高度／圓角／對齊 */
+  /* 查詢掣同語音掣：同一高度／圓角／字級／字型 */
   div[data-testid="stFormSubmitButton"] {
     width: 100%;
   }
@@ -764,6 +765,16 @@ def inject_layout_css() -> None:
     border-radius: 0.5rem !important;
     line-height: 1 !important;
     box-sizing: border-box !important;
+    font-size: 1rem !important;
+    font-family: "Source Sans Pro", "Segoe UI", sans-serif !important;
+    font-weight: 400 !important;
+  }
+  div[data-testid="stFormSubmitButton"] button p,
+  div[data-testid="stFormSubmitButton"] button span {
+    font-size: 1rem !important;
+    font-family: inherit !important;
+    font-weight: inherit !important;
+    line-height: 1 !important;
   }
   /* 同語音掣（mic_recorder）：outline 預設 + 珊瑚紅 hover（寫死色碼，避免 theme 變數缺失） */
   div[data-testid="stFormSubmitButton"] button,
@@ -1080,6 +1091,7 @@ def inject_layout_css() -> None:
   function stopSpeechNow() {
     speech.stop();
     setSpeechSpeakingUi(false);
+    try { broadcastStopSpeechPlayers(); } catch (e) {}
   }
 
   function toggleSuggestionSpeechNow(ev) {
@@ -1140,6 +1152,8 @@ def inject_layout_css() -> None:
       if (isMicRecorderIframe(iframe)) return;
       var srcdoc = "";
       try { srcdoc = iframe.srcdoc || iframe.getAttribute("srcdoc") || ""; } catch (e) {}
+      // 可見嘅「播放建議」player 唔好收起
+      if (srcdoc.indexOf("speech-player-ui") !== -1) return;
       var marker = srcdoc.indexOf("sync-speech-text:") !== -1
         || srcdoc.indexOf("speak-nonce:") !== -1
         || srcdoc.indexOf("stop-nonce:") !== -1
@@ -1148,6 +1162,17 @@ def inject_layout_css() -> None:
       var hStyle = parseInt(iframe.style.height || "-1", 10);
       var tiny = (hAttr >= 0 && hAttr <= 1) || (hStyle >= 0 && hStyle <= 1);
       if (marker || tiny) collapseIframeContainer(iframe);
+    });
+  }
+
+  function broadcastStopSpeechPlayers() {
+    doc.querySelectorAll("iframe").forEach(function (iframe) {
+      try {
+        iframe.contentWindow && iframe.contentWindow.postMessage(
+          { type: "hk-parking-stop-speech" },
+          "*"
+        );
+      } catch (e) {}
     });
   }
 
@@ -1213,6 +1238,8 @@ def inject_layout_css() -> None:
         btn.style.justifyContent = "center";
         btn.style.gap = "0.35rem";
         btn.style.fontSize = "1rem";
+        btn.style.fontFamily = '"Source Sans Pro", "Segoe UI", sans-serif';
+        btn.style.fontWeight = "400";
         btn.style.lineHeight = "1";
         btn.style.whiteSpace = "nowrap";
 
@@ -1222,7 +1249,7 @@ def inject_layout_css() -> None:
           btn.dataset.iconMode = mode;
           var icon = mode === "stop" ? micStopIconSvg() : micVoiceIconSvg();
           var text = mode === "stop" ? "停止" : "語音";
-          btn.innerHTML = icon + "<span>" + text + "</span>";
+          btn.innerHTML = icon + "<span style=\"font-size:1rem;font-family:inherit;font-weight:inherit;line-height:1;\">" + text + "</span>";
         }
 
         if (!btn.dataset.stopSpeechBound) {
@@ -2385,6 +2412,214 @@ def stop_speech_zh_hk() -> None:
     )
 
 
+@st.cache_data(ttl=6 * 3600, show_spinner="正在產生語音…")
+def synthesize_zh_hk_mp3(text: str) -> bytes | None:
+    """用 Edge 粵語 Neural 聲線合成 MP3（手機 HTML5 Audio 播放較 speechSynthesis 可靠）。"""
+    text = (text or "").strip()
+    if not text:
+        return None
+    # 避免極長稿拖垮 Cloud／base64
+    if len(text) > 800:
+        text = text[:800]
+
+    try:
+        import edge_tts
+    except ImportError:
+        return None
+
+    async def _run() -> bytes:
+        communicate = edge_tts.Communicate(
+            text,
+            voice="zh-HK-HiuMaanNeural",
+            rate="-5%",
+        )
+        chunks: list[bytes] = []
+        async for chunk in communicate.stream():
+            if chunk.get("type") == "audio" and chunk.get("data"):
+                chunks.append(chunk["data"])
+        return b"".join(chunks)
+
+    try:
+        return asyncio.run(_run())
+    except Exception:
+        return None
+
+
+def render_iframe_speech_player(spoken: str, *, auto_speak: bool = False) -> None:
+    """iframe 內建播放掣：優先播伺服器 MP3（iOS 可用），否則退回 Web Speech。
+
+    撳掣同 audio.play()／speak() 必須同一 iframe、同一手勢，唔經 parent。
+    """
+    spoken = prepare_spoken_text_for_tts((spoken or "").strip())
+    if not spoken:
+        return
+
+    mp3 = synthesize_zh_hk_mp3(spoken)
+    payload = json.dumps(spoken, ensure_ascii=False)
+    auto_js = "true" if auto_speak else "false"
+    nonce = abs(hash(spoken)) % (10**9)
+
+    if mp3:
+        audio_src = "data:audio/mpeg;base64," + base64.b64encode(mp3).decode("ascii")
+        audio_src_js = json.dumps(audio_src)
+        media_js = f"""
+  var audioSrc = {audio_src_js};
+  var aud = new Audio();
+  aud.preload = "auto";
+  aud.src = audioSrc;
+  aud.addEventListener("ended", function () {{ setUi(false); }});
+  aud.addEventListener("error", function () {{ setUi(false); }});
+
+  function stopNow() {{
+    try {{ aud.pause(); aud.currentTime = 0; }} catch (e) {{}}
+    try {{ if (synth) synth.cancel(); }} catch (e) {{}}
+    setUi(false);
+  }}
+
+  function speakNow() {{
+    // 必須喺用戶手勢內同步呼叫 play()（iOS 唔接受 setTimeout 後再 play）
+    try {{ aud.pause(); }} catch (e) {{}}
+    try {{ aud.currentTime = 0; }} catch (e) {{}}
+    try {{ if (synth) synth.cancel(); }} catch (e) {{}}
+    setUi(true);
+    var p = aud.play();
+    if (p && typeof p.then === "function") {{
+      p.catch(function () {{
+        setUi(false);
+        speakViaWebSpeech();
+      }});
+    }}
+  }}
+"""
+    else:
+        media_js = """
+  function stopNow() {
+    try { if (synth) synth.cancel(); } catch (e) {}
+    setUi(false);
+  }
+
+  function speakNow() {
+    speakViaWebSpeech();
+  }
+"""
+
+    components.html(
+        f"""
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  html, body {{
+    margin: 0; padding: 0; background: transparent;
+    font-family: "Source Sans", "Segoe UI", sans-serif;
+  }}
+  #btn {{
+    display: flex; align-items: center; justify-content: center;
+    width: 100%; height: 2.5rem; min-height: 2.5rem;
+    margin: 0; padding: 0 0.6rem; box-sizing: border-box;
+    border-radius: 0.5rem;
+    border: 1px solid rgba(250, 250, 250, 0.2);
+    background: #0e1117; color: rgba(250, 250, 250, 0.95);
+    font-size: 1rem; line-height: 1; cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+  }}
+  #btn:active {{ border-color: #ff4b4b; color: #ff4b4b; }}
+</style>
+</head>
+<body>
+<!-- speech-player-ui:{nonce} -->
+<button id="btn" type="button">🔊 播放建議</button>
+<script>
+(function () {{
+  var text = {payload};
+  var wantAuto = {auto_js};
+  var synth = window.speechSynthesis;
+  var Utterance = window.SpeechSynthesisUtterance;
+  var btn = document.getElementById("btn");
+  var uiSpeaking = false;
+  var lockUntil = 0;
+
+  function isIOS() {{
+    var ua = navigator.userAgent || "";
+    return /iPad|iPhone|iPod/.test(ua)
+      || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  }}
+
+  function pickVoice(voices) {{
+    var list = voices || [];
+    return list.find(function (v) {{ return (v.lang || "").toLowerCase().startsWith("zh-hk"); }})
+      || list.find(function (v) {{ return (v.lang || "").toLowerCase().includes("hk"); }})
+      || list.find(function (v) {{ return (v.lang || "").toLowerCase().startsWith("zh"); }})
+      || null;
+  }}
+
+  function setUi(speaking) {{
+    uiSpeaking = !!speaking;
+    btn.textContent = uiSpeaking ? "⏹ 停止播放" : "🔊 播放建議";
+  }}
+
+  function speakViaWebSpeech() {{
+    if (!synth || !Utterance || !text) return;
+    try {{ synth.resume(); }} catch (e) {{}}
+    try {{ synth.cancel(); }} catch (e) {{}}
+    var u = new Utterance(text);
+    u.lang = "zh-HK";
+    u.rate = 0.95;
+    var voice = pickVoice(synth.getVoices());
+    if (voice) u.voice = voice;
+    u.onend = function () {{ setUi(false); }};
+    u.onerror = function () {{ setUi(false); }};
+    setUi(true);
+    synth.speak(u);
+  }}
+
+{media_js}
+
+  function onUserPlayToggle(ev) {{
+    var now = Date.now();
+    if (now < lockUntil) return;
+    lockUntil = now + 400;
+    if (ev) {{
+      try {{ ev.preventDefault(); }} catch (e) {{}}
+    }}
+    if (uiSpeaking) {{
+      stopNow();
+      return;
+    }}
+    speakNow();
+  }}
+
+  btn.addEventListener("click", onUserPlayToggle);
+  btn.addEventListener("touchend", function (ev) {{
+    try {{ ev.preventDefault(); }} catch (e) {{}}
+    onUserPlayToggle(ev);
+  }}, {{ passive: false }});
+
+  window.addEventListener("message", function (ev) {{
+    var data = ev && ev.data;
+    if (!data || data.type !== "hk-parking-stop-speech") return;
+    stopNow();
+  }});
+
+  try {{ synth && synth.getVoices(); }} catch (e) {{}}
+
+  // 桌面可試自動播；iOS 必須手動撳（瀏覽器政策）
+  if (wantAuto && !isIOS()) {{
+    setTimeout(function () {{
+      if (!uiSpeaking) speakNow();
+    }}, 300);
+  }}
+}})();
+</script>
+</body>
+</html>
+        """,
+        height=48,
+    )
+
+
 def render_text_with_speech(
     written: str,
     spoken: str | None = None,
@@ -2393,33 +2628,20 @@ def render_text_with_speech(
     button_key: str = "suggestion_speech_toggle",
     show_written: bool = True,
 ) -> bool:
-    """顯示文字；可自動朗讀，並提供再聽／停止按鈕。
+    """顯示文字，並用 iframe 內建掣朗讀（手機／iOS 可出聲）。
 
-    回傳 True 表示掣狀態已變、呼叫端應喺畫完結果表後再 st.rerun()，
-    避免 rerun 太早令表格未畫就消失。
+    回傳值保留相容（而家唔再需要因掣狀態 rerun，固定 False）。
     """
+    del button_key  # 舊 Streamlit toggle 已棄用
     written = (written or "").strip()
     spoken = prepare_spoken_text_for_tts(((spoken or written) or "").strip())
-    # 冇書面稿亦要可朗讀（例如暫時隱藏建議文字）
     if not written and not spoken:
         return False
 
-    if "_suggestion_speaking" not in st.session_state:
-        st.session_state._suggestion_speaking = False
-
-    need_rerun = False
     should_auto_speak = auto_speak and st.session_state.get("_auto_speak_token") != spoken
     if should_auto_speak:
-        st.session_state._suggestion_speaking = True
-        st.session_state._pending_speak_text = spoken
         st.session_state._auto_speak_token = spoken
 
-    speaking = bool(st.session_state._suggestion_speaking)
-
-    # 建議全文同一欄、以緊湊 HTML 渲染；按鈕置頂對齊第一行。
-    # 語音 sync／播／停 iframe 延後到結果表之後（flush_deferred_speech_browser_ops），
-    # 避免撐開掣上下空隙（margin b／c）。
-    toggle_label = "⏹ 停止播放" if speaking else "🔊 播放建議"
     if show_written and written:
         text_col, btn_col = st.columns([3.6, 1.2], vertical_alignment="top")
         with text_col:
@@ -2438,45 +2660,15 @@ def render_text_with_speech(
                 unsafe_allow_html=True,
             )
         with btn_col:
-            toggled = st.button(
-                toggle_label,
-                key=button_key,
-                use_container_width=True,
-                type="secondary",
-            )
+            render_iframe_speech_player(spoken, auto_speak=should_auto_speak)
     else:
-        # 書面建議隱藏時：唔用空 column（避免 stack／空隙），直接出掣
-        toggled = st.button(
-            toggle_label,
-            key=button_key,
-            use_container_width=True,
-            type="secondary",
-        )
+        render_iframe_speech_player(spoken, auto_speak=should_auto_speak)
 
-    stop_requested = False
-    pending_speak = None
-    if toggled:
-        if speaking:
-            # 而家顯示「停止播放」→ 用戶要停（iframe 延後 flush）
-            st.session_state._suggestion_speaking = False
-            st.session_state.pop("_pending_speak_text", None)
-            stop_requested = True
-        else:
-            # 而家顯示「播放建議」→ 用戶要播（前端 pointerdown／click 已開始播）
-            st.session_state._suggestion_speaking = True
-            st.session_state.pop("_pending_speak_text", None)
-            st.session_state._last_spoken_text = spoken
-        need_rerun = True
-    else:
-        pending_speak = st.session_state.pop("_pending_speak_text", None)
-
-    st.session_state["_deferred_speech_sync"] = {
-        "spoken": spoken,
-        "speaking": bool(st.session_state._suggestion_speaking),
-        "pending_speak": pending_speak,
-        "stop": stop_requested,
-    }
-    return need_rerun
+    # 清除舊 deferred 路徑，避免再走 parent.speechSynthesis 自動播（手機無效）
+    st.session_state.pop("_deferred_speech_sync", None)
+    st.session_state.pop("_pending_speak_text", None)
+    st.session_state._suggestion_speaking = False
+    return False
 
 
 def render_suggestion_with_speech(
