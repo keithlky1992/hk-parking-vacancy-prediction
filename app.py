@@ -1249,7 +1249,7 @@ def inject_layout_css() -> None:
           btn.dataset.iconMode = mode;
           var icon = mode === "stop" ? micStopIconSvg() : micVoiceIconSvg();
           var text = mode === "stop" ? "停止" : "語音";
-          btn.innerHTML = icon + "<span style=\"font-size:1rem;font-family:inherit;font-weight:inherit;line-height:1;\">" + text + "</span>";
+          btn.innerHTML = icon + "<span>" + text + "</span>";
         }
 
         if (!btn.dataset.stopSpeechBound) {
