@@ -1084,14 +1084,106 @@ def inject_layout_css() -> None:
   }
   root.__hkParkingSetSpeechSpeakingUi = setSpeechSpeakingUi;
 
-  function unlockSpeechNow() {
-    speech.unlock();
+  // 極短靜音 WAV：喺「查詢／語音」手勢內 play 一次，之後結果頁可用同一 Audio 自動播（iOS／手機）
+  var SILENT_WAV = "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQQAAAAAAA==";
+
+  function ensureUnlockedMediaAudio() {
+    if (!root.__hkParkingMediaAudio) {
+      root.__hkParkingMediaAudio = new root.Audio();
+      root.__hkParkingMediaAudio.preload = "auto";
+      try { root.__hkParkingMediaAudio.playsInline = true; } catch (e) {}
+      try { root.__hkParkingMediaAudio.setAttribute("playsinline", "true"); } catch (e) {}
+      try { root.__hkParkingMediaAudio.setAttribute("webkit-playsinline", "true"); } catch (e) {}
+    }
+    return root.__hkParkingMediaAudio;
   }
 
-  function stopSpeechNow() {
+  function stopUnlockedMedia() {
+    var a = root.__hkParkingMediaAudio;
+    if (!a) return;
+    try { a.pause(); } catch (e) {}
+    try { a.currentTime = 0; } catch (e) {}
+    a.onended = null;
+    a.onerror = null;
+  }
+
+  function unlockMediaNow() {
+    speech.unlock();
+    try {
+      var a = ensureUnlockedMediaAudio();
+      // iOS：必須非 muted 解鎖，否則之後只能自動播靜音
+      a.muted = false;
+      a.volume = 1;
+      a.src = SILENT_WAV;
+      var finish = function () {
+        try { a.pause(); a.currentTime = 0; } catch (e) {}
+        root.__hkParkingMediaUnlocked = true;
+      };
+      var p = a.play();
+      if (p && typeof p.then === "function") {
+        p.then(finish).catch(function () {
+          // 即使 promise 失敗，手勢內呼叫過 play() 有時仍算解鎖
+          root.__hkParkingMediaUnlocked = true;
+        });
+      } else {
+        finish();
+      }
+    } catch (e) {}
+  }
+
+  function playUnlockedMedia(src, cbs) {
+    cbs = cbs || {};
+    if (!src) {
+      if (typeof cbs.onError === "function") cbs.onError();
+      return false;
+    }
+    try {
+      var a = ensureUnlockedMediaAudio();
+      stopUnlockedMedia();
+      a.muted = false;
+      a.volume = 1;
+      a.src = src;
+      a.onended = function () {
+        if (typeof cbs.onEnded === "function") cbs.onEnded();
+      };
+      a.onerror = function () {
+        if (typeof cbs.onError === "function") cbs.onError();
+      };
+      var p = a.play();
+      if (p && typeof p.then === "function") {
+        p.then(function () {
+          if (typeof cbs.onStart === "function") cbs.onStart();
+        }).catch(function () {
+          if (typeof cbs.onError === "function") cbs.onError();
+        });
+      } else if (typeof cbs.onStart === "function") {
+        cbs.onStart();
+      }
+      return true;
+    } catch (e) {
+      if (typeof cbs.onError === "function") cbs.onError();
+      return false;
+    }
+  }
+
+  root.__hkParkingUnlockMedia = unlockMediaNow;
+  root.__hkParkingPlayUnlockedMedia = playUnlockedMedia;
+  root.__hkParkingStopUnlockedMedia = stopUnlockedMedia;
+
+  function unlockSpeechNow() {
+    unlockMediaNow();
+  }
+
+  // 停建議播音；唔動解鎖用 Audio，避免 pointerdown→click 連續兩下打掉 silent unlock
+  function stopSuggestionPlaybackOnly() {
     speech.stop();
     setSpeechSpeakingUi(false);
     try { broadcastStopSpeechPlayers(); } catch (e) {}
+  }
+
+  function stopSpeechNow() {
+    stopSuggestionPlaybackOnly();
+    try { stopUnlockedMedia(); } catch (e) {}
   }
 
   function toggleSuggestionSpeechNow(ev) {
@@ -1213,14 +1305,14 @@ def inject_layout_css() -> None:
       restoreMicIframeVisibility(iframe);
       if (!iframe.dataset.stopSpeechBound) {
         iframe.dataset.stopSpeechBound = "1";
-        // 語音掣手勢內解鎖 TTS，之後自動朗讀先會喺 iOS 出聲
+        // 語音掣手勢內解鎖 Media／TTS（先停舊播，再 unlock），之後結果頁先可自動播
         iframe.addEventListener("pointerdown", function () {
+          stopSuggestionPlaybackOnly();
           unlockSpeechNow();
-          stopSpeechNow();
         }, true);
         iframe.addEventListener("click", function () {
+          stopSuggestionPlaybackOnly();
           unlockSpeechNow();
-          stopSpeechNow();
         }, true);
       }
       try {
@@ -1255,12 +1347,12 @@ def inject_layout_css() -> None:
         if (!btn.dataset.stopSpeechBound) {
           btn.dataset.stopSpeechBound = "1";
           btn.addEventListener("click", function () {
+            stopSuggestionPlaybackOnly();
             unlockSpeechNow();
-            stopSpeechNow();
           }, true);
           btn.addEventListener("pointerdown", function () {
+            stopSuggestionPlaybackOnly();
             unlockSpeechNow();
-            stopSpeechNow();
           }, true);
         }
       } catch (e) {}
@@ -1316,14 +1408,14 @@ def inject_layout_css() -> None:
     doc.querySelectorAll('div[data-testid="stFormSubmitButton"] button').forEach(function (btn) {
       if (btn.dataset.stopSpeechBound) return;
       btn.dataset.stopSpeechBound = "1";
-      // 查詢掣手勢內解鎖 TTS（空 utterance），結果頁自動朗讀先可喺 iOS／手機出聲
+      // 查詢掣手勢內解鎖 Media／TTS（先停舊播，再 unlock），結果頁自動朗讀先可喺 iOS／手機出聲
       btn.addEventListener("pointerdown", function () {
+        stopSuggestionPlaybackOnly();
         unlockSpeechNow();
-        stopSpeechNow();
       }, true);
       btn.addEventListener("click", function () {
+        stopSuggestionPlaybackOnly();
         unlockSpeechNow();
-        stopSpeechNow();
       }, true);
     });
   }
@@ -2448,7 +2540,8 @@ def synthesize_zh_hk_mp3(text: str) -> bytes | None:
 def render_iframe_speech_player(spoken: str, *, auto_speak: bool = False) -> None:
     """iframe 內建播放掣：優先播伺服器 MP3（iOS 可用），否則退回 Web Speech。
 
-    撳掣同 audio.play()／speak() 必須同一 iframe、同一手勢，唔經 parent。
+    手動撳掣：同一 iframe 內同步 play()／speak()。
+    自動播：用 parent 喺「查詢」手勢解鎖過嘅 Audio（手機／iOS 先得）。
     """
     spoken = prepare_spoken_text_for_tts((spoken or "").strip())
     if not spoken:
@@ -2463,21 +2556,35 @@ def render_iframe_speech_player(spoken: str, *, auto_speak: bool = False) -> Non
         audio_src = "data:audio/mpeg;base64," + base64.b64encode(mp3).decode("ascii")
         audio_src_js = json.dumps(audio_src)
         media_js = f"""
-  var audioSrc = {audio_src_js};
+  audioSrc = {audio_src_js};
   var aud = new Audio();
   aud.preload = "auto";
   aud.src = audioSrc;
   aud.addEventListener("ended", function () {{ setUi(false); }});
   aud.addEventListener("error", function () {{ setUi(false); }});
 
-  function stopNow() {{
+  function stopParentMedia() {{
+    try {{
+      if (window.parent && typeof window.parent.__hkParkingStopUnlockedMedia === "function") {{
+        window.parent.__hkParkingStopUnlockedMedia();
+      }}
+    }} catch (e) {{}}
+  }}
+
+  function stopLocalOnly() {{
     try {{ aud.pause(); aud.currentTime = 0; }} catch (e) {{}}
     try {{ if (synth) synth.cancel(); }} catch (e) {{}}
     setUi(false);
   }}
 
+  function stopNow() {{
+    stopParentMedia();
+    stopLocalOnly();
+  }}
+
   function speakNow() {{
     // 必須喺用戶手勢內同步呼叫 play()（iOS 唔接受 setTimeout 後再 play）
+    stopParentMedia();
     try {{ aud.pause(); }} catch (e) {{}}
     try {{ aud.currentTime = 0; }} catch (e) {{}}
     try {{ if (synth) synth.cancel(); }} catch (e) {{}}
@@ -2493,12 +2600,26 @@ def render_iframe_speech_player(spoken: str, *, auto_speak: bool = False) -> Non
 """
     else:
         media_js = """
-  function stopNow() {
+  function stopParentMedia() {
+    try {
+      if (window.parent && typeof window.parent.__hkParkingStopUnlockedMedia === "function") {
+        window.parent.__hkParkingStopUnlockedMedia();
+      }
+    } catch (e) {}
+  }
+
+  function stopLocalOnly() {
     try { if (synth) synth.cancel(); } catch (e) {}
     setUi(false);
   }
 
+  function stopNow() {
+    stopParentMedia();
+    stopLocalOnly();
+  }
+
   function speakNow() {
+    stopParentMedia();
     speakViaWebSpeech();
   }
 """
@@ -2535,17 +2656,12 @@ def render_iframe_speech_player(spoken: str, *, auto_speak: bool = False) -> Non
 (function () {{
   var text = {payload};
   var wantAuto = {auto_js};
+  var audioSrc = null;
   var synth = window.speechSynthesis;
   var Utterance = window.SpeechSynthesisUtterance;
   var btn = document.getElementById("btn");
   var uiSpeaking = false;
   var lockUntil = 0;
-
-  function isIOS() {{
-    var ua = navigator.userAgent || "";
-    return /iPad|iPhone|iPod/.test(ua)
-      || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
-  }}
 
   function pickVoice(voices) {{
     var list = voices || [];
@@ -2600,16 +2716,41 @@ def render_iframe_speech_player(spoken: str, *, auto_speak: bool = False) -> Non
   window.addEventListener("message", function (ev) {{
     var data = ev && ev.data;
     if (!data || data.type !== "hk-parking-stop-speech") return;
-    stopNow();
+    // 只停 iframe 本地；唔好 stopParentMedia，否則會打掉查詢手勢嘅 unlock
+    stopLocalOnly();
   }});
 
   try {{ synth && synth.getVoices(); }} catch (e) {{}}
 
-  // 桌面可試自動播；iOS 必須手動撳（瀏覽器政策）
-  if (wantAuto && !isIOS()) {{
-    setTimeout(function () {{
-      if (!uiSpeaking) speakNow();
-    }}, 300);
+  function tryAutoSpeak() {{
+    if (uiSpeaking) return;
+    var parent = window.parent;
+    // 優先：parent 喺查詢手勢解鎖過嘅 Audio（手機／iOS 自動播）
+    if (audioSrc && parent && typeof parent.__hkParkingPlayUnlockedMedia === "function") {{
+      var started = false;
+      parent.__hkParkingPlayUnlockedMedia(audioSrc, {{
+        onStart: function () {{
+          started = true;
+          setUi(true);
+        }},
+        onEnded: function () {{ setUi(false); }},
+        onError: function () {{
+          if (!started) speakNow();
+          else setUi(false);
+        }}
+      }});
+      // 未解鎖時 play 可能靜默失敗：稍後再試 iframe 本地播（桌面通常得）
+      setTimeout(function () {{
+        if (!started && !uiSpeaking) speakNow();
+      }}, 500);
+      return;
+    }}
+    // 無 MP3：退回 Web Speech／本地播
+    speakNow();
+  }}
+
+  if (wantAuto) {{
+    setTimeout(tryAutoSpeak, 300);
   }}
 }})();
 </script>
