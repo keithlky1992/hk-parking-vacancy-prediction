@@ -257,19 +257,26 @@ def list_carparks_missing_google_area(
     *,
     limit: Optional[int] = None,
 ) -> list[dict[str, Any]]:
+    """未填 google_area，或只有非中文名（需重抓優先中文）嘅車場。"""
+    from google_areas import needs_google_area_refresh
+
     client = client or get_write_client()
     q = (
         client.table("carparks")
-        .select("park_id,latitude,longitude")
+        .select("park_id,latitude,longitude,google_area")
         .not_.is_("latitude", "null")
         .not_.is_("longitude", "null")
-        .is_("google_area", "null")
         .order("park_id")
     )
-    if limit is not None:
-        q = q.limit(int(limit))
     resp = q.execute()
-    return list(resp.data or [])
+    rows = [
+        {"park_id": r["park_id"], "latitude": r["latitude"], "longitude": r["longitude"]}
+        for r in (resp.data or [])
+        if needs_google_area_refresh(r.get("google_area"))
+    ]
+    if limit is not None:
+        rows = rows[: int(limit)]
+    return rows
 
 
 def insert_vacancy_records(

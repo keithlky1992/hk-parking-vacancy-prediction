@@ -33,8 +33,27 @@ _REVERSE_GEOCODE_TYPE_PRIORITY = (
 )
 
 
+def _has_cjk(text: str) -> bool:
+    """地名是否含中日韓統一表意文字（用來判斷中文名）。"""
+    return any("\u4e00" <= ch <= "\u9fff" for ch in text)
+
+
+def _pick_label_by_type(
+    components: list[tuple[str, set[str]]], *, chinese_only: bool
+) -> str | None:
+    """依類型優先序選地名；chinese_only 時只接受含中文嘅名稱。"""
+    for preferred in _REVERSE_GEOCODE_TYPE_PRIORITY:
+        for name, types in components:
+            if preferred not in types:
+                continue
+            if chinese_only and not _has_cjk(name):
+                continue
+            return name
+    return None
+
+
 def label_from_google_address_components(results: list) -> str | None:
-    """從 Google reverse geocode 結果抽出短地區名。"""
+    """從 Google reverse geocode 結果抽出短地區名（優先中文，無則英文）。"""
     components: list[tuple[str, set[str]]] = []
     for result in results or []:
         for comp in result.get("address_components") or []:
@@ -44,10 +63,13 @@ def label_from_google_address_components(results: list) -> str | None:
             types = set(comp.get("types") or [])
             components.append((name, types))
 
-    for preferred in _REVERSE_GEOCODE_TYPE_PRIORITY:
-        for name, types in components:
-            if preferred in types:
-                return name
+    # 先取中文名；如無中文名，才取英文／其他語言
+    chinese = _pick_label_by_type(components, chinese_only=True)
+    if chinese:
+        return chinese
+    any_lang = _pick_label_by_type(components, chinese_only=False)
+    if any_lang:
+        return any_lang
 
     top = (results or [{}])[0]
     formatted = (top.get("formatted_address") or "").strip()
@@ -83,6 +105,12 @@ def reverse_geocode_location_label(lat: float, lon: float) -> str | None:
     return label_from_google_address_components(data["results"])
 
 
+def needs_google_area_refresh(label: str | None) -> bool:
+    """未填或只有非中文名時需要重新 reverse geocode。"""
+    text = (label or "").strip()
+    return not text or not _has_cjk(text)
+
+
 def ensure_carpark_google_areas(
     db_path: str = "parking.db",
     *,
@@ -91,7 +119,8 @@ def ensure_carpark_google_areas(
     pause_sec: float = 0.05,
 ) -> int:
     """
-    為車場寫入 google_area（Google reverse geocode 短名）。
+    為車場寫入 google_area（Google reverse geocode 短名；優先中文）。
+    only_missing 時亦會重抓純英文／空白嘅舊值。
     回傳成功更新列數。無 API key 時 raise RuntimeError。
     """
     if not GOOGLE_MAPS_API_KEY:
@@ -104,24 +133,19 @@ def ensure_carpark_google_areas(
             conn.execute("ALTER TABLE carparks ADD COLUMN google_area TEXT")
             conn.commit()
 
-        if only_missing:
-            where = (
-                "latitude IS NOT NULL AND longitude IS NOT NULL "
-                "AND (google_area IS NULL OR TRIM(google_area) = '')"
-            )
-        else:
-            where = "latitude IS NOT NULL AND longitude IS NOT NULL"
-
         sql = (
-            f"SELECT park_id, latitude, longitude FROM carparks WHERE {where} "
+            "SELECT park_id, latitude, longitude, google_area FROM carparks "
+            "WHERE latitude IS NOT NULL AND longitude IS NOT NULL "
             "ORDER BY park_id"
         )
-        if limit is not None:
-            sql += f" LIMIT {int(limit)}"
         rows = conn.execute(sql).fetchall()
+        if only_missing:
+            rows = [r for r in rows if needs_google_area_refresh(r[3])]
+        if limit is not None:
+            rows = rows[: int(limit)]
 
         updated = 0
-        for i, (park_id, lat, lon) in enumerate(rows):
+        for i, (park_id, lat, lon, _existing) in enumerate(rows):
             try:
                 label = reverse_geocode_location_label(float(lat), float(lon))
             except RuntimeError as exc:

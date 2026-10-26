@@ -47,7 +47,7 @@ CN_NUM = {
 }
 NUM_CN = {1: "一", 2: "兩", 3: "三", 4: "四", 5: "五", 6: "六", 7: "七", 8: "八", 9: "九", 10: "十"}
 DEFAULT_TOP_N = 10
-# 暫時隱藏預測建議書面文字；朗讀掣／自動播仍然保留。改 True 即可恢復顯示
+# 暫時隱藏建議／資料答覆書面文字；朗讀掣／自動播仍然保留。改 True 即可恢復顯示
 SHOW_WRITTEN_SUGGESTION = False
 # 朗讀自然結束時由 JS 點擊；放頁頂並以 CSS 收起，唔插入結果區
 SPEECH_ENDED_SENTINEL_LABEL = "SPEECH_ENDED"
@@ -439,7 +439,9 @@ HEADER_AUTO_REFRESH = timedelta(seconds=WEATHER_CACHE_TTL_SEC)
 
 @st.cache_data(ttl=LOCATION_CACHE_TTL_SEC)
 def fetch_user_location_label(lat: float, lon: float) -> str | None:
-    """Google reverse geocode → 地區名。"""
+    """Google reverse geocode → 地區名（優先中文）。"""
+    # cache key 含版本，避免選名邏輯更新後仍用舊英文結果
+    _ = "zh-first-v1"
     return resolve_user_district(lat, lon)
 
 
@@ -831,8 +833,12 @@ def inject_layout_css() -> None:
     margin-bottom: 0 !important;
   }
   div[data-testid="stHorizontalBlock"]:has(button[kind="secondary"]),
+  div[data-testid="stHorizontalBlock"]:has(.mzd-speech-left-slot),
   div[data-testid="stElementContainer"]:has(
     div[data-testid="stHorizontalBlock"]:has(button[kind="secondary"])
+  ),
+  div[data-testid="stElementContainer"]:has(
+    div[data-testid="stHorizontalBlock"]:has(.mzd-speech-left-slot)
   ),
   div[data-testid="stElementContainer"]:has(div[data-testid="stButton"] button[kind="secondary"]) {
     margin-top: 0 !important;
@@ -847,6 +853,12 @@ def inject_layout_css() -> None:
   div[data-testid="stHorizontalBlock"]:has(button[kind="secondary"])
     div[data-testid="column"] > div,
   div[data-testid="stHorizontalBlock"]:has(button[kind="secondary"])
+    div[data-testid="stColumn"] > div,
+  div[data-testid="stHorizontalBlock"]:has(.mzd-speech-left-slot)
+    [data-testid="stElementContainer"],
+  div[data-testid="stHorizontalBlock"]:has(.mzd-speech-left-slot)
+    div[data-testid="column"] > div,
+  div[data-testid="stHorizontalBlock"]:has(.mzd-speech-left-slot)
     div[data-testid="stColumn"] > div {
     margin-top: 0 !important;
     margin-bottom: 0 !important;
@@ -858,7 +870,11 @@ def inject_layout_css() -> None:
     div[data-testid="stHorizontalBlock"]:has(button[kind="secondary"])
       > div[data-testid="column"]:not(:has(button)),
     div[data-testid="stHorizontalBlock"]:has(button[kind="secondary"])
-      > div[data-testid="stColumn"]:not(:has(button)) {
+      > div[data-testid="stColumn"]:not(:has(button)),
+    div[data-testid="stHorizontalBlock"]:has(.mzd-speech-left-slot)
+      > div[data-testid="column"]:has(.mzd-speech-left-slot),
+    div[data-testid="stHorizontalBlock"]:has(.mzd-speech-left-slot)
+      > div[data-testid="stColumn"]:has(.mzd-speech-left-slot) {
       display: none !important;
     }
   }
@@ -1232,7 +1248,7 @@ def inject_layout_css() -> None:
     doc.querySelectorAll('iframe[title*="streamlit_js_eval"]').forEach(collapseIframeContainer);
   }
 
-  // Streamlit 1.51：height=0 會被當成 falsy 而用預設 ~150px，撐開「播放建議」下方空白。
+  // Streamlit 1.51：height=0 會被當成 falsy 而用預設 ~150px，撐開「播放」下方空白。
   // 標記用 height=1 的 speech sync／speak／stop iframe，一律收起。
   // 唔好收起 mic_recorder（語音掣）；佢可能短暫 height=0／未 setFrameHeight。
   function isMicRecorderIframe(iframe) {
@@ -1244,7 +1260,7 @@ def inject_layout_css() -> None:
       if (isMicRecorderIframe(iframe)) return;
       var srcdoc = "";
       try { srcdoc = iframe.srcdoc || iframe.getAttribute("srcdoc") || ""; } catch (e) {}
-      // 可見嘅「播放建議」player 唔好收起
+      // 可見嘅「播放」player 唔好收起
       if (srcdoc.indexOf("speech-player-ui") !== -1) return;
       var marker = srcdoc.indexOf("sync-speech-text:") !== -1
         || srcdoc.indexOf("speak-nonce:") !== -1
@@ -1391,7 +1407,7 @@ def inject_layout_css() -> None:
   function isMicLikeLabel(label) {
     return label.indexOf("查詢") !== -1
       || label.indexOf("停止播放") !== -1
-      || label.indexOf("播放建議") !== -1
+      || label.indexOf("播放") !== -1
       || label.indexOf("再聽一次") !== -1;
   }
 
@@ -1422,7 +1438,7 @@ def inject_layout_css() -> None:
 
   function isSpeechToggleLabel(label) {
     return label.indexOf("停止播放") !== -1
-      || label.indexOf("播放建議") !== -1
+      || label.indexOf("播放") !== -1
       || label.indexOf("再聽一次") !== -1;
   }
 
@@ -2279,11 +2295,13 @@ def _latin_token_to_hk_speech(token: str) -> str:
 
 
 def prepare_spoken_text_for_tts(text: str) -> str:
-    """朗讀前處理英文名稱：跟香港人習慣讀詞或逐字母，唔改書面顯示。"""
+    """朗讀前處理：英文名稱跟香港習慣；日期括號星期改口語，唔改書面顯示。"""
     text = (text or "").strip()
     if not text:
         return text
     text = re.sub(r"\bM\+", "M plus", text, flags=re.IGNORECASE)
+    # 「2026年10月27日（二）」→「…星期二」；否則 Edge TTS 只讀「二」，聽落似月份／亂碼
+    text = re.sub(r"[（(]([一二三四五六日])[）)]", r"星期\1", text)
     return _LATIN_SPEECH_TOKEN_RE.sub(
         lambda m: _latin_token_to_hk_speech(m.group(0)), text
     )
@@ -2651,7 +2669,7 @@ def render_iframe_speech_player(spoken: str, *, auto_speak: bool = False) -> Non
 </head>
 <body>
 <!-- speech-player-ui:{nonce} -->
-<button id="btn" type="button">🔊 播放建議</button>
+<button id="btn" type="button">🔊 播放</button>
 <script>
 (function () {{
   var text = {payload};
@@ -2673,7 +2691,7 @@ def render_iframe_speech_player(spoken: str, *, auto_speak: bool = False) -> Non
 
   function setUi(speaking) {{
     uiSpeaking = !!speaking;
-    btn.textContent = uiSpeaking ? "⏹ 停止播放" : "🔊 播放建議";
+    btn.textContent = uiSpeaking ? "⏹ 停止播放" : "🔊 播放";
   }}
 
   function speakViaWebSpeech() {{
@@ -2783,9 +2801,10 @@ def render_text_with_speech(
     if should_auto_speak:
         st.session_state._auto_speak_token = spoken
 
-    if show_written and written:
-        text_col, btn_col = st.columns([3.6, 1.2], vertical_alignment="top")
-        with text_col:
+    # 固定右欄掣位（有／無書面文字都一樣），同預測成功排版一致
+    text_col, btn_col = st.columns([3.6, 1.2], vertical_alignment="top")
+    with text_col:
+        if show_written and written:
             compact_lines = []
             for line in written.split("\n"):
                 line = line.strip()
@@ -2800,9 +2819,12 @@ def render_text_with_speech(
                 + "</div>",
                 unsafe_allow_html=True,
             )
-        with btn_col:
-            render_iframe_speech_player(spoken, auto_speak=should_auto_speak)
-    else:
+        else:
+            st.markdown(
+                '<div class="mzd-speech-left-slot" aria-hidden="true"></div>',
+                unsafe_allow_html=True,
+            )
+    with btn_col:
         render_iframe_speech_player(spoken, auto_speak=should_auto_speak)
 
     # 清除舊 deferred 路徑，避免再走 parent.speechSynthesis 自動播（手機無效）
@@ -2829,6 +2851,73 @@ def render_suggestion_with_speech(
         spoken,
         auto_speak=auto_speak,
         show_written=SHOW_WRITTEN_SUGGESTION,
+    )
+
+
+def _plain_for_speech(text: str) -> str:
+    """書面提示轉朗讀稿：去掉 markdown 強調符號。"""
+    return prepare_spoken_text_for_tts((text or "").replace("**", "").strip())
+
+
+def render_feedback_with_speech(
+    written: str,
+    *,
+    spoken: str | None = None,
+    auto_speak: bool = True,
+    level: str = "warning",
+    intent: dict | None = None,
+    info_mode: bool = False,
+    persist: bool = True,
+) -> None:
+    """顯示提示／警告，並提供播放掣；新查詢時可自動朗讀（方便駕駛中用耳聽）。"""
+    written = (written or "").strip()
+    if not written:
+        return
+    spoken_text = prepare_spoken_text_for_tts(
+        ((spoken if spoken is not None else _plain_for_speech(written)) or "").strip()
+    )
+    if not spoken_text:
+        spoken_text = _plain_for_speech(written)
+
+    if persist:
+        st.session_state.last_feedback = {
+            "written": written,
+            "spoken": spoken_text,
+            "level": level,
+            "intent": intent,
+            "info_mode": info_mode,
+        }
+        st.session_state.pop("last_prediction", None)
+        st.session_state.pop("last_info_answer", None)
+
+    if intent is not None:
+        render_intent_summary(intent, info_mode=info_mode)
+
+    if level == "error":
+        st.error(written)
+    elif level == "info":
+        st.info(written)
+    else:
+        st.warning(written)
+
+    render_text_with_speech(
+        written,
+        spoken_text,
+        auto_speak=auto_speak,
+        show_written=False,
+    )
+
+
+def render_saved_feedback(payload: dict, *, auto_speak: bool = False) -> None:
+    """重顯示已儲存的提示／警告（含播放掣）。"""
+    render_feedback_with_speech(
+        payload.get("written") or "",
+        spoken=payload.get("spoken"),
+        auto_speak=auto_speak,
+        level=payload.get("level") or "warning",
+        intent=payload.get("intent"),
+        info_mode=bool(payload.get("info_mode")),
+        persist=False,
     )
 
 
@@ -2859,8 +2948,7 @@ def render_saved_prediction(payload: dict, *, auto_speak: bool = False) -> None:
         )
     else:
         st.success(f"{day} {time_str} {district_label} 較易泊車的停車場（前 {top_n} 名）")
-    # 朗讀掣放喺表格外右上方（「預測空位」欄上方），唔入表格
-    # 語音掣若要 rerun，等結果表畫完先執行，避免表消失
+    # 朗讀掣：success 之下、表格之上、靠右（同資料查詢一致）；空名單都要可聽
     need_rerun = False
     if not result_df.empty:
         need_rerun = render_suggestion_with_speech(
@@ -2871,11 +2959,257 @@ def render_saved_prediction(payload: dict, *, auto_speak: bool = False) -> None:
             written=payload.get("written"),
             spoken=payload.get("spoken"),
         )
+    else:
+        written = (payload.get("written") or "").strip() or (
+            f"{day} {time_str} {district_label}暫時沒有可用的預測結果。"
+        )
+        spoken = (payload.get("spoken") or "").strip() or (
+            f"{day} {time_str} {district_label}暫時冇可用嘅預測結果。"
+        )
+        need_rerun = render_text_with_speech(
+            written,
+            spoken,
+            auto_speak=auto_speak,
+            show_written=SHOW_WRITTEN_SUGGESTION,
+        )
     render_ranked_table(result_df)
-    # 語音 iframe 放表後，令 success→掣→表 只各隔一個預設 gap（同 margin a）
+    render_results_map(result_df, intent=intent)
     flush_deferred_speech_browser_ops()
     if need_rerun:
         st.rerun()
+
+
+_TABLE_HIDDEN_COLS = frozenset({"latitude", "longitude"})
+
+
+def render_results_map(
+    df: pd.DataFrame,
+    *,
+    intent: dict | None = None,
+    height: int = 420,
+) -> None:
+    """喺結果表下方以 Google Maps 顯示停車場分布。"""
+    if df is None or df.empty:
+        return
+    if not GOOGLE_MAPS_API_KEY:
+        st.caption("尚未設定 Google Maps API Key，未能顯示地圖。")
+        return
+    if "latitude" not in df.columns or "longitude" not in df.columns:
+        st.caption("結果沒有座標資料，未能顯示地圖。")
+        return
+
+    markers: list[dict] = []
+    for _, row in df.iterrows():
+        try:
+            lat = float(row["latitude"])
+            lon = float(row["longitude"])
+        except (TypeError, ValueError):
+            continue
+        if pd.isna(lat) or pd.isna(lon):
+            continue
+        name = str(row.get("名稱") or "").strip() or "停車場"
+        vacancy = row.get("預測空位")
+        try:
+            vacancy_txt = str(int(vacancy)) if vacancy is not None and not pd.isna(vacancy) else "—"
+        except (TypeError, ValueError):
+            vacancy_txt = str(vacancy) if vacancy is not None else "—"
+        dist = row.get("距離(公里)")
+        dist_txt = ""
+        if dist is not None and not (isinstance(dist, float) and pd.isna(dist)):
+            try:
+                dist_txt = f"<br>距離：{float(dist):.1f} 公里"
+            except (TypeError, ValueError):
+                dist_txt = ""
+        rank = row.get("")
+        rank_txt = f"{rank} · " if rank not in (None, "") and not (isinstance(rank, float) and pd.isna(rank)) else ""
+        markers.append(
+            {
+                "lat": lat,
+                "lng": lon,
+                "title": name,
+                "info": (
+                    f"<strong>{html.escape(rank_txt + name)}</strong>"
+                    f"<br>預測空位：{html.escape(vacancy_txt)}{dist_txt}"
+                ),
+            }
+        )
+
+    if not markers:
+        st.caption("結果沒有有效座標，未能顯示地圖。")
+        return
+
+    center = None
+    intent = intent or {}
+    geo_lat, geo_lon = intent.get("geo_lat"), intent.get("geo_lon")
+    if geo_lat is not None and geo_lon is not None:
+        try:
+            center = {
+                "lat": float(geo_lat),
+                "lng": float(geo_lon),
+                "label": str(intent.get("geo_label") or "查詢位置").strip() or "查詢位置",
+            }
+        except (TypeError, ValueError):
+            center = None
+
+    markers_json = json.dumps(markers, ensure_ascii=False)
+    center_json = json.dumps(center, ensure_ascii=False)
+    maps_src = html.escape(
+        "https://maps.googleapis.com/maps/api/js?"
+        + urlencode(
+            {
+                "key": GOOGLE_MAPS_API_KEY,
+                "callback": "initResultsMap",
+                "language": "zh-HK",
+            }
+        )
+    )
+
+    # Google Maps JS 為主；若 API 未啟用／金鑰被拒，自動退回 Leaflet（同一批 marker）。
+    map_html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="" />
+  <style>
+    html, body {{ margin: 0; padding: 0; height: 100%; background: transparent; }}
+    #map {{
+      width: 100%;
+      height: 100%;
+      border-radius: 0.6rem;
+      border: 1px solid rgba(128,128,128,0.28);
+      overflow: hidden;
+    }}
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+    integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+  <script>
+    const MARKERS = {markers_json};
+    const CENTER = {center_json};
+    let usedFallback = false;
+
+    function initLeafletFallback() {{
+      if (usedFallback) return;
+      usedFallback = true;
+      const el = document.getElementById("map");
+      el.innerHTML = "";
+      // Leaflet 需要明確高度；清掉 Google 殘餘 DOM 後重建
+      const map = L.map(el, {{ scrollWheelZoom: true }});
+      L.tileLayer("https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png", {{
+        maxZoom: 19,
+        attribution: "&copy; OpenStreetMap",
+      }}).addTo(map);
+
+      const bounds = [];
+      MARKERS.forEach(function (m) {{
+        const marker = L.marker([m.lat, m.lng]).addTo(map);
+        marker.bindPopup(m.info);
+        bounds.push([m.lat, m.lng]);
+      }});
+      if (CENTER) {{
+        const c = L.circleMarker([CENTER.lat, CENTER.lng], {{
+          radius: 8,
+          color: "#ffffff",
+          weight: 2,
+          fillColor: "#4285F4",
+          fillOpacity: 1,
+        }}).addTo(map);
+        c.bindPopup(CENTER.label || "查詢位置");
+        bounds.push([CENTER.lat, CENTER.lng]);
+      }}
+      if (bounds.length === 1) {{
+        map.setView(bounds[0], 15);
+      }} else if (bounds.length > 1) {{
+        map.fitBounds(bounds, {{ padding: [40, 40] }});
+      }}
+      setTimeout(function () {{ map.invalidateSize(); }}, 80);
+    }}
+
+    window.gm_authFailure = function () {{
+      initLeafletFallback();
+    }};
+
+    function initResultsMap() {{
+      try {{
+        const map = new google.maps.Map(document.getElementById("map"), {{
+          zoom: 12,
+          center: {{ lat: MARKERS[0].lat, lng: MARKERS[0].lng }},
+          mapTypeControl: false,
+          streetViewControl: false,
+          fullscreenControl: true,
+        }});
+        const bounds = new google.maps.LatLngBounds();
+        const infoWindow = new google.maps.InfoWindow();
+
+        MARKERS.forEach(function (m) {{
+          const pos = {{ lat: m.lat, lng: m.lng }};
+          bounds.extend(pos);
+          const marker = new google.maps.Marker({{
+            position: pos,
+            map: map,
+            title: m.title,
+          }});
+          marker.addListener("click", function () {{
+            infoWindow.setContent(m.info);
+            infoWindow.open(map, marker);
+          }});
+        }});
+
+        if (CENTER) {{
+          const cpos = {{ lat: CENTER.lat, lng: CENTER.lng }};
+          bounds.extend(cpos);
+          new google.maps.Marker({{
+            position: cpos,
+            map: map,
+            title: CENTER.label,
+            icon: {{
+              path: google.maps.SymbolPath.CIRCLE,
+              scale: 8,
+              fillColor: "#4285F4",
+              fillOpacity: 1,
+              strokeColor: "#ffffff",
+              strokeWeight: 2,
+            }},
+          }});
+        }}
+
+        if (MARKERS.length === 1 && !CENTER) {{
+          map.setCenter({{ lat: MARKERS[0].lat, lng: MARKERS[0].lng }});
+          map.setZoom(15);
+        }} else {{
+          map.fitBounds(bounds, 48);
+        }}
+
+        // 若 auth 失敗，Google 仍可能短暫建到 Map；等一下再檢查是否已 fallback
+        setTimeout(function () {{
+          if (!usedFallback) {{
+            const sorry = document.querySelector("#map .gm-err-container, #map .dismissButton");
+            if (sorry) initLeafletFallback();
+          }}
+        }}, 1500);
+      }} catch (err) {{
+        initLeafletFallback();
+      }}
+    }}
+
+    // 腳本載入失敗時亦退回
+    window.addEventListener("error", function (ev) {{
+      if (ev && ev.target && ev.target.src &&
+          String(ev.target.src).indexOf("maps.googleapis.com") !== -1) {{
+        initLeafletFallback();
+      }}
+    }}, true);
+  </script>
+  <script async defer src="{maps_src}"
+    onerror="initLeafletFallback()"></script>
+</body>
+</html>
+"""
+    components.html(map_html, height=height)
 
 
 def render_ranked_table(df: pd.DataFrame) -> None:
@@ -2885,7 +3219,9 @@ def render_ranked_table(df: pd.DataFrame) -> None:
         return
 
     rank_col = ""
-    data_cols = [c for c in df.columns if c != rank_col]
+    data_cols = [
+        c for c in df.columns if c != rank_col and c not in _TABLE_HIDDEN_COLS
+    ]
 
     # 計算每個排名連續區塊的 rowspan
     ranks = df[rank_col].tolist()
@@ -3073,10 +3409,31 @@ def looks_like_vacancy_prediction_query(query: str) -> bool:
     return any(h in q for h in hints)
 
 
+def looks_like_fee_query(query: str) -> bool:
+    """是否在問停車場收費／價錢（而非空位預測）。"""
+    q = (query or "").replace(" ", "").lower()
+    strong = (
+        "泊車費",
+        "停車費",
+        "停車場收費",
+        "停車場幾錢",
+        "停車場價錢",
+        "時租",
+        "日泊",
+        "夜泊",
+    )
+    if any(s in q for s in strong):
+        return True
+    soft = ("收費", "價錢", "價格", "幾錢", "多少錢", "幾多錢")
+    return any(s in q for s in soft) and looks_like_parking_query(query)
+
+
 def looks_like_parking_info_query(query: str) -> bool:
     """與停車場有關、但似在問數量／名單／有冇等資料，而非空位預測。"""
     if looks_like_vacancy_prediction_query(query):
         return False
+    if looks_like_fee_query(query):
+        return True
     q = (query or "").replace(" ", "")
     system_faq = (
         r"呢個系統",
@@ -3155,9 +3512,9 @@ def parse_query_with_llm(query: str):
   - false：天氣、食肆、純閒聊、新聞、或其他與泊車完全無關的問題
 - query_type: 查詢類型（只在 related 為 true 時有意義）
   - "prediction"：想知邊度較易泊、某時某地空位、預測／推薦停車場等（即使沒寫「預測」二字）
-  - "info"：與停車場有關，但不是在問空位預測。例如：某區有幾個停車場、係咪得一個、有冇停車場、叫咩名、本系統可以問咩
+  - "info"：與停車場有關，但不是在問空位預測。例如：某區有幾個停車場、係咪得一個、有冇停車場、叫咩名、收費／價錢、本系統可以問咩
 - district: 地點名稱，會交 Google Maps 定位。優先填用戶提到的具體地名（屋邨、商場、街道、地區，例如「彩雲邨」「栢慧豪園」「天水圍」）；沒有提到就填「全港」。related 為 false 時填「全港」。不要改寫成內部代號或加「／」合併名
-- hour: 小時（0-23）。只在句子有具體鐘點時填數字（如「三點」「15:30」「晚上九點」）；沒有具體鐘點則填 null（「後晚／聽晚／今晚／嚟緊」單獨出現不算具體鐘點）。query_type 為 "info" 時通常填 null
+- hour: 小時（0-23）。只在句子有具體鐘點時填數字（如「三點」「15:30」「晚上九點」）；沒有具體鐘點則填 null（「後晚／聽晚／今晚／嚟緊」單獨出現不算具體鐘點）。問收費但無具體鐘點時填 null（系統會用當刻時間）
 - minute: 分鐘，時間以半小時為單位，只允許 0 或 30。規則：
   - 「三點半／3:30／15:30」→ 30
   - 「三點／3:00／15:00」或只提到整點 → 0
@@ -3187,6 +3544,12 @@ def parse_query_with_llm(query: str):
 
 範例（停車場資料／非預測）：
 {{"related": true, "query_type": "info", "district": "掃管笏", "hour": null, "minute": null, "day": "{day_today}", "top_n": null}}
+
+範例（問收費、無具體鐘點 → 當刻收費）：
+{{"related": true, "query_type": "info", "district": "天水圍", "hour": null, "minute": null, "day": "{day_today}", "top_n": null}}
+
+範例（問某日某時收費）：
+{{"related": true, "query_type": "info", "district": "天水圍", "hour": 20, "minute": 0, "day": "{day_tomorrow}", "top_n": null}}
 
 範例（與停車場無關）：
 {{"related": false, "query_type": "prediction", "district": "全港", "hour": null, "minute": null, "day": "{day_today}", "top_n": null}}
@@ -3246,12 +3609,23 @@ def parse_query_with_llm(query: str):
 
     intent["related"] = True
 
-    # 資料／FAQ 類：不推時間、不進入預測
+    # 資料／FAQ 類：不進入預測；收費問句可保留用戶指定鐘點
     if not intent_wants_prediction(intent):
         intent["query_type"] = "info"
-        intent["hour"] = None
-        intent["minute"] = None
         intent["top_n"] = None
+        if looks_like_fee_query(query) and has_explicit_clock_time(query):
+            if not intent_has_clock_time(intent.get("hour")):
+                intent["hour"] = None
+                intent["minute"] = None
+            elif intent.get("minute") is None or str(intent.get("minute")).strip() in (
+                "",
+                "null",
+                "None",
+            ):
+                intent["minute"] = 0
+        else:
+            intent["hour"] = None
+            intent["minute"] = None
         return intent
 
     intent["query_type"] = "prediction"
@@ -3299,6 +3673,9 @@ def render_intent_summary(intent: dict, *, info_mode: bool = False):
             ("地區", _intent_display(place_label)),
             ("查詢類型", "停車場資料／說明"),
         ]
+        fee_slot = intent.get("_fee_slot_label")
+        if fee_slot:
+            intent_fields.append(("收費時段", str(fee_slot)))
     else:
         intent_fields = [
             ("地區", _intent_display(place_label)),
@@ -3346,6 +3723,7 @@ def unique_carparks_for_location(
         filtered = dedupe_equivalent_carparks(parks)
         rows = pd.DataFrame(
             {
+                "park_id": filtered["park_id"].astype(str).values,
                 "名稱": filtered["name"].values,
                 "地區": filtered["sub_district"].fillna(filtered["district"]).values,
             }
@@ -3354,11 +3732,14 @@ def unique_carparks_for_location(
 
     district_label = geo_label or district or "該地點"
     if geo_lat is None or geo_lon is None:
-        return "nearby", district_label, pd.DataFrame(columns=["名稱", "地區", "距離(公里)"])
+        return "nearby", district_label, pd.DataFrame(
+            columns=["park_id", "名稱", "地區", "距離(公里)"]
+        )
 
     nearby, _radius = carparks_near_coords(float(geo_lat), float(geo_lon))
     rows = pd.DataFrame(
         {
+            "park_id": nearby["park_id"].astype(str).values,
             "名稱": nearby["name"].values,
             "地區": nearby["sub_district"].fillna(nearby["district"]).values,
             "距離(公里)": nearby["distance_km"].round(1).values,
@@ -3367,17 +3748,104 @@ def unique_carparks_for_location(
     return "nearby", district_label, rows
 
 
+def resolve_fee_query_slot(
+    intent: dict, query: str, now=None
+) -> tuple[str, int, int, bool]:
+    """收費查詢用時段。回傳 (day, hour, minute, is_current)。
+
+    - 有具體鐘點 → 該日該時
+    - 否則 → 現在（非今日日子缺時間應先被 needs_fee_missing_time_reentry 攔截）
+    """
+    now = now or hong_kong_now()
+    explicit_day = resolve_relative_day(query, now)
+
+    if has_explicit_clock_time(query) and intent_has_clock_time(intent.get("hour")):
+        day = explicit_day or intent.get("day") or WEEKDAY_CN[now.weekday()]
+        minute_raw = intent.get("minute")
+        minute = (
+            0
+            if minute_raw is None or str(minute_raw).strip() in ("", "null", "None")
+            else int(minute_raw)
+        )
+        hour, minute = normalize_half_hour(int(intent["hour"]), minute)
+        return str(day), hour, minute, False
+
+    return WEEKDAY_CN[now.weekday()], int(now.hour), int(now.minute), True
+
+
+def needs_fee_missing_time_reentry(intent: dict, query_text: str) -> bool:
+    """收費查詢：非今天（聽日／某一日）且未提供時間 → 要求重新輸入。"""
+    if not looks_like_fee_query(query_text):
+        return False
+    if is_now_query(query_text):
+        return False
+    if has_explicit_clock_time(query_text) and intent_has_clock_time(intent.get("hour")):
+        return False
+    explicit_day = resolve_relative_day(query_text)
+    if not explicit_day:
+        return False
+    today_day = WEEKDAY_CN[hong_kong_now().weekday()]
+    return explicit_day != today_day
+
+
+def attach_fees_to_parks_df(
+    parks_df: pd.DataFrame,
+    day_cn: str,
+    hour: int,
+    minute: int,
+    fee_map: dict[str, dict] | None = None,
+) -> pd.DataFrame:
+    """為停車場表加上「收費」欄（需有 park_id）。"""
+    out = parks_df.copy()
+    if out.empty or "park_id" not in out.columns:
+        if "收費" not in out.columns:
+            out["收費"] = pd.Series(dtype=str)
+        return out
+    fee_map = fee_map if fee_map is not None else load_carpark_fee_rules()
+    out["收費"] = [
+        format_carpark_fee(str(pid), day_cn, hour, minute, fee_map)
+        for pid in out["park_id"]
+    ]
+    return out
+
+
+def parks_df_for_display(parks_df: pd.DataFrame) -> pd.DataFrame:
+    """結果表顯示欄（隱藏 park_id）。"""
+    preferred = ["名稱", "地區", "距離(公里)", "收費"]
+    cols = [c for c in preferred if c in parks_df.columns]
+    cols += [c for c in parks_df.columns if c not in cols and c != "park_id"]
+    return parks_df[cols] if cols else parks_df.drop(columns=["park_id"], errors="ignore")
+
+
 def _fallback_parking_info_answer(
-    query: str, district_label: str, parks_df: pd.DataFrame
+    query: str,
+    district_label: str,
+    parks_df: pd.DataFrame,
+    *,
+    fee_slot_label: str | None = None,
 ) -> tuple[str, str]:
     """LLM 失敗時的規則回覆。"""
     n = len(parks_df)
-    names = parks_df["名稱"].tolist()
+    names = parks_df["名稱"].tolist() if "名稱" in parks_df.columns else []
+    has_fees = fee_slot_label and "收費" in parks_df.columns and n > 0
+
     if n == 0:
         written = (
             f"本系統在「{district_label}」附近目前沒有停車場紀錄。"
             f"你可以改試其他地點，或直接問空位預測"
             f"（例如：天水圍今晚八點邊度較易泊？）。"
+        )
+    elif has_fees:
+        samples = []
+        for _, row in parks_df.head(5).iterrows():
+            fee = str(row.get("收費") or "未提供")
+            samples.append(f"「{row['名稱']}」{fee}")
+        sample_txt = "；".join(samples)
+        more = f" 等共 {n} 個" if n > 5 else f"，共 {n} 個"
+        written = (
+            f"「{district_label}」附近停車場{fee_slot_label}收費如下"
+            f"（{sample_txt}{more}）。"
+            f"詳細見下表；未提供者為政府開放資料暫無該時段規則。"
         )
     elif n == 1:
         written = (
@@ -3406,33 +3874,50 @@ def _fallback_parking_info_answer(
 
 
 def answer_parking_info_with_llm(
-    query: str, district_label: str, parks_df: pd.DataFrame
+    query: str,
+    district_label: str,
+    parks_df: pd.DataFrame,
+    *,
+    fee_slot_label: str | None = None,
 ) -> tuple[str, str]:
     """根據本系統停車場名單，用 LLM 認真回答非預測問題。"""
     n = len(parks_df)
+    has_fees = bool(fee_slot_label) and "收費" in parks_df.columns
     if district_label == "全港" and n > 30:
         name_block = f"（全港共 {n} 個，名單過長不逐一列出）"
     else:
-        listed = "\n".join(
-            f"{i}. {row['名稱']}（{row['地區']}）"
-            for i, (_, row) in enumerate(parks_df.head(40).iterrows(), start=1)
-        )
+        lines = []
+        for i, (_, row) in enumerate(parks_df.head(40).iterrows(), start=1):
+            line = f"{i}. {row['名稱']}（{row['地區']}）"
+            if has_fees:
+                line += f"｜收費：{row.get('收費') or '未提供'}"
+            lines.append(line)
+        listed = "\n".join(lines)
         if n > 40:
             listed += f"\n…另有 {n - 40} 個未列出"
         name_block = listed or "（無）"
 
+    fee_fact = ""
+    fee_guidance = ""
+    if has_fees:
+        fee_fact = f"- 收費時段：{fee_slot_label}\n- 收費來源：政府停車場開放資料（私家車時租／日夜泊；無資料則顯示未提供）\n"
+        fee_guidance = (
+            "用戶在問收費：請依事實說明該時段收費概況，可舉數個例子，"
+            "並提醒下表有完整名單；不要捏造價錢。\n"
+        )
+
     prompt = f"""
 你是「咪再兜」香港停車場空位預測系統的助手。用戶的問題與停車場有關，但不是在問空位預測。
 請根據「本系統資料庫事實」認真回答，用繁體中文、簡潔清楚（可用粵語口語）。
-只根據事實作答，不要捏造停車場；若資料不足就誠實說明。
-回答後可自然地提一句：若要查某時段較易泊／空位，可以再問預測問題。
+只根據事實作答，不要捏造停車場或收費；若資料不足就誠實說明。
+{fee_guidance}回答後可自然地提一句：若要查某時段較易泊／空位，可以再問預測問題。
 
 用戶問題：{query}
 
 事實：
 - 查詢地區：{district_label}
 - 該範圍停車場數量：{n}
-- 停車場名單：
+{fee_fact}- 停車場名單：
 {name_block}
 - 本系統主要功能：預測香港各區停車場在指定時段的空位，並推薦較易泊的停車場
 
@@ -3441,7 +3926,9 @@ def answer_parking_info_with_llm(
 """
     text = call_deepseek(prompt)
     if not text:
-        return _fallback_parking_info_answer(query, district_label, parks_df)
+        return _fallback_parking_info_answer(
+            query, district_label, parks_df, fee_slot_label=fee_slot_label
+        )
     try:
         if text.startswith("```"):
             text = text.split("```")[1]
@@ -3451,36 +3938,55 @@ def answer_parking_info_with_llm(
         answer = str(payload.get("answer") or "").strip()
         spoken = str(payload.get("spoken") or answer).strip()
         if not answer:
-            return _fallback_parking_info_answer(query, district_label, parks_df)
+            return _fallback_parking_info_answer(
+                query, district_label, parks_df, fee_slot_label=fee_slot_label
+            )
         return answer, spoken or answer
     except Exception:
-        return _fallback_parking_info_answer(query, district_label, parks_df)
+        return _fallback_parking_info_answer(
+            query, district_label, parks_df, fee_slot_label=fee_slot_label
+        )
 
 
 def render_saved_info_answer(payload: dict, *, auto_speak: bool = False) -> None:
     """重顯示已儲存的停車場資料／說明回覆。"""
-    intent = payload.get("intent") or {}
+    intent = dict(payload.get("intent") or {})
+    fee_slot_label = payload.get("fee_slot_label")
+    if fee_slot_label:
+        intent["_fee_slot_label"] = fee_slot_label
     render_intent_summary(intent, info_mode=True)
     district_label = payload.get("district_label") or district_display_name(
         intent.get("district")
     )
     count = int(payload.get("count") or 0)
     nearby_suffix = "附近" if intent.get("geo_lat") is not None else ""
-    st.success(
-        f"「{district_label}」{nearby_suffix}本系統停車場資料（共 {count} 個）"
+    if fee_slot_label:
+        st.success(
+            f"「{district_label}」{nearby_suffix}停車場收費"
+            f"（{fee_slot_label}，共 {count} 個）"
+        )
+    else:
+        st.success(
+            f"「{district_label}」{nearby_suffix}本系統停車場資料（共 {count} 個）"
+        )
+    # 朗讀掣：success 之下、表格之上、靠右（同預測成功一致）；無稿都畀司機聽到一句
+    written = (payload.get("written") or "").strip()
+    spoken = (payload.get("spoken") or written).strip()
+    if not written and not spoken:
+        written = "暫時沒有可顯示的回覆。"
+        spoken = "暫時冇可顯示嘅回覆。"
+    need_rerun = render_text_with_speech(
+        written,
+        spoken,
+        auto_speak=auto_speak,
+        button_key="info_speech_toggle",
+        show_written=SHOW_WRITTEN_SUGGESTION,
     )
-    parks_df = pd.DataFrame(payload.get("park_records") or [])
+    parks_df = parks_df_for_display(pd.DataFrame(payload.get("park_records") or []))
     if not parks_df.empty and count <= 40:
         st.dataframe(parks_df, use_container_width=True, hide_index=True)
     elif count > 40:
         st.caption(f"該範圍共有 {count} 個停車場，名單較長，以上方文字說明為準。")
-    # 語音掣若要 rerun，等資料表畫完先執行
-    need_rerun = render_text_with_speech(
-        payload.get("written") or "",
-        payload.get("spoken") or "",
-        auto_speak=auto_speak,
-        button_key="info_speech_toggle",
-    )
     flush_deferred_speech_browser_ops()
     if need_rerun:
         st.rerun()
@@ -3501,29 +4007,54 @@ def run_parking_info_answer(intent: dict, query_text: str) -> None:
     if match_type == "nearby":
         district_label = geo_label or district or district_label
 
+    wants_fee = looks_like_fee_query(query_text)
+    fee_slot_label = None
+    if wants_fee and not parks_df.empty:
+        day_cn, hour, minute, is_current = resolve_fee_query_slot(intent, query_text)
+        parks_df = attach_fees_to_parks_df(parks_df, day_cn, hour, minute)
+        if is_current:
+            fee_slot_label = f"現在 {format_time_ampm(hour, minute)}"
+        else:
+            fee_slot_label = f"{day_cn} {format_time_12h(hour, minute)}"
+
     if match_type == "nearby" and parks_df.empty:
-        render_intent_summary(intent, info_mode=True)
-        st.warning(
+        intent_for_summary = dict(intent)
+        if fee_slot_label:
+            intent_for_summary["_fee_slot_label"] = fee_slot_label
+        render_feedback_with_speech(
             f"「{district_label}」附近本系統沒有停車場紀錄。"
-            "請改試其他地點後重新輸入。"
+            "請改試其他地點後重新輸入。",
+            spoken=(
+                f"「{district_label}」附近本系統冇停車場紀錄。"
+                "請改試其他地點之後重新輸入。"
+            ),
+            intent=intent_for_summary,
+            info_mode=True,
+            auto_speak=True,
         )
         return
 
     with st.spinner("正在根據本系統資料整理回覆..."):
         written, spoken = answer_parking_info_with_llm(
-            query_text, district_label, parks_df
+            query_text,
+            district_label,
+            parks_df,
+            fee_slot_label=fee_slot_label,
         )
 
     payload = {
         "intent": intent,
         "district_label": district_label,
         "count": int(len(parks_df)),
-        "park_records": parks_df.to_dict(orient="records"),
+        "park_records": parks_df_for_display(parks_df).to_dict(orient="records"),
         "written": written,
         "spoken": spoken,
+        "fee_slot_label": fee_slot_label,
+        "wants_fee": wants_fee,
     }
     st.session_state.last_info_answer = payload
     st.session_state.pop("last_prediction", None)
+    st.session_state.pop("last_feedback", None)
     render_saved_info_answer(payload, auto_speak=True)
 
 
@@ -3591,10 +4122,15 @@ def run_vacancy_prediction(intent: dict, query_text: str):
         nearby, _radius = carparks_near_coords(float(geo_lat), float(geo_lon))
         district_label = geo_label or district or "該地點"
         if nearby.empty:
-            render_intent_summary(intent)
-            st.warning(
+            render_feedback_with_speech(
                 f"「{district_label}」附近本系統沒有停車場紀錄。"
-                "請改試其他地點後重新輸入。"
+                "請改試其他地點後重新輸入。",
+                spoken=(
+                    f"「{district_label}」附近本系統冇停車場紀錄。"
+                    "請改試其他地點之後重新輸入。"
+                ),
+                intent=intent,
+                auto_speak=True,
             )
             return
         dist_map = {
@@ -3603,18 +4139,25 @@ def run_vacancy_prediction(intent: dict, query_text: str):
         }
         df_filtered = df[df["park_id"].astype(str).isin(list(dist_map.keys()))]
         if df_filtered.empty:
-            render_intent_summary(intent)
-            st.warning(
+            render_feedback_with_speech(
                 f"「{district_label}」附近本系統沒有可用的空位預測資料。"
-                "請改試其他地點後重新輸入。"
+                "請改試其他地點後重新輸入。",
+                spoken=(
+                    f"「{district_label}」附近本系統冇可用嘅空位預測資料。"
+                    "請改試其他地點之後重新輸入。"
+                ),
+                intent=intent,
+                auto_speak=True,
             )
             return
         match_type = "nearby"
     else:
-        render_intent_summary(intent)
-        st.warning(
-            f"未能定位「{district_display_name(district)}」。"
-            "請重新輸入更清楚的地名。"
+        place = district_display_name(district)
+        render_feedback_with_speech(
+            f"未能定位「{place}」。請重新輸入更清楚的地名。",
+            spoken=f"未能定位「{place}」。請重新輸入更清楚嘅地名。",
+            intent=intent,
+            auto_speak=True,
         )
         return
 
@@ -3644,15 +4187,14 @@ def run_vacancy_prediction(intent: dict, query_text: str):
         pred_df = dedupe_equivalent_carparks(
             pred_df, prefer_higher_col="預測空位"
         )
-        pred_df = pred_df.drop(
-            columns=["park_id", "name", "latitude", "longitude"], errors="ignore"
-        )
+        # 保留 latitude／longitude 畀地圖用；表格顯示時會隱藏
+        pred_df = pred_df.drop(columns=["park_id", "name"], errors="ignore")
     if match_type == "nearby":
         result_df = select_top_nearby_with_ties(pred_df, top_n)
         district_label = f"{district_label}附近"
     else:
         result_df = select_top_with_ties(pred_df, top_n)
-    # 欄位順序：排名、名稱、地區、（距離）、收費、預測空位
+    # 欄位順序：排名、名稱、地區、（距離）、收費、預測空位；（隱藏）座標
     preferred = ["", "名稱", "地區", "距離(公里)", "收費", "預測空位"]
     ordered = [c for c in preferred if c in result_df.columns]
     ordered += [c for c in result_df.columns if c not in ordered]
@@ -3677,6 +4219,7 @@ def run_vacancy_prediction(intent: dict, query_text: str):
     }
     st.session_state.last_prediction = payload
     st.session_state.pop("last_info_answer", None)
+    st.session_state.pop("last_feedback", None)
     render_saved_prediction(payload, auto_speak=True)
 
 
@@ -3715,36 +4258,76 @@ def needs_past_time_followup(intent: dict, query_text: str) -> bool:
     return is_past_intent_datetime(day, intent.get("hour"), intent.get("minute"))
 
 
-def render_missing_time_blocked(intent: dict):
+def render_missing_time_blocked(intent: dict, *, auto_speak: bool = True):
     """未來日期但未指明時間：顯示意圖並要求重新輸入完整查詢。"""
-    render_intent_summary(intent)
     day = intent.get("day", WEEKDAY_CN[hong_kong_now().weekday()])
-    st.warning(
-        f"你想查詢的是 **{format_intent_date(day)}**，但未提供具體時間。"
-        f"請重新輸入查詢內容（例如：灣仔大後日下午三點邊度較易泊？）。"
+    day_label = format_intent_date(day)
+    render_feedback_with_speech(
+        f"你想查詢的是 **{day_label}**，但未提供具體時間。"
+        f"請重新輸入查詢內容（例如：灣仔大後日下午三點邊度較易泊？）。",
+        spoken=(
+            f"你想查嘅係{day_label}，但未有提供具體時間。"
+            "請重新輸入查詢內容，例如灣仔大後日下午三點邊度較易泊。"
+        ),
+        intent=intent,
+        auto_speak=auto_speak,
     )
 
 
-def render_ambiguous_ampm_blocked(intent: dict):
+def render_fee_missing_time_blocked(
+    intent: dict, query_text: str, *, auto_speak: bool = True
+):
+    """收費查詢指定非今日日子但未指明時間：要求重新輸入。"""
+    day = (
+        resolve_relative_day(query_text)
+        or intent.get("day")
+        or WEEKDAY_CN[hong_kong_now().weekday()]
+    )
+    day_label = format_intent_date(day)
+    render_feedback_with_speech(
+        f"你想查詢的是 **{day_label}** 的停車場收費，但未提供具體時間。"
+        f"查詢今天以外的日子必須註明時間。"
+        f"請重新輸入查詢內容（例如：彩雲邨星期日下午三點停車場收費？）。",
+        spoken=(
+            f"你想查嘅係{day_label}嘅停車場收費，但未有提供具體時間。"
+            "查詢今天以外嘅日子必須註明時間。"
+            "請重新輸入，例如彩雲邨星期日下午三點停車場收費。"
+        ),
+        intent=intent,
+        info_mode=True,
+        auto_speak=auto_speak,
+    )
+
+
+def render_ambiguous_ampm_blocked(intent: dict, *, auto_speak: bool = True):
     """有鐘點但未標上午／下午：顯示意圖並要求重新輸入完整查詢。"""
     # 唔顯示 LLM 臆測嘅 am/pm，避免誤導
     display_intent = {**intent, "hour": None, "minute": None}
-    render_intent_summary(display_intent)
-    st.warning(
+    render_feedback_with_speech(
         "你提供了鐘點，但未標明是上午還是下午"
         "（例如：上午／下午／上晝／下晝／朝早／夜晚／凌晨／嚟緊）。"
-        "請重新輸入查詢內容（例如：天晴邨附近星期日下午三點邊度較易泊？）。"
+        "請重新輸入查詢內容（例如：天晴邨附近星期日下午三點邊度較易泊？）。",
+        spoken=(
+            "你提供咗鐘點，但未標明係上午定下午。"
+            "請重新輸入查詢內容，例如天晴邨附近星期日下午三點邊度較易泊。"
+        ),
+        intent=display_intent,
+        auto_speak=auto_speak,
     )
 
 
-def render_past_time_blocked(intent: dict):
+def render_past_time_blocked(intent: dict, *, auto_speak: bool = True):
     """查詢時間已過：顯示意圖並要求重新輸入完整查詢。"""
-    render_intent_summary(intent)
     day = intent.get("day", WEEKDAY_CN[hong_kong_now().weekday()])
-    st.warning(
-        f"你想查詢的是 **{format_intent_date(day)} "
-        f"{format_intent_time(intent.get('hour'), intent.get('minute'))}**，"
-        f"但該時間已過去。請重新輸入查詢內容。"
+    when = (
+        f"{format_intent_date(day)} "
+        f"{format_intent_time(intent.get('hour'), intent.get('minute'))}"
+    )
+    render_feedback_with_speech(
+        f"你想查詢的是 **{when}**，但該時間已過去。請重新輸入查詢內容。",
+        spoken=f"你想查嘅係{when}，但該時間已經過去。請重新輸入查詢內容。",
+        intent=intent,
+        auto_speak=auto_speak,
     )
 
 
@@ -3769,14 +4352,21 @@ if should_query and query_text:
     st.session_state._suggestion_speaking = False
     st.session_state.pop("last_prediction", None)
     st.session_state.pop("last_info_answer", None)
+    st.session_state.pop("last_feedback", None)
     with st.spinner("AI 正在理解你的問題..."):
         intent = parse_query_with_llm(query_text)
 
     if not intent_is_parking_related(intent):
-        st.warning(
+        render_feedback_with_speech(
             "你的查詢似乎與停車場／泊車無關。"
             "請重新輸入與停車場空位有關的問題"
-            "（例如：天水圍今晚八點邊度較易泊？）。"
+            "（例如：天水圍今晚八點邊度較易泊？）。",
+            spoken=(
+                "你嘅查詢似乎同停車場或者泊車無關。"
+                "請重新輸入同停車場空位有關嘅問題，"
+                "例如天水圍今晚八點邊度較易泊。"
+            ),
+            auto_speak=True,
         )
     else:
         geo_error = None
@@ -3784,13 +4374,18 @@ if should_query and query_text:
             with st.spinner("正在用 Google Maps 搜尋地點..."):
                 geo_error = attach_geocode_to_intent(intent)
         if geo_error:
-            render_intent_summary(
-                intent,
+            render_feedback_with_speech(
+                geo_error,
+                spoken=_plain_for_speech(geo_error),
+                intent=intent,
                 info_mode=not intent_wants_prediction(intent),
+                auto_speak=True,
             )
-            st.warning(geo_error)
         elif not intent_wants_prediction(intent):
-            run_parking_info_answer(intent, query_text)
+            if needs_fee_missing_time_reentry(intent, query_text):
+                render_fee_missing_time_blocked(intent, query_text)
+            else:
+                run_parking_info_answer(intent, query_text)
         elif needs_missing_time_reentry(intent, query_text):
             render_missing_time_blocked(intent)
         elif needs_ambiguous_ampm_reentry(intent, query_text):
@@ -3800,9 +4395,15 @@ if should_query and query_text:
         else:
             run_vacancy_prediction(intent, query_text)
 elif should_query:
-    st.warning("請先輸入查詢內容。")
+    render_feedback_with_speech(
+        "請先輸入查詢內容。",
+        spoken="請先輸入查詢內容。",
+        auto_speak=True,
+    )
 
 # 保留上次結果（例如撳「再聽一次」後仍可看到建議）
+elif st.session_state.get("last_feedback") and not should_query:
+    render_saved_feedback(st.session_state.last_feedback, auto_speak=False)
 elif st.session_state.get("last_info_answer") and not should_query:
     render_saved_info_answer(st.session_state.last_info_answer, auto_speak=False)
 elif st.session_state.get("last_prediction") and not should_query:
