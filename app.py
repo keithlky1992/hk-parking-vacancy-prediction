@@ -1,8 +1,6 @@
 import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
-from sklearn.ensemble import GradientBoostingRegressor
-from sklearn.preprocessing import LabelEncoder
 from streamlit_mic_recorder import mic_recorder
 from streamlit_js_eval import get_geolocation
 from dotenv import load_dotenv
@@ -1182,9 +1180,20 @@ def inject_layout_css() -> None:
     }
   }
 
+  function isUnlockedMediaPlaying() {
+    var a = root.__hkParkingMediaAudio;
+    if (!a) return false;
+    try {
+      return !a.paused && !a.ended && a.currentTime > 0;
+    } catch (e) {
+      return false;
+    }
+  }
+
   root.__hkParkingUnlockMedia = unlockMediaNow;
   root.__hkParkingPlayUnlockedMedia = playUnlockedMedia;
   root.__hkParkingStopUnlockedMedia = stopUnlockedMedia;
+  root.__hkParkingIsUnlockedMediaPlaying = isUnlockedMediaPlaying;
 
   function unlockSpeechNow() {
     unlockMediaNow();
@@ -1483,6 +1492,57 @@ def inject_layout_css() -> None:
     });
   }
 
+  // 查詢送出後 blur，唔好留住 primary 紅邊／「Press Enter to submit form」
+  function blurUserQueryInput() {
+    var input = doc.querySelector(".st-key-user_query input")
+      || doc.querySelector('div[data-testid="stTextInput"] input');
+    if (!input) return;
+    try { input.blur(); } catch (e) {}
+  }
+
+  function scheduleBlurUserQuery() {
+    [0, 50, 150, 400, 800].forEach(function (ms) {
+      setTimeout(blurUserQueryInput, ms);
+    });
+  }
+
+  function bindQueryInputBlurOnSubmit() {
+    var input = doc.querySelector(".st-key-user_query input")
+      || doc.querySelector('div[data-testid="stTextInput"] input');
+    if (!input || input.dataset.mzdBlurBound) return;
+    input.dataset.mzdBlurBound = "1";
+    input.addEventListener("keydown", function (e) {
+      if (e.key !== "Enter") return;
+      // Enter 送出唔經「查詢」掣 pointerdown；必須喺手勢內停舊播＋解鎖，結果頁先可自動朗讀
+      stopSuggestionPlaybackOnly();
+      unlockSpeechNow();
+      scheduleBlurUserQuery();
+    });
+  }
+
+  function bindQueryButtonBlur() {
+    doc.querySelectorAll('div[data-testid="stFormSubmitButton"] button').forEach(function (btn) {
+      if (btn.dataset.mzdBlurBound) return;
+      btn.dataset.mzdBlurBound = "1";
+      btn.addEventListener("pointerdown", scheduleBlurUserQuery, true);
+      btn.addEventListener("click", scheduleBlurUserQuery, true);
+    });
+  }
+
+  function blurUserQueryIfMarked() {
+    var mark = doc.querySelector(".mzd-blur-user-query");
+    if (!mark) return;
+    blurUserQueryInput();
+    // 只 blur 一次；唔好每 400ms 搶 focus，否則用家改唔到字重新查詢
+    try {
+      mark.remove();
+    } catch (e) {
+      try {
+        if (mark.parentNode) mark.parentNode.removeChild(mark);
+      } catch (e2) {}
+    }
+  }
+
   // 與 format_hong_kong_now() 一致：只改 .mzd-hk-time 文字，唔重建 DOM
   var MZD_WEEKDAY = { Sun: "日", Mon: "一", Tue: "二", Wed: "三", Thu: "四", Fri: "五", Sat: "六" };
   function formatHongKongNow() {
@@ -1520,6 +1580,9 @@ def inject_layout_css() -> None:
   bindQueryStopSpeech();
   bindSuggestionSpeechButtons();
   hideSpeechEndedSentinel();
+  bindQueryInputBlurOnSubmit();
+  bindQueryButtonBlur();
+  blurUserQueryIfMarked();
   tickHkClock();
   setInterval(function () {
     styleMicButtons();
@@ -1529,6 +1592,9 @@ def inject_layout_css() -> None:
     bindQueryStopSpeech();
     bindSuggestionSpeechButtons();
     hideSpeechEndedSentinel();
+    bindQueryInputBlurOnSubmit();
+    bindQueryButtonBlur();
+    blurUserQueryIfMarked();
     tickHkClock();
   }, 400);
 })();
@@ -1659,11 +1725,18 @@ handle_voice_transcription(
 )
 render_voice_feedback("_voice_feedback")
 
+# 送出後 blur 查詢欄（去掉 focus 紅邊），文字保留
+if submitted or st.session_state.get("auto_submit_query"):
+    st.markdown(
+        '<span class="mzd-blur-user-query" aria-hidden="true"></span>',
+        unsafe_allow_html=True,
+    )
 
 
-@st.cache_data(ttl=600, show_spinner="")
+
+@st.cache_data(ttl=600, show_spinner="正在載入停車場數據…")
 def load_data():
-    """從 Supabase 載入空位歷史（香港時間；cache 10 分鐘）。"""
+    """從 Supabase 載入空位歷史（香港時間；cache 10 分鐘）。首屏唔呼叫，查詢時先拉。"""
     df = load_vacancy_frame()
     df["collected_at"] = pd.to_datetime(df["collected_at"])
     # 半小時槽位：0=12:00am … 30=3:00pm、31=3:30pm … 47=11:30pm
@@ -1675,6 +1748,67 @@ def load_data():
     # 結果表「地區」：Google reverse geocode 短名；未填則退回十八區
     df["sub_district"] = df["google_area"].fillna(df["district"])
     return df
+
+
+@st.cache_data(ttl=600, show_spinner="")
+def load_park_baselines() -> tuple[dict, dict, dict, dict]:
+    """
+    每車場歷史平均空位（忽略 vacancy=-1 未知值）。
+    回傳四層 lookup dict（tuple/park_id → mean）：
+      (park_id, half_hour, dow)
+      → (park_id, half_hour, is_weekend)
+      → (park_id, half_hour)
+      → park_id
+    """
+    df = load_data()
+    valid = df[df["vacancy"] >= 0].copy()
+    if valid.empty:
+        return {}, {}, {}, {}
+    valid["is_weekend"] = (valid["dow"] >= 5).astype(int)
+    by_slot_dow = (
+        valid.groupby(["park_id", "half_hour", "dow"], sort=False)["vacancy"]
+        .mean()
+        .to_dict()
+    )
+    by_slot_weekend = (
+        valid.groupby(["park_id", "half_hour", "is_weekend"], sort=False)["vacancy"]
+        .mean()
+        .to_dict()
+    )
+    by_slot = (
+        valid.groupby(["park_id", "half_hour"], sort=False)["vacancy"].mean().to_dict()
+    )
+    by_park = valid.groupby("park_id", sort=False)["vacancy"].mean().to_dict()
+    return by_slot_dow, by_slot_weekend, by_slot, by_park
+
+
+def predict_park_vacancy_baseline(
+    park_id,
+    half_hour: int,
+    dow: int,
+    baselines: tuple[dict, dict, dict, dict] | None = None,
+) -> float | None:
+    """
+    Per-park baseline：優先同車場＋半小時＋星期；
+    否則平日／週末同組；再否則同半小時；最後車場全日平均。
+    """
+    by_slot_dow, by_slot_weekend, by_slot, by_park = (
+        baselines or load_park_baselines()
+    )
+    val = by_slot_dow.get((park_id, half_hour, dow))
+    if val is not None:
+        return float(val)
+    is_weekend = 1 if dow >= 5 else 0
+    val = by_slot_weekend.get((park_id, half_hour, is_weekend))
+    if val is not None:
+        return float(val)
+    val = by_slot.get((park_id, half_hour))
+    if val is not None:
+        return float(val)
+    val = by_park.get(park_id)
+    if val is not None:
+        return float(val)
+    return None
 
 
 @st.cache_data(ttl=6 * 3600)
@@ -1826,9 +1960,6 @@ def format_carpark_fee(
     return "未提供"
 
 
-df = load_data()
-
-
 def _normalize_park_name(name: str) -> str:
     """正規化名稱以便比對重複車場（忽略大小寫、空白、停車場／車場後綴）。"""
     s = (name or "").strip().lower()
@@ -1931,7 +2062,9 @@ def carparks_near_coords(
     回傳 (車場 DataFrame含 distance_km, 實際使用半徑)；仍無則半徑為 None。
     """
     parks = (
-        df[["park_id", "name", "district", "sub_district", "latitude", "longitude"]]
+        load_data()[
+            ["park_id", "name", "district", "sub_district", "latitude", "longitude"]
+        ]
         .drop_duplicates(subset=["park_id"])
         .dropna(subset=["latitude", "longitude"])
         .copy()
@@ -2568,7 +2701,13 @@ def render_iframe_speech_player(spoken: str, *, auto_speak: bool = False) -> Non
     mp3 = synthesize_zh_hk_mp3(spoken)
     payload = json.dumps(spoken, ensure_ascii=False)
     auto_js = "true" if auto_speak else "false"
-    nonce = abs(hash(spoken)) % (10**9)
+    # 每次自動播都升 nonce，逼 Streamlit 重建 iframe；否則同一段講稿 HTML 不變 → 腳本唔跑 → 無聲
+    if auto_speak:
+        play_nonce = int(st.session_state.get("_speech_player_nonce", 0)) + 1
+        st.session_state._speech_player_nonce = play_nonce
+    else:
+        play_nonce = int(st.session_state.get("_speech_player_nonce", 0))
+    nonce = f"{play_nonce}-{abs(hash(spoken)) % (10**9)}"
 
     if mp3:
         audio_src = "data:audio/mpeg;base64," + base64.b64encode(mp3).decode("ascii")
@@ -2740,12 +2879,31 @@ def render_iframe_speech_player(spoken: str, *, auto_speak: bool = False) -> Non
 
   try {{ synth && synth.getVoices(); }} catch (e) {{}}
 
+  function parentMediaPlaying() {{
+    try {{
+      var parent = window.parent;
+      if (parent && typeof parent.__hkParkingIsUnlockedMediaPlaying === "function") {{
+        return !!parent.__hkParkingIsUnlockedMediaPlaying();
+      }}
+    }} catch (e) {{}}
+    return false;
+  }}
+
+  function tryLocalAutoSpeak() {{
+    if (uiSpeaking || parentMediaPlaying()) {{
+      if (parentMediaPlaying()) setUi(true);
+      return;
+    }}
+    speakNow();
+  }}
+
   function tryAutoSpeak() {{
     if (uiSpeaking) return;
     var parent = window.parent;
     // 優先：parent 喺查詢手勢解鎖過嘅 Audio（手機／iOS 自動播）
     if (audioSrc && parent && typeof parent.__hkParkingPlayUnlockedMedia === "function") {{
       var started = false;
+      var failed = false;
       parent.__hkParkingPlayUnlockedMedia(audioSrc, {{
         onStart: function () {{
           started = true;
@@ -2753,22 +2911,32 @@ def render_iframe_speech_player(spoken: str, *, auto_speak: bool = False) -> Non
         }},
         onEnded: function () {{ setUi(false); }},
         onError: function () {{
-          if (!started) speakNow();
+          failed = true;
+          if (!started) tryLocalAutoSpeak();
           else setUi(false);
         }}
       }});
-      // 未解鎖時 play 可能靜默失敗：稍後再試 iframe 本地播（桌面通常得）
-      setTimeout(function () {{
-        if (!started && !uiSpeaking) speakNow();
-      }}, 500);
+      // MP3 data URI 有時 >500ms 先起播；唔好過早 speakNow() 打掉 parent 音訊
+      [700, 1400, 2200].forEach(function (ms) {{
+        setTimeout(function () {{
+          if (started || failed || uiSpeaking || parentMediaPlaying()) {{
+            if (!started && parentMediaPlaying()) {{
+              started = true;
+              setUi(true);
+            }}
+            return;
+          }}
+          tryLocalAutoSpeak();
+        }}, ms);
+      }});
       return;
     }}
     // 無 MP3：退回 Web Speech／本地播
-    speakNow();
+    tryLocalAutoSpeak();
   }}
 
   if (wantAuto) {{
-    setTimeout(tryAutoSpeak, 300);
+    setTimeout(tryAutoSpeak, 200);
   }}
 }})();
 </script>
@@ -3731,7 +3899,9 @@ def unique_carparks_for_location(
     """
     if _is_all_hong_kong(district):
         parks = (
-            df[["park_id", "name", "district", "sub_district", "latitude", "longitude"]]
+            load_data()[
+                ["park_id", "name", "district", "sub_district", "latitude", "longitude"]
+            ]
             .drop_duplicates(subset=["park_id"])
             .copy()
         )
@@ -4145,15 +4315,8 @@ def run_vacancy_prediction(intent: dict, query_text: str):
     match_type = "all"
     district_label = "全港"
 
-    le = LabelEncoder()
-    df["park_code"] = le.fit_transform(df["park_id"])
-
-    features = ["half_hour", "dow", "park_code"]
-    X = df[features]
-    y = df["vacancy"]
-
-    model = GradientBoostingRegressor(random_state=42, n_estimators=50)
-    model.fit(X, y)
+    df = load_data().copy()
+    baselines = load_park_baselines()
 
     # 非全港：一律 Google 座標＋半徑篩附近車場（不再用 sub_district）
     if _is_all_hong_kong(district):
@@ -4202,11 +4365,15 @@ def run_vacancy_prediction(intent: dict, query_text: str):
         return
 
     fee_map = load_carpark_fee_rules()
+    park_info = (
+        df_filtered.drop_duplicates(subset=["park_id"]).set_index("park_id", drop=False)
+    )
     results = []
-    for park_id in df_filtered["park_id"].unique():
-        park_code = le.transform([park_id])[0]
-        pred = model.predict([[half_hour, dow_num, park_code]])[0]
-        info = df[df["park_id"] == park_id].iloc[0]
+    for park_id in park_info.index:
+        pred = predict_park_vacancy_baseline(park_id, half_hour, dow_num, baselines)
+        if pred is None:
+            continue
+        info = park_info.loc[park_id]
         row = {
             "park_id": park_id,
             "name": info["name"],
