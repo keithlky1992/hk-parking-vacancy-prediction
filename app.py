@@ -2284,6 +2284,7 @@ def resolve_coming_soon_intent(intent: dict, query: str, now=None) -> dict:
     intent["hour"] = dt.hour
     intent["minute"] = dt.minute
     intent["day"] = WEEKDAY_CN[dt.weekday()]
+    intent["day_next_week"] = False
     return intent
 
 
@@ -3448,10 +3449,35 @@ def render_ranked_table(df: pd.DataFrame) -> None:
 
 
 
+# 「下星期二／下週三／下個星期一」等 → 下一個日曆週嘅該日
+_NEXT_WEEK_DAY_RE = re.compile(r"下個?(?:星期|週|周)([一二三四五六日天])")
+_DAY_CHAR_TO_CN = {
+    "一": "週一",
+    "二": "週二",
+    "三": "週三",
+    "四": "週四",
+    "五": "週五",
+    "六": "週六",
+    "日": "週日",
+    "天": "週日",
+}
+
+
+def query_implies_next_week_weekday(query: str) -> bool:
+    """查詢是否寫明「下星期／下週／下個星期」＋星期。"""
+    q = (query or "").replace(" ", "")
+    return bool(_NEXT_WEEK_DAY_RE.search(q))
+
+
 def resolve_relative_day(query: str, today=None):
     """從查詢解析相對日期（粵語），回傳「週一」…「週日」；無法判斷則回傳 None。"""
     today = today or hong_kong_now()
     q = query.replace(" ", "")
+
+    # 「下星期二」等：先抽星期（實際日期由 day_next_week＋date_for_weekday_cn 處理）
+    m = _NEXT_WEEK_DAY_RE.search(q)
+    if m:
+        return _DAY_CHAR_TO_CN.get(m.group(1))
 
     # 由遠至近／較具體先匹配，避免「後日」被「日」誤傷
     relative_offsets = [
@@ -3478,20 +3504,35 @@ def district_display_name(district: str) -> str:
     return str(district or "").strip() or "全港"
 
 
-def date_for_weekday_cn(day_cn: str, today=None) -> datetime | None:
-    """將「週一」…「週日」轉成今天或之後最近的該日日期。"""
+def date_for_weekday_cn(
+    day_cn: str, today=None, *, next_week: bool = False
+) -> datetime | None:
+    """將「週一」…「週日」轉成日期。
+
+    - 預設：今天或之後最近的該日（含今日）
+    - next_week=True（「下星期二」等）：下一個日曆週的該日（由下星期一起計）
+    """
     today = today or hong_kong_now()
     target = DAY_TO_NUM.get(day_cn)
     if target is None:
         return None
+    if next_week:
+        # Mon→+7、Tue→+6 … Sun→+1，再到該星期幾
+        days_to_next_monday = 7 - today.weekday()
+        next_monday = today + timedelta(days=days_to_next_monday)
+        return (next_monday + timedelta(days=target)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
     delta = (target - today.weekday()) % 7
-    return (today + timedelta(days=delta)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return (today + timedelta(days=delta)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
 
 
-def is_future_day(day_cn: str, today=None) -> bool:
+def is_future_day(day_cn: str, today=None, *, next_week: bool = False) -> bool:
     """日子是否為明天或之後（相對今天）。"""
     today = today or hong_kong_now()
-    date_part = date_for_weekday_cn(day_cn, today)
+    date_part = date_for_weekday_cn(day_cn, today, next_week=next_week)
     if date_part is None:
         return False
     return date_part.date() > today.date()
@@ -3502,12 +3543,14 @@ def intent_has_clock_time(hour) -> bool:
     return hour is not None and str(hour).strip() not in ("", "null", "None")
 
 
-def intent_query_datetime(day_cn: str, hour, minute, today=None) -> datetime | None:
+def intent_query_datetime(
+    day_cn: str, hour, minute, today=None, *, next_week: bool = False
+) -> datetime | None:
     """將意圖的星期＋鐘點組合成具體日期時間；缺資料則回傳 None。"""
     if not intent_has_clock_time(hour):
         return None
     today = today or hong_kong_now()
-    date_part = date_for_weekday_cn(day_cn, today)
+    date_part = date_for_weekday_cn(day_cn, today, next_week=next_week)
     if date_part is None:
         return None
     m = 0 if minute is None or str(minute).strip() in ("", "null", "None") else int(minute)
@@ -3515,10 +3558,14 @@ def intent_query_datetime(day_cn: str, hour, minute, today=None) -> datetime | N
     return date_part.replace(hour=h, minute=m, second=0, microsecond=0)
 
 
-def is_past_intent_datetime(day_cn: str, hour, minute, today=None) -> bool:
+def is_past_intent_datetime(
+    day_cn: str, hour, minute, today=None, *, next_week: bool = False
+) -> bool:
     """意圖所指日期時間是否已過去（相對香港時間）。"""
     today = today or hong_kong_now()
-    when = intent_query_datetime(day_cn, hour, minute, today)
+    when = intent_query_datetime(
+        day_cn, hour, minute, today, next_week=next_week
+    )
     if when is None:
         return False
     return when < today.replace(second=0, microsecond=0)
@@ -3531,10 +3578,12 @@ def format_time_ampm(hour: int, minute: int = 0) -> str:
     return f"{hour12}:{minute:02d}{suffix}"
 
 
-def format_intent_date(day_cn, today=None) -> str:
+def format_intent_date(day_cn, today=None, *, next_week: bool = False) -> str:
     """例如：2026年10月24日（六）"""
     today = today or hong_kong_now()
-    date_part = date_for_weekday_cn(day_cn, today) if day_cn else None
+    date_part = (
+        date_for_weekday_cn(day_cn, today, next_week=next_week) if day_cn else None
+    )
     if date_part is None:
         return "未指定"
     return (
@@ -3708,6 +3757,7 @@ def parse_query_with_llm(query: str):
   - 「今日／今晚／今天」→ {day_today}
   - 「聽日／聽晚／明天／明晚」→ {day_tomorrow}
   - 「後日／後晚／後天」→ {day_after}
+  - 「下星期二／下週三／下個星期一」等 → 填對應「週X」（系統會解成下一個日曆週，不是本週已過或今日）
   - 「嚟緊」單獨或「嚟緊＋鐘點」：日期先填「{day_today}」（稍後會規則校正）
   - 如果句子沒有提到日期或星期，就填「{day_today}」
 - top_n: 要顯示幾個較易泊車的停車場（整數）。規則：
@@ -3777,6 +3827,7 @@ def parse_query_with_llm(query: str):
     resolved_day = resolve_relative_day(query, today)
     if resolved_day:
         intent["day"] = resolved_day
+    intent["day_next_week"] = query_implies_next_week_weekday(query)
 
     # 保留 LLM 抽出的地點原文予 Google Geocoding；只把「全部」等正規成全港
     if _is_all_hong_kong(intent.get("district")):
@@ -3784,6 +3835,7 @@ def parse_query_with_llm(query: str):
 
     if is_now_query(query):
         intent["day"] = WEEKDAY_CN[today.weekday()]
+        intent["day_next_week"] = False
 
     # 與停車場無關 → 不推時間／不進入預測
     if not intent_is_parking_related(intent):
@@ -3813,7 +3865,8 @@ def parse_query_with_llm(query: str):
 
     intent["query_type"] = "prediction"
     day_cn = intent.get("day") or today_day
-    future = is_future_day(day_cn, today)
+    next_week = bool(intent.get("day_next_week"))
+    future = is_future_day(day_cn, today, next_week=next_week)
     has_clock = has_explicit_clock_time(query)
     coming_soon = is_coming_soon_query(query)
 
@@ -3830,6 +3883,7 @@ def parse_query_with_llm(query: str):
         intent["hour"] = dt.hour
         intent["minute"] = dt.minute
         intent["day"] = WEEKDAY_CN[dt.weekday()]
+        intent["day_next_week"] = False
 
     return intent
 
@@ -3862,7 +3916,13 @@ def render_intent_summary(intent: dict, *, info_mode: bool = False):
     else:
         intent_fields = [
             ("地區", _intent_display(place_label)),
-            ("日期", format_intent_date(intent.get("day"))),
+            (
+                "日期",
+                format_intent_date(
+                    intent.get("day"),
+                    next_week=bool(intent.get("day_next_week")),
+                ),
+            ),
             ("時間", format_intent_time(intent.get("hour"), intent.get("minute"))),
             ("顯示數量", _intent_display(intent.get("top_n"))),
         ]
@@ -3980,6 +4040,9 @@ def needs_fee_missing_time_reentry(intent: dict, query_text: str) -> bool:
     explicit_day = resolve_relative_day(query_text)
     if not explicit_day:
         return False
+    # 「下星期二」即使今日亦係星期二，仍屬未來日，要具體時間
+    if query_implies_next_week_weekday(query_text) or intent.get("day_next_week"):
+        return True
     today_day = WEEKDAY_CN[hong_kong_now().weekday()]
     return explicit_day != today_day
 
@@ -4436,7 +4499,9 @@ def needs_missing_time_reentry(intent: dict, query_text: str) -> bool:
     day = intent.get("day", WEEKDAY_CN[hong_kong_now().weekday()])
     if asking_now:
         return False
-    return is_future_day(day) and not intent_has_clock_time(intent.get("hour"))
+    return is_future_day(
+        day, next_week=bool(intent.get("day_next_week"))
+    ) and not intent_has_clock_time(intent.get("hour"))
 
 
 def needs_ambiguous_ampm_reentry(intent: dict, query_text: str) -> bool:
@@ -4462,13 +4527,20 @@ def needs_past_time_followup(intent: dict, query_text: str) -> bool:
     if is_now_query(query_text):
         return False
     day = intent.get("day", WEEKDAY_CN[hong_kong_now().weekday()])
-    return is_past_intent_datetime(day, intent.get("hour"), intent.get("minute"))
+    return is_past_intent_datetime(
+        day,
+        intent.get("hour"),
+        intent.get("minute"),
+        next_week=bool(intent.get("day_next_week")),
+    )
 
 
 def render_missing_time_blocked(intent: dict, *, auto_speak: bool = True):
     """未來日期但未指明時間：顯示意圖並要求重新輸入完整查詢。"""
     day = intent.get("day", WEEKDAY_CN[hong_kong_now().weekday()])
-    day_label = format_intent_date(day)
+    day_label = format_intent_date(
+        day, next_week=bool(intent.get("day_next_week"))
+    )
     render_feedback_with_speech(
         f"你想查詢的是 **{day_label}**，但未提供具體時間。"
         f"請重新輸入查詢內容（例如：灣仔大後日下午三點邊度較易泊？）。",
@@ -4490,7 +4562,13 @@ def render_fee_missing_time_blocked(
         or intent.get("day")
         or WEEKDAY_CN[hong_kong_now().weekday()]
     )
-    day_label = format_intent_date(day)
+    day_label = format_intent_date(
+        day,
+        next_week=bool(
+            intent.get("day_next_week")
+            or query_implies_next_week_weekday(query_text)
+        ),
+    )
     render_feedback_with_speech(
         f"你想查詢的是 **{day_label}** 的停車場收費，但未提供具體時間。"
         f"查詢今天以外的日子必須註明時間。"
@@ -4527,7 +4605,7 @@ def render_past_time_blocked(intent: dict, *, auto_speak: bool = True):
     """查詢時間已過：顯示意圖並要求重新輸入完整查詢。"""
     day = intent.get("day", WEEKDAY_CN[hong_kong_now().weekday()])
     when = (
-        f"{format_intent_date(day)} "
+        f"{format_intent_date(day, next_week=bool(intent.get('day_next_week')))} "
         f"{format_intent_time(intent.get('hour'), intent.get('minute'))}"
     )
     render_feedback_with_speech(
