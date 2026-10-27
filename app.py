@@ -3008,28 +3008,39 @@ def render_results_map(
         if pd.isna(lat) or pd.isna(lon):
             continue
         name = str(row.get("名稱") or "").strip() or "停車場"
-        vacancy = row.get("預測空位")
-        try:
-            vacancy_txt = str(int(vacancy)) if vacancy is not None and not pd.isna(vacancy) else "—"
-        except (TypeError, ValueError):
-            vacancy_txt = str(vacancy) if vacancy is not None else "—"
+        details: list[str] = []
+        if "預測空位" in df.columns:
+            vacancy = row.get("預測空位")
+            try:
+                vacancy_txt = (
+                    str(int(vacancy))
+                    if vacancy is not None and not pd.isna(vacancy)
+                    else "—"
+                )
+            except (TypeError, ValueError):
+                vacancy_txt = str(vacancy) if vacancy is not None else "—"
+            details.append(f"預測空位：{html.escape(vacancy_txt)}")
+        fee = row.get("收費")
+        if fee is not None and not (isinstance(fee, float) and pd.isna(fee)):
+            fee_txt = str(fee).strip()
+            if fee_txt:
+                details.append(f"收費：{html.escape(fee_txt)}")
         dist = row.get("距離(公里)")
-        dist_txt = ""
         if dist is not None and not (isinstance(dist, float) and pd.isna(dist)):
             try:
-                dist_txt = f"<br>距離：{float(dist):.1f} 公里"
+                details.append(f"距離：{float(dist):.1f} 公里")
             except (TypeError, ValueError):
-                dist_txt = ""
+                pass
         rank = row.get("")
         rank_txt = f"{rank} · " if rank not in (None, "") and not (isinstance(rank, float) and pd.isna(rank)) else ""
+        detail_html = "".join(f"<br>{d}" for d in details)
         markers.append(
             {
                 "lat": lat,
                 "lng": lon,
                 "title": name,
                 "info": (
-                    f"<strong>{html.escape(rank_txt + name)}</strong>"
-                    f"<br>預測空位：{html.escape(vacancy_txt)}{dist_txt}"
+                    f"<strong>{html.escape(rank_txt + name)}</strong>{detail_html}"
                 ),
             }
         )
@@ -3410,7 +3421,11 @@ def looks_like_vacancy_prediction_query(query: str) -> bool:
 
 
 def looks_like_fee_query(query: str) -> bool:
-    """是否在問停車場收費／價錢（而非空位預測）。"""
+    """是否在問停車場收費／價錢（而非空位預測）。
+
+    「收費／價錢」等 soft 關鍵字視為已含「停車場」語意
+    （例如「天水圍聽日嘅收費如何」＝「天水圍停車場聽日嘅收費如何」）。
+    """
     q = (query or "").replace(" ", "").lower()
     strong = (
         "泊車費",
@@ -3425,7 +3440,7 @@ def looks_like_fee_query(query: str) -> bool:
     if any(s in q for s in strong):
         return True
     soft = ("收費", "價錢", "價格", "幾錢", "多少錢", "幾多錢")
-    return any(s in q for s in soft) and looks_like_parking_query(query)
+    return any(s in q for s in soft)
 
 
 def looks_like_parking_info_query(query: str) -> bool:
@@ -3726,6 +3741,8 @@ def unique_carparks_for_location(
                 "park_id": filtered["park_id"].astype(str).values,
                 "名稱": filtered["name"].values,
                 "地區": filtered["sub_district"].fillna(filtered["district"]).values,
+                "latitude": filtered["latitude"].values,
+                "longitude": filtered["longitude"].values,
             }
         ).sort_values(["地區", "名稱"], kind="mergesort").reset_index(drop=True)
         return "all", "全港", rows
@@ -3733,7 +3750,14 @@ def unique_carparks_for_location(
     district_label = geo_label or district or "該地點"
     if geo_lat is None or geo_lon is None:
         return "nearby", district_label, pd.DataFrame(
-            columns=["park_id", "名稱", "地區", "距離(公里)"]
+            columns=[
+                "park_id",
+                "名稱",
+                "地區",
+                "距離(公里)",
+                "latitude",
+                "longitude",
+            ]
         )
 
     nearby, _radius = carparks_near_coords(float(geo_lat), float(geo_lon))
@@ -3743,6 +3767,8 @@ def unique_carparks_for_location(
             "名稱": nearby["name"].values,
             "地區": nearby["sub_district"].fillna(nearby["district"]).values,
             "距離(公里)": nearby["distance_km"].round(1).values,
+            "latitude": nearby["latitude"].values,
+            "longitude": nearby["longitude"].values,
         }
     )
     return "nearby", district_label, rows
@@ -3952,6 +3978,12 @@ def render_saved_info_answer(payload: dict, *, auto_speak: bool = False) -> None
     """重顯示已儲存的停車場資料／說明回覆。"""
     intent = dict(payload.get("intent") or {})
     fee_slot_label = payload.get("fee_slot_label")
+    # 舊 session payload 無 wants_fee：有 fee_slot_label 即當明確問收費
+    wants_fee = (
+        bool(payload["wants_fee"])
+        if "wants_fee" in payload
+        else bool(fee_slot_label)
+    )
     if fee_slot_label:
         intent["_fee_slot_label"] = fee_slot_label
     render_intent_summary(intent, info_mode=True)
@@ -3960,7 +3992,7 @@ def render_saved_info_answer(payload: dict, *, auto_speak: bool = False) -> None
     )
     count = int(payload.get("count") or 0)
     nearby_suffix = "附近" if intent.get("geo_lat") is not None else ""
-    if fee_slot_label:
+    if wants_fee and fee_slot_label:
         st.success(
             f"「{district_label}」{nearby_suffix}停車場收費"
             f"（{fee_slot_label}，共 {count} 個）"
@@ -3984,7 +4016,14 @@ def render_saved_info_answer(payload: dict, *, auto_speak: bool = False) -> None
     )
     parks_df = parks_df_for_display(pd.DataFrame(payload.get("park_records") or []))
     if not parks_df.empty and count <= 40:
-        st.dataframe(parks_df, use_container_width=True, hide_index=True)
+        # 保留 latitude／longitude 畀地圖；表格顯示時隱藏
+        display_df = parks_df.drop(columns=list(_TABLE_HIDDEN_COLS), errors="ignore")
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+        render_results_map(parks_df, intent=intent)
+        if fee_slot_label and "收費" in parks_df.columns:
+            st.caption(
+                f"收費為「{fee_slot_label}」時段（政府開放資料私家車規則；無資料則顯示未提供）。"
+            )
     elif count > 40:
         st.caption(f"該範圍共有 {count} 個停車場，名單較長，以上方文字說明為準。")
     flush_deferred_speech_browser_ops()
@@ -4007,9 +4046,10 @@ def run_parking_info_answer(intent: dict, query_text: str) -> None:
     if match_type == "nearby":
         district_label = geo_label or district or district_label
 
+    # 結果表一律附上收費（預設用當刻／已指定時段）；成功橫幅／LLM 聚焦收費只喺明確問價時開啟
     wants_fee = looks_like_fee_query(query_text)
     fee_slot_label = None
-    if wants_fee and not parks_df.empty:
+    if not parks_df.empty:
         day_cn, hour, minute, is_current = resolve_fee_query_slot(intent, query_text)
         parks_df = attach_fees_to_parks_df(parks_df, day_cn, hour, minute)
         if is_current:
@@ -4019,7 +4059,7 @@ def run_parking_info_answer(intent: dict, query_text: str) -> None:
 
     if match_type == "nearby" and parks_df.empty:
         intent_for_summary = dict(intent)
-        if fee_slot_label:
+        if wants_fee and fee_slot_label:
             intent_for_summary["_fee_slot_label"] = fee_slot_label
         render_feedback_with_speech(
             f"「{district_label}」附近本系統沒有停車場紀錄。"
@@ -4039,7 +4079,7 @@ def run_parking_info_answer(intent: dict, query_text: str) -> None:
             query_text,
             district_label,
             parks_df,
-            fee_slot_label=fee_slot_label,
+            fee_slot_label=fee_slot_label if wants_fee else None,
         )
 
     payload = {

@@ -143,45 +143,48 @@ def maybe_update_carparks_monthly(target_ids: set[str]) -> set[str]:
 
 
 def collect_vacancy(target_ids: set[str]) -> None:
-    response = requests.get(
-        VACANCY_URL,
-        params={
-            "data": "vacancy",
-            "lang": "zh_TW",
-            "vehicleTypes": "privateCar",
-        },
-        timeout=30,
-    )
-    if response.status_code != 200:
-        print("空位請求失敗")
-        return
-
-    collected_at = now_hk_iso()
-    records = []
-    for item in response.json().get("results") or []:
-        park_id = str(item.get("park_Id"))
-        if park_id not in target_ids:
-            continue
-        private = item.get("privateCar") or []
-        if not private:
-            continue
-        v = private[0]
-        records.append(
-            {
-                "park_id": park_id,
-                "vacancy": v.get("vacancy"),
-                "vacancy_type": v.get("vacancy_type"),
-                "lastupdate": parse_api_timestamp(v.get("lastupdate")),
-                "collected_at": collected_at,
-            }
+    try:
+        response = requests.get(
+            VACANCY_URL,
+            params={
+                "data": "vacancy",
+                "lang": "zh_TW",
+                "vehicleTypes": "privateCar",
+            },
+            timeout=30,
         )
+        if response.status_code != 200:
+            print(f"空位請求失敗 HTTP {response.status_code}")
+            return
 
-    if not records:
-        print("沒有新資料")
-        return
+        collected_at = now_hk_iso()
+        records = []
+        for item in response.json().get("results") or []:
+            park_id = str(item.get("park_Id"))
+            if park_id not in target_ids:
+                continue
+            private = item.get("privateCar") or []
+            if not private:
+                continue
+            v = private[0]
+            records.append(
+                {
+                    "park_id": park_id,
+                    "vacancy": v.get("vacancy"),
+                    "vacancy_type": v.get("vacancy_type"),
+                    "lastupdate": parse_api_timestamp(v.get("lastupdate")),
+                    "collected_at": collected_at,
+                }
+            )
 
-    insert_vacancy_records(records)
-    print(f"成功寫入 Supabase {len(records)} 筆空位 ({collected_at})")
+        if not records:
+            print("沒有新資料")
+            return
+
+        insert_vacancy_records(records)
+        print(f"成功寫入 Supabase {len(records)} 筆空位 ({collected_at})")
+    except Exception as e:
+        print("空位收集失敗:", e)
 
 
 def collect_weather() -> None:
@@ -226,9 +229,13 @@ def main() -> None:
         f"目標車場 {len(target_ids)}；Ctrl+C 停止）"
     )
     while True:
-        target_ids = maybe_update_carparks_monthly(target_ids)
-        collect_vacancy(target_ids)
-        collect_weather()
+        try:
+            target_ids = maybe_update_carparks_monthly(target_ids)
+            collect_vacancy(target_ids)
+            collect_weather()
+        except Exception as e:
+            # 唔好因單次網絡／API 錯誤就退出迴圈
+            print("本輪採集異常（稍後重試）:", e)
         time.sleep(600)
 
 
