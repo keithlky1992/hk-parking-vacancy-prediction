@@ -21,7 +21,7 @@ from zoneinfo import ZoneInfo
 from pyflac import StreamEncoder
 
 from google_areas import reverse_geocode_location_label
-from parking_db import get_secret, load_vacancy_frame
+from parking_db import get_secret, load_carparks_frame, load_vacancy_frame
 
 WEEKDAY_CN = {0: "週一", 1: "週二", 2: "週三", 3: "週四", 4: "週五", 5: "週六", 6: "週日"}
 WEEKDAY_SHORT = {0: "一", 1: "二", 2: "三", 3: "四", 4: "五", 5: "六", 6: "日"}
@@ -45,6 +45,10 @@ CN_NUM = {
 }
 NUM_CN = {1: "一", 2: "兩", 3: "三", 4: "四", 5: "五", 6: "六", 7: "七", 8: "八", 9: "九", 10: "十"}
 DEFAULT_TOP_N = 10
+# 預測 shrinkage：同星期樣本少時向平日／週末均值收斂，仍保留星期差異
+BASELINE_PRIOR_K = 3.0
+SEARCH_HISTORY_MAX = 8
+LIVE_NEARBY_TOP_N = 8
 # 暫時隱藏建議／資料答覆書面文字；朗讀掣／自動播仍然保留。改 True 即可恢復顯示
 SHOW_WRITTEN_SUGGESTION = False
 # 朗讀自然結束時由 JS 點擊；放頁頂並以 CSS 收起，唔插入結果區
@@ -1686,9 +1690,19 @@ render_header_context_panel()
 apply_pending_input("user_query", "_pending_user_query")
 if "user_query" not in st.session_state:
     st.session_state.user_query = ""
+if "search_history" not in st.session_state:
+    st.session_state.search_history = []
+
+# 歷史紀錄重查：喺 form 前套用 pending，避免改已建立嘅 widget
+if st.session_state.pop("_history_rerun", False):
+    st.session_state.auto_submit_query = True
+apply_pending_input("user_query", "_pending_history_query")
 
 # 文字輸入 + 查詢 + 語音同一列（Enter 或按「查詢」皆可送出）
-st.caption("輸入查詢（例如：天水圍今晚八點邊度較易泊？）")
+st.caption(
+    "輸入查詢（例如：天水圍今晚八點邊度較易泊？）"
+    f"· 未指定數量時預設顯示前 {DEFAULT_TOP_N} 名"
+)
 form_col, voice_col = st.columns([6.2, 1], vertical_alignment="bottom")
 with form_col:
     with st.form("query_form", border=False):
@@ -1725,19 +1739,51 @@ handle_voice_transcription(
 )
 render_voice_feedback("_voice_feedback")
 
+# 搜尋歷史（可一鍵重查）
+if st.session_state.search_history:
+    st.caption("最近搜尋")
+    hist_cols = st.columns(min(4, len(st.session_state.search_history)))
+    for i, past_q in enumerate(st.session_state.search_history[:4]):
+        label = past_q if len(past_q) <= 18 else past_q[:16] + "…"
+        if hist_cols[i].button(
+            label,
+            key=f"hist_btn_{i}",
+            use_container_width=True,
+            help=past_q,
+        ):
+            st.session_state["_pending_history_query"] = past_q
+            st.session_state["_history_rerun"] = True
+            st.rerun()
+
 # 送出後 blur 查詢欄（去掉 focus 紅邊），文字保留
 if submitted or st.session_state.get("auto_submit_query"):
     st.markdown(
         '<span class="mzd-blur-user-query" aria-hidden="true"></span>',
         unsafe_allow_html=True,
     )
+    st.info("正在處理查詢…（語音／首次載入歷史數據時可能需數秒）")
 
 
 
-@st.cache_data(ttl=600, show_spinner="正在載入停車場數據…")
-def load_data():
-    """從 Supabase 載入空位歷史（香港時間；cache 10 分鐘）。首屏唔呼叫，查詢時先拉。"""
-    df = load_vacancy_frame()
+@st.cache_data(ttl=600, show_spinner="正在載入停車場清單…")
+def load_carparks_meta() -> pd.DataFrame:
+    """只載入車場靜態資料（附近篩選／預設地圖用；唔拉歷史空位）。"""
+    df = load_carparks_frame()
+    if df.empty:
+        return df
+    df["sub_district"] = df["google_area"].fillna(df["district"])
+    return df
+
+
+@st.cache_data(ttl=600, show_spinner="正在載入歷史空位…")
+def load_data(park_ids: tuple[str, ...] | None = None) -> pd.DataFrame:
+    """
+    從 Supabase 載入空位歷史（香港時間；cache 10 分鐘）。
+    傳 park_ids 時只拉該批車場（附近查詢大幅加速）。
+    """
+    df = load_vacancy_frame(park_ids=list(park_ids) if park_ids else None)
+    if df.empty:
+        return df
     df["collected_at"] = pd.to_datetime(df["collected_at"])
     # 半小時槽位：0=12:00am … 30=3:00pm、31=3:30pm … 47=11:30pm
     df["half_hour"] = (
@@ -1750,65 +1796,184 @@ def load_data():
     return df
 
 
-@st.cache_data(ttl=600, show_spinner="")
-def load_park_baselines() -> tuple[dict, dict, dict, dict]:
+def build_park_baselines(
+    df: pd.DataFrame,
+) -> tuple[dict, dict, dict, dict, dict, dict, dict, dict]:
     """
-    每車場歷史平均空位（忽略 vacancy=-1 未知值）。
-    回傳四層 lookup dict（tuple/park_id → mean）：
+    每車場歷史平均空位 + 樣本數（忽略 vacancy=-1）。
+    回傳 mean／count 各四層：
       (park_id, half_hour, dow)
       → (park_id, half_hour, is_weekend)
       → (park_id, half_hour)
       → park_id
     """
-    df = load_data()
+    empty = ({}, {}, {}, {}, {}, {}, {}, {})
+    if df is None or df.empty:
+        return empty
     valid = df[df["vacancy"] >= 0].copy()
     if valid.empty:
-        return {}, {}, {}, {}
+        return empty
     valid["is_weekend"] = (valid["dow"] >= 5).astype(int)
-    by_slot_dow = (
-        valid.groupby(["park_id", "half_hour", "dow"], sort=False)["vacancy"]
-        .mean()
-        .to_dict()
-    )
-    by_slot_weekend = (
-        valid.groupby(["park_id", "half_hour", "is_weekend"], sort=False)["vacancy"]
-        .mean()
-        .to_dict()
-    )
-    by_slot = (
-        valid.groupby(["park_id", "half_hour"], sort=False)["vacancy"].mean().to_dict()
-    )
+
+    def _maps(keys: list[str]) -> tuple[dict, dict]:
+        agg = valid.groupby(keys, sort=False)["vacancy"].agg(["mean", "count"])
+        means = agg["mean"].to_dict()
+        counts = agg["count"].astype(int).to_dict()
+        return means, counts
+
+    by_slot_dow, n_slot_dow = _maps(["park_id", "half_hour", "dow"])
+    by_slot_weekend, n_slot_weekend = _maps(["park_id", "half_hour", "is_weekend"])
+    by_slot, n_slot = _maps(["park_id", "half_hour"])
     by_park = valid.groupby("park_id", sort=False)["vacancy"].mean().to_dict()
-    return by_slot_dow, by_slot_weekend, by_slot, by_park
+    n_park = valid.groupby("park_id", sort=False)["vacancy"].count().astype(int).to_dict()
+    return (
+        by_slot_dow,
+        by_slot_weekend,
+        by_slot,
+        by_park,
+        n_slot_dow,
+        n_slot_weekend,
+        n_slot,
+        n_park,
+    )
+
+
+@st.cache_data(ttl=600, show_spinner="")
+def load_park_baselines(
+    park_ids: tuple[str, ...] | None = None,
+) -> tuple[dict, dict, dict, dict, dict, dict, dict, dict]:
+    """載入（可選：指定車場）歷史 baseline。"""
+    return build_park_baselines(load_data(park_ids))
+
+
+def _shrink_mean(
+    primary: float | None,
+    n_primary: int,
+    prior: float | None,
+    *,
+    k: float = BASELINE_PRIOR_K,
+) -> float | None:
+    """樣本少時向 prior 收斂，保留星期差異同時避免噪音。"""
+    if primary is None and prior is None:
+        return None
+    if primary is None:
+        return float(prior) if prior is not None else None
+    if prior is None or n_primary <= 0:
+        return float(primary)
+    w = n_primary / (n_primary + k)
+    return float(w * primary + (1.0 - w) * prior)
 
 
 def predict_park_vacancy_baseline(
     park_id,
     half_hour: int,
     dow: int,
-    baselines: tuple[dict, dict, dict, dict] | None = None,
-) -> float | None:
+    baselines: tuple | None = None,
+) -> tuple[float | None, dict]:
     """
-    Per-park baseline：優先同車場＋半小時＋星期；
-    否則平日／週末同組；再否則同半小時；最後車場全日平均。
+    Per-park baseline（含 shrinkage）：優先同車場＋半小時＋星期，
+    向平日／週末／同時段均值收斂。回傳 (預測值, 元資料)。
     """
-    by_slot_dow, by_slot_weekend, by_slot, by_park = (
-        baselines or load_park_baselines()
-    )
-    val = by_slot_dow.get((park_id, half_hour, dow))
-    if val is not None:
-        return float(val)
+    packed = baselines or load_park_baselines()
+    (
+        by_slot_dow,
+        by_slot_weekend,
+        by_slot,
+        by_park,
+        n_slot_dow,
+        n_slot_weekend,
+        n_slot,
+        n_park,
+    ) = packed
+
     is_weekend = 1 if dow >= 5 else 0
-    val = by_slot_weekend.get((park_id, half_hour, is_weekend))
-    if val is not None:
-        return float(val)
-    val = by_slot.get((park_id, half_hour))
-    if val is not None:
-        return float(val)
-    val = by_park.get(park_id)
-    if val is not None:
-        return float(val)
-    return None
+    key_dow = (park_id, half_hour, dow)
+    key_we = (park_id, half_hour, is_weekend)
+    key_slot = (park_id, half_hour)
+
+    mean_dow = by_slot_dow.get(key_dow)
+    n_dow = int(n_slot_dow.get(key_dow, 0))
+    mean_we = by_slot_weekend.get(key_we)
+    n_we = int(n_slot_weekend.get(key_we, 0))
+    mean_slot = by_slot.get(key_slot)
+    n_s = int(n_slot.get(key_slot, 0))
+    mean_park = by_park.get(park_id)
+    n_p = int(n_park.get(park_id, 0))
+
+    prior = mean_we if mean_we is not None else mean_slot
+    if prior is None:
+        prior = mean_park
+    pred = _shrink_mean(mean_dow, n_dow, prior)
+    source = "同星期同時段"
+    n_used = n_dow
+
+    if pred is None:
+        pred = _shrink_mean(mean_we, n_we, mean_slot if mean_slot is not None else mean_park)
+        source = "平日／週末同時段"
+        n_used = n_we
+    if pred is None:
+        pred = mean_slot if mean_slot is not None else mean_park
+        source = "同時段" if mean_slot is not None else "車場全日平均"
+        n_used = n_s if mean_slot is not None else n_p
+
+    if pred is None:
+        return None, {"source": "無資料", "n": 0, "confidence": "低"}
+
+    if n_used >= 6:
+        confidence = "高"
+    elif n_used >= 2:
+        confidence = "中"
+    else:
+        confidence = "低"
+
+    return float(pred), {
+        "source": source,
+        "n": int(n_used),
+        "confidence": confidence,
+        "mean_dow": None if mean_dow is None else float(mean_dow),
+        "mean_weekend_group": None if mean_we is None else float(mean_we),
+    }
+
+
+@st.cache_data(ttl=120, show_spinner="")
+def load_live_private_car_vacancies() -> dict[str, dict]:
+    """政府即時空位 API → park_id -> {vacancy, lastupdate}。"""
+    try:
+        response = requests.get(
+            CARPARK_INFO_VACANCY_URL,
+            params={
+                "data": "vacancy",
+                "lang": "zh_TW",
+                "vehicleTypes": "privateCar",
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
+        results = response.json().get("results") or []
+    except Exception:
+        return {}
+
+    out: dict[str, dict] = {}
+    for item in results:
+        park_id = str(item.get("park_Id") or "").strip()
+        if not park_id:
+            continue
+        private = item.get("privateCar") or []
+        if not private:
+            continue
+        v = private[0] or {}
+        raw = v.get("vacancy")
+        try:
+            vacancy = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if vacancy < 0:
+            continue
+        out[park_id] = {
+            "vacancy": vacancy,
+            "lastupdate": v.get("lastupdate"),
+        }
+    return out
 
 
 @st.cache_data(ttl=6 * 3600)
@@ -2060,9 +2225,10 @@ def carparks_near_coords(
     """
     依座標篩選附近唯一停車場（先 3km，沒有再放寬至 5km）。
     回傳 (車場 DataFrame含 distance_km, 實際使用半徑)；仍無則半徑為 None。
+    只用車場靜態清單，唔拉歷史空位。
     """
     parks = (
-        load_data()[
+        load_carparks_meta()[
             ["park_id", "name", "district", "sub_district", "latitude", "longitude"]
         ]
         .drop_duplicates(subset=["park_id"])
@@ -3090,10 +3256,115 @@ def render_saved_feedback(payload: dict, *, auto_speak: bool = False) -> None:
     )
 
 
+def render_nearby_live_slots() -> None:
+    """未搜尋前：顯示用戶附近即時空位（政府 API + 本地車場座標）。"""
+    coords = st.session_state.get("user_geo_coords")
+    if not coords:
+        st.info(
+            "開始查詢前，可先允許定位以查看附近即時空位；"
+            "或直接輸入／語音查詢未來時段預測。"
+        )
+        st.caption(
+            "資料庫約每 10 分鐘自動採集運輸署開放數據（自動化，非人手 scrap）。"
+        )
+        return
+
+    lat, lon = coords
+    with st.spinner("正在載入附近即時空位…"):
+        nearby, radius = carparks_near_coords(float(lat), float(lon))
+        live = load_live_private_car_vacancies()
+
+    if nearby.empty:
+        st.info("附近暫時找不到本系統有紀錄的停車場。請直接輸入查詢。")
+        return
+
+    rows = []
+    for _, park in nearby.iterrows():
+        pid = str(park["park_id"])
+        live_row = live.get(pid)
+        if not live_row:
+            continue
+        rows.append(
+            {
+                "park_id": pid,
+                "名稱": park["name"],
+                "地區": park.get("sub_district") or park.get("district"),
+                "距離(公里)": round(float(park["distance_km"]), 1),
+                "即時空位": int(live_row["vacancy"]),
+                "latitude": park.get("latitude"),
+                "longitude": park.get("longitude"),
+            }
+        )
+
+    if not rows:
+        st.info("已定位附近車場，但暫時未能取得即時空位。請直接輸入查詢。")
+        return
+
+    live_df = pd.DataFrame(rows).sort_values(
+        ["即時空位", "距離(公里)"], ascending=[False, True], kind="mergesort"
+    )
+    live_df["name"] = live_df["名稱"]
+    live_df = dedupe_equivalent_carparks(live_df, prefer_higher_col="即時空位")
+    live_df = live_df.drop(columns=["name"], errors="ignore")
+    live_df = add_dense_ranks(live_df, value_col="即時空位").head(LIVE_NEARBY_TOP_N)
+    preferred = ["", "名稱", "地區", "距離(公里)", "即時空位"]
+    ordered = [c for c in preferred if c in live_df.columns]
+    ordered += [c for c in live_df.columns if c not in ordered]
+    live_df = live_df[ordered]
+
+    radius_txt = f"{radius:.1f} km" if radius else "附近"
+    st.success(f"你附近（約 {radius_txt}）即時空位較多的停車場")
+    st.caption(
+        "以下為開頁預設：政府即時數據。"
+        "輸入時間／地點可查預測；資料庫約每 10 分鐘自動更新歷史。"
+    )
+    render_ranked_table(live_df)
+    render_results_map(
+        live_df,
+        intent={
+            "geo_lat": lat,
+            "geo_lon": lon,
+            "geo_label": "你目前位置",
+        },
+    )
+
+
+def render_day_profile_chart(profile_df: pd.DataFrame, *, day: str, half_hour: int) -> None:
+    """顯示前列車場全日預測曲線，方便判斷信心／走勢。"""
+    if profile_df is None or profile_df.empty:
+        return
+    import altair as alt
+
+    st.markdown(f"**{day} 全日空位走勢（前列車場）**")
+    st.caption(
+        "曲線來自歷史同時段均值（含星期 shrinkage）。"
+        "樣本愈多信心愈高；垂直虛線為你查詢的時段。"
+    )
+    highlight_time = f"{half_hour // 2:02d}:{30 if half_hour % 2 else 0:02d}"
+    chart = (
+        alt.Chart(profile_df)
+        .mark_line(point=True)
+        .encode(
+            x=alt.X("時間:N", sort=None, title="時間"),
+            y=alt.Y("預測空位:Q", title="預測空位"),
+            color=alt.Color("名稱:N", title="停車場"),
+            tooltip=["名稱", "時間", "預測空位", "信心"],
+        )
+        .properties(height=260)
+    )
+    rule = (
+        alt.Chart(pd.DataFrame({"時間": [highlight_time]}))
+        .mark_rule(strokeDash=[4, 4], color="#888")
+        .encode(x=alt.X("時間:N", sort=None))
+    )
+    st.altair_chart(chart + rule, use_container_width=True)
+
+
 def render_saved_prediction(payload: dict, *, auto_speak: bool = False) -> None:
     """重顯示已儲存的預測結果（例如撳「再聽一次」後）。"""
     intent = payload.get("intent") or {}
     result_df = pd.DataFrame(payload.get("result_records") or [])
+    profile_df = pd.DataFrame(payload.get("profile_records") or [])
     hour = int(payload["hour"])
     minute = int(payload["minute"])
     day = payload["day"]
@@ -3101,15 +3372,23 @@ def render_saved_prediction(payload: dict, *, auto_speak: bool = False) -> None:
     top_n = int(payload["top_n"])
     shown = int(payload["shown"])
     asking_now = bool(payload.get("asking_now"))
+    top_n_default = bool(payload.get("top_n_default"))
     time_str = format_time_12h(hour, minute)
+    half_hour = to_half_hour_slot(hour, minute)
 
-    render_intent_summary(intent)
+    render_intent_summary(
+        intent,
+        resolved_top_n=top_n,
+        top_n_default=top_n_default,
+    )
     if asking_now:
         st.info(
             f"我們的預測系統以半小時為單位。"
             f"你查詢的是「而家／現在」，因此顯示未來 1–30 分鐘內"
             f"下一個半小時（{time_str}）的預測結果。"
         )
+    if top_n_default:
+        st.caption(f"未指定顯示數量 → 預設顯示前 {top_n} 名")
     if shown > top_n:
         st.success(
             f"{day} {time_str} {district_label} 較易泊車的停車場"
@@ -3143,12 +3422,18 @@ def render_saved_prediction(payload: dict, *, auto_speak: bool = False) -> None:
         )
     render_ranked_table(result_df)
     render_results_map(result_df, intent=intent)
+    render_day_profile_chart(profile_df, day=day, half_hour=half_hour)
+    st.caption(
+        "資料來源：運輸署開放數據，約每 10 分鐘自動採集寫入資料庫（非人手更新）。"
+    )
     flush_deferred_speech_browser_ops()
     if need_rerun:
         st.rerun()
 
 
-_TABLE_HIDDEN_COLS = frozenset({"latitude", "longitude"})
+_TABLE_HIDDEN_COLS = frozenset(
+    {"latitude", "longitude", "park_id", "樣本數", "依據"}
+)
 
 
 def render_results_map(
@@ -3167,6 +3452,17 @@ def render_results_map(
         st.caption("結果沒有座標資料，未能顯示地圖。")
         return
 
+    def _vacancy_color(v) -> str:
+        try:
+            n = float(v)
+        except (TypeError, ValueError):
+            return "#9aa0a6"
+        if n >= 30:
+            return "#34a853"  # 充足
+        if n >= 10:
+            return "#f9ab00"  # 一般
+        return "#ea4335"  # 緊張
+
     markers: list[dict] = []
     for _, row in df.iterrows():
         try:
@@ -3178,17 +3474,25 @@ def render_results_map(
             continue
         name = str(row.get("名稱") or "").strip() or "停車場"
         details: list[str] = []
-        if "預測空位" in df.columns:
-            vacancy = row.get("預測空位")
+        vacancy_num = None
+        vacancy_col = (
+            "預測空位"
+            if "預測空位" in df.columns
+            else ("即時空位" if "即時空位" in df.columns else None)
+        )
+        if vacancy_col:
+            vacancy = row.get(vacancy_col)
             try:
-                vacancy_txt = (
-                    str(int(vacancy))
-                    if vacancy is not None and not pd.isna(vacancy)
-                    else "—"
-                )
+                vacancy_num = int(vacancy) if vacancy is not None and not pd.isna(vacancy) else None
+                vacancy_txt = str(vacancy_num) if vacancy_num is not None else "—"
             except (TypeError, ValueError):
                 vacancy_txt = str(vacancy) if vacancy is not None else "—"
-            details.append(f"預測空位：{html.escape(vacancy_txt)}")
+            details.append(f"{vacancy_col}：{html.escape(vacancy_txt)}")
+        conf = row.get("信心")
+        if conf is not None and not (isinstance(conf, float) and pd.isna(conf)):
+            conf_txt = str(conf).strip()
+            if conf_txt:
+                details.append(f"信心：{html.escape(conf_txt)}")
         fee = row.get("收費")
         if fee is not None and not (isinstance(fee, float) and pd.isna(fee)):
             fee_txt = str(fee).strip()
@@ -3203,11 +3507,14 @@ def render_results_map(
         rank = row.get("")
         rank_txt = f"{rank} · " if rank not in (None, "") and not (isinstance(rank, float) and pd.isna(rank)) else ""
         detail_html = "".join(f"<br>{d}" for d in details)
+        label = str(vacancy_num) if vacancy_num is not None else "·"
         markers.append(
             {
                 "lat": lat,
                 "lng": lon,
                 "title": name,
+                "color": _vacancy_color(vacancy_num),
+                "label": label,
                 "info": (
                     f"<strong>{html.escape(rank_txt + name)}</strong>{detail_html}"
                 ),
@@ -3245,6 +3552,7 @@ def render_results_map(
     )
 
     # Google Maps JS 為主；若 API 未啟用／金鑰被拒，自動退回 Leaflet（同一批 marker）。
+    # Pin 顏色：綠≥30／橙10–29／紅<10；圓內數字＝空位數。
     map_html = f"""
 <!DOCTYPE html>
 <html>
@@ -3261,10 +3569,34 @@ def render_results_map(
       border: 1px solid rgba(128,128,128,0.28);
       overflow: hidden;
     }}
+    #map-legend {{
+      position: absolute; left: 10px; bottom: 10px; z-index: 1000;
+      background: rgba(255,255,255,0.92); color: #222;
+      padding: 6px 10px; border-radius: 8px; font: 12px/1.35 sans-serif;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.18);
+    }}
+    #map-legend span.dot {{
+      display: inline-block; width: 10px; height: 10px; border-radius: 50%;
+      margin-right: 4px; vertical-align: -1px; border: 1px solid #fff;
+    }}
+    .mzd-pin-icon {{
+      background: transparent; border: none;
+    }}
+    .mzd-pin {{
+      width: 28px; height: 28px; border-radius: 50%;
+      border: 2px solid #fff; color: #fff; font: 700 11px/24px sans-serif;
+      text-align: center; box-shadow: 0 1px 4px rgba(0,0,0,0.35);
+    }}
   </style>
 </head>
-<body>
+<body style="position:relative">
   <div id="map"></div>
+  <div id="map-legend">
+    <div><span class="dot" style="background:#34a853"></span>空位充足（≥30）</div>
+    <div><span class="dot" style="background:#f9ab00"></span>一般（10–29）</div>
+    <div><span class="dot" style="background:#ea4335"></span>緊張（&lt;10）</div>
+    <div style="margin-top:2px;opacity:0.75">圓內數字＝空位數</div>
+  </div>
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
     integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
   <script>
@@ -3272,12 +3604,22 @@ def render_results_map(
     const CENTER = {center_json};
     let usedFallback = false;
 
+    function pinSvg(color, label) {{
+      const text = String(label == null ? "·" : label);
+      const fontSize = text.length > 2 ? 9 : 11;
+      const svg =
+        '<svg xmlns="http://www.w3.org/2000/svg" width="28" height="28">' +
+        '<circle cx="14" cy="14" r="12" fill="' + color + '" stroke="#fff" stroke-width="2"/>' +
+        '<text x="14" y="18" text-anchor="middle" fill="#fff" font-size="' + fontSize +
+        '" font-family="sans-serif" font-weight="700">' + text + '</text></svg>';
+      return "data:image/svg+xml;charset=UTF-8," + encodeURIComponent(svg);
+    }}
+
     function initLeafletFallback() {{
       if (usedFallback) return;
       usedFallback = true;
       const el = document.getElementById("map");
       el.innerHTML = "";
-      // Leaflet 需要明確高度；清掉 Google 殘餘 DOM 後重建
       const map = L.map(el, {{ scrollWheelZoom: true }});
       L.tileLayer("https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png", {{
         maxZoom: 19,
@@ -3286,7 +3628,14 @@ def render_results_map(
 
       const bounds = [];
       MARKERS.forEach(function (m) {{
-        const marker = L.marker([m.lat, m.lng]).addTo(map);
+        const icon = L.divIcon({{
+          className: "mzd-pin-icon",
+          html: '<div class="mzd-pin" style="background:' + (m.color || "#9aa0a6") +
+                '">' + (m.label || "·") + '</div>',
+          iconSize: [28, 28],
+          iconAnchor: [14, 14],
+        }});
+        const marker = L.marker([m.lat, m.lng], {{ icon: icon }}).addTo(map);
         marker.bindPopup(m.info);
         bounds.push([m.lat, m.lng]);
       }});
@@ -3331,7 +3680,12 @@ def render_results_map(
           const marker = new google.maps.Marker({{
             position: pos,
             map: map,
-            title: m.title,
+            title: m.title + (m.label ? (" · " + m.label) : ""),
+            icon: {{
+              url: pinSvg(m.color || "#9aa0a6", m.label),
+              scaledSize: new google.maps.Size(28, 28),
+              anchor: new google.maps.Point(14, 14),
+            }},
           }});
           marker.addListener("click", function () {{
             infoWindow.setContent(m.info);
@@ -3364,7 +3718,6 @@ def render_results_map(
           map.fitBounds(bounds, 48);
         }}
 
-        // 若 auth 失敗，Google 仍可能短暫建到 Map；等一下再檢查是否已 fallback
         setTimeout(function () {{
           if (!usedFallback) {{
             const sorry = document.querySelector("#map .gm-err-container, #map .dismissButton");
@@ -3376,7 +3729,6 @@ def render_results_map(
       }}
     }}
 
-    // 腳本載入失敗時亦退回
     window.addEventListener("error", function (ev) {{
       if (ev && ev.target && ev.target.src &&
           String(ev.target.src).indexOf("maps.googleapis.com") !== -1) {{
@@ -3389,6 +3741,7 @@ def render_results_map(
 </body>
 </html>
 """
+    st.caption("地圖標記：顏色＝空位鬆緊，數字＝預測／即時空位。")
     components.html(map_html, height=height)
 
 
@@ -3894,7 +4247,13 @@ def _intent_display(value, fallback="未指定"):
     return str(value)
 
 
-def render_intent_summary(intent: dict, *, info_mode: bool = False):
+def render_intent_summary(
+    intent: dict,
+    *,
+    info_mode: bool = False,
+    resolved_top_n: int | None = None,
+    top_n_default: bool = False,
+):
     """顯示 AI 理解的意圖（非 JSON）。"""
     # 優先顯示 Google 定位結果；否則用地點原文
     if _is_all_hong_kong(intent.get("district")):
@@ -3914,6 +4273,14 @@ def render_intent_summary(intent: dict, *, info_mode: bool = False):
         if fee_slot:
             intent_fields.append(("收費時段", str(fee_slot)))
     else:
+        if resolved_top_n is not None:
+            qty_label = (
+                f"{resolved_top_n}（預設）"
+                if top_n_default
+                else str(resolved_top_n)
+            )
+        else:
+            qty_label = _intent_display(intent.get("top_n"))
         intent_fields = [
             ("地區", _intent_display(place_label)),
             (
@@ -3924,7 +4291,7 @@ def render_intent_summary(intent: dict, *, info_mode: bool = False):
                 ),
             ),
             ("時間", format_intent_time(intent.get("hour"), intent.get("minute"))),
-            ("顯示數量", _intent_display(intent.get("top_n"))),
+            ("顯示數量", qty_label),
         ]
     intent_cells = "".join(
         f'<div style="flex:1 1 0;min-width:7.5rem;">'
@@ -3959,7 +4326,7 @@ def unique_carparks_for_location(
     """
     if _is_all_hong_kong(district):
         parks = (
-            load_data()[
+            load_carparks_meta()[
                 ["park_id", "name", "district", "sub_district", "latitude", "longitude"]
             ]
             .drop_duplicates(subset=["park_id"])
@@ -4325,14 +4692,17 @@ def run_parking_info_answer(intent: dict, query_text: str) -> None:
         "fee_slot_label": fee_slot_label,
         "wants_fee": wants_fee,
     }
+    _push_search_history(query_text)
     st.session_state.last_info_answer = payload
     st.session_state.pop("last_prediction", None)
     st.session_state.pop("last_feedback", None)
     render_saved_info_answer(payload, auto_speak=True)
 
 
-def resolve_top_n(query_text: str, intent: dict) -> int:
+def resolve_top_n(query_text: str, intent: dict) -> tuple[int, bool]:
+    """回傳 (top_n, used_default)。"""
     top_n = parse_top_n_from_query(query_text)
+    used_default = False
     if top_n is None:
         raw_top_n = intent.get("top_n")
         if raw_top_n is not None and str(raw_top_n).strip() not in ("", "null", "None"):
@@ -4340,11 +4710,58 @@ def resolve_top_n(query_text: str, intent: dict) -> int:
                 top_n = int(raw_top_n)
             except (TypeError, ValueError):
                 top_n = DEFAULT_TOP_N
+                used_default = True
         else:
             top_n = DEFAULT_TOP_N
+            used_default = True
     if top_n < 1:
         top_n = DEFAULT_TOP_N
-    return top_n
+        used_default = True
+    return top_n, used_default
+
+
+def _push_search_history(query_text: str) -> None:
+    q = (query_text or "").strip()
+    if not q:
+        return
+    hist = [
+        h
+        for h in (st.session_state.get("search_history") or [])
+        if h != q
+    ]
+    hist.insert(0, q)
+    st.session_state.search_history = hist[:SEARCH_HISTORY_MAX]
+
+
+def day_profile_for_parks(
+    park_ids: list[str],
+    names: dict[str, str],
+    dow: int,
+    baselines: tuple,
+    *,
+    highlight_half_hour: int,
+) -> pd.DataFrame:
+    """產生指定車場全日（半小時）預測曲線。"""
+    rows: list[dict] = []
+    for pid in park_ids:
+        for hh in range(48):
+            pred, meta = predict_park_vacancy_baseline(pid, hh, dow, baselines)
+            if pred is None:
+                continue
+            hour = hh // 2
+            minute = 30 if hh % 2 else 0
+            rows.append(
+                {
+                    "park_id": pid,
+                    "名稱": names.get(pid, pid),
+                    "half_hour": hh,
+                    "時間": f"{hour:02d}:{minute:02d}",
+                    "預測空位": max(0, round(pred, 1)),
+                    "查詢時段": hh == highlight_half_hour,
+                    "信心": meta.get("confidence", "低"),
+                }
+            )
+    return pd.DataFrame(rows)
 
 
 def run_vacancy_prediction(intent: dict, query_text: str):
@@ -4372,18 +4789,24 @@ def run_vacancy_prediction(intent: dict, query_text: str):
         )
         hour, minute = normalize_half_hour(hour, minute)
     half_hour = to_half_hour_slot(hour, minute)
-    top_n = resolve_top_n(query_text, intent)
+    top_n, top_n_default = resolve_top_n(query_text, intent)
     dow_num = DAY_TO_NUM.get(day, 0)
     dist_map: dict[str, float] = {}
     match_type = "all"
     district_label = "全港"
+    target_park_ids: list[str] | None = None
 
-    df = load_data().copy()
-    baselines = load_park_baselines()
-
-    # 非全港：一律 Google 座標＋半徑篩附近車場（不再用 sub_district）
+    # 非全港：先用靜態清單篩附近，再只拉該批歷史（加速）
     if _is_all_hong_kong(district):
+        with st.spinner("正在載入全港歷史空位（首次約需數十秒）…"):
+            df = load_data().copy()
+            baselines = load_park_baselines()
         df_filtered = df
+        park_info = (
+            load_carparks_meta()
+            .drop_duplicates(subset=["park_id"])
+            .set_index("park_id", drop=False)
+        )
     elif geo_lat is not None and geo_lon is not None:
         nearby, _radius = carparks_near_coords(float(geo_lat), float(geo_lon))
         district_label = geo_label or district or "該地點"
@@ -4403,8 +4826,14 @@ def run_vacancy_prediction(intent: dict, query_text: str):
             str(pid): float(dist)
             for pid, dist in zip(nearby["park_id"], nearby["distance_km"])
         }
-        df_filtered = df[df["park_id"].astype(str).isin(list(dist_map.keys()))]
-        if df_filtered.empty:
+        target_park_ids = [str(p) for p in nearby["park_id"].tolist()]
+        with st.spinner(f"正在載入「{district_label}」附近歷史空位…"):
+            park_key = tuple(sorted(target_park_ids))
+            df = load_data(park_key).copy()
+            baselines = load_park_baselines(park_key)
+        df_filtered = df[df["park_id"].astype(str).isin(target_park_ids)]
+        park_info = nearby.set_index("park_id", drop=False)
+        if df_filtered.empty and park_info.empty:
             render_feedback_with_speech(
                 f"「{district_label}」附近本系統沒有可用的空位預測資料。"
                 "請改試其他地點後重新輸入。",
@@ -4428,24 +4857,26 @@ def run_vacancy_prediction(intent: dict, query_text: str):
         return
 
     fee_map = load_carpark_fee_rules()
-    park_info = (
-        df_filtered.drop_duplicates(subset=["park_id"]).set_index("park_id", drop=False)
-    )
     results = []
     for park_id in park_info.index:
-        pred = predict_park_vacancy_baseline(park_id, half_hour, dow_num, baselines)
+        pred, meta = predict_park_vacancy_baseline(
+            park_id, half_hour, dow_num, baselines
+        )
         if pred is None:
             continue
         info = park_info.loc[park_id]
         row = {
-            "park_id": park_id,
+            "park_id": str(park_id),
             "name": info["name"],
             "latitude": info.get("latitude"),
             "longitude": info.get("longitude"),
             "名稱": info["name"],
-            "地區": info.get("sub_district") or info["district"],
+            "地區": info.get("sub_district") or info.get("district"),
             "收費": format_carpark_fee(park_id, day, hour, minute, fee_map),
             "預測空位": max(0, round(pred)),
+            "信心": meta.get("confidence", "低"),
+            "樣本數": meta.get("n", 0),
+            "依據": meta.get("source", ""),
         }
         pid_key = str(park_id)
         if match_type == "nearby" and pid_key in dist_map:
@@ -4457,22 +4888,47 @@ def run_vacancy_prediction(intent: dict, query_text: str):
         pred_df = dedupe_equivalent_carparks(
             pred_df, prefer_higher_col="預測空位"
         )
-        # 保留 latitude／longitude 畀地圖用；表格顯示時會隱藏
-        pred_df = pred_df.drop(columns=["park_id", "name"], errors="ignore")
+        # 保留 park_id／座標畀曲線同地圖；表格顯示時會隱藏
+        pred_df = pred_df.drop(columns=["name"], errors="ignore")
     if match_type == "nearby":
         result_df = select_top_nearby_with_ties(pred_df, top_n)
         district_label = f"{district_label}附近"
     else:
         result_df = select_top_with_ties(pred_df, top_n)
-    # 欄位順序：排名、名稱、地區、（距離）、收費、預測空位；（隱藏）座標
-    preferred = ["", "名稱", "地區", "距離(公里)", "收費", "預測空位"]
+    # 欄位順序：排名、名稱、地區、（距離）、收費、預測空位、信心；（隱藏）座標／內部欄
+    preferred = ["", "名稱", "地區", "距離(公里)", "收費", "預測空位", "信心"]
     ordered = [c for c in preferred if c in result_df.columns]
-    ordered += [c for c in result_df.columns if c not in ordered]
+    ordered += [
+        c
+        for c in result_df.columns
+        if c not in ordered and c not in {"park_id", "樣本數", "依據"}
+    ]
+    # 內部欄留喺 df 尾（表格會隱藏）
+    for hidden in ("park_id", "樣本數", "依據", "latitude", "longitude"):
+        if hidden in result_df.columns and hidden not in ordered:
+            ordered.append(hidden)
     result_df = result_df[ordered]
 
     shown = len(result_df)
     written = format_top_suggestion(result_df, hour, minute)
     spoken = format_spoken_suggestion(result_df, hour, minute)
+
+    profile_df = pd.DataFrame()
+    if not result_df.empty and "park_id" in result_df.columns:
+        top_ids = (
+            result_df["park_id"].astype(str).drop_duplicates().head(3).tolist()
+        )
+        name_map = {
+            str(r["park_id"]): str(r["名稱"])
+            for _, r in result_df.drop_duplicates("park_id").iterrows()
+        }
+        profile_df = day_profile_for_parks(
+            top_ids,
+            name_map,
+            dow_num,
+            baselines,
+            highlight_half_hour=half_hour,
+        )
 
     payload = {
         "intent": intent,
@@ -4482,11 +4938,14 @@ def run_vacancy_prediction(intent: dict, query_text: str):
         "minute": minute,
         "district_label": district_label,
         "top_n": top_n,
+        "top_n_default": top_n_default,
         "shown": shown,
         "result_records": result_df.to_dict(orient="records"),
+        "profile_records": profile_df.to_dict(orient="records"),
         "written": written,
         "spoken": spoken,
     }
+    _push_search_history(query_text)
     st.session_state.last_prediction = payload
     st.session_state.pop("last_info_answer", None)
     st.session_state.pop("last_feedback", None)
@@ -4693,3 +5152,6 @@ elif st.session_state.get("last_info_answer") and not should_query:
     render_saved_info_answer(st.session_state.last_info_answer, auto_speak=False)
 elif st.session_state.get("last_prediction") and not should_query:
     render_saved_prediction(st.session_state.last_prediction, auto_speak=False)
+elif not should_query:
+    # 未搜尋：預設顯示附近即時空位
+    render_nearby_live_slots()

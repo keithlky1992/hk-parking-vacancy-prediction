@@ -78,23 +78,54 @@ def _fetch_all(
     columns: str,
     *,
     order_col: str = "id",
+    filters: Optional[list[tuple[str, str, Any]]] = None,
 ) -> list[dict[str, Any]]:
+    """filters: [(op, column, value), ...]；op 支援 eq / gte / lte / in_。"""
     rows: list[dict[str, Any]] = []
     start = 0
     while True:
-        resp = (
-            client.table(table)
-            .select(columns)
-            .order(order_col)
-            .range(start, start + PAGE_SIZE - 1)
-            .execute()
-        )
+        q = client.table(table).select(columns)
+        for op, col, val in filters or []:
+            if op == "eq":
+                q = q.eq(col, val)
+            elif op == "gte":
+                q = q.gte(col, val)
+            elif op == "lte":
+                q = q.lte(col, val)
+            elif op == "in_":
+                q = q.in_(col, list(val))
+            else:
+                raise ValueError(f"unsupported filter op: {op}")
+        resp = q.order(order_col).range(start, start + PAGE_SIZE - 1).execute()
         page = resp.data or []
         rows.extend(page)
         if len(page) < PAGE_SIZE:
             break
         start += PAGE_SIZE
     return rows
+
+
+def load_carparks_frame(client: Optional[Client] = None) -> pd.DataFrame:
+    """只載入車場靜態資料（快；畀地圖／附近篩選用）。"""
+    client = client or get_read_client()
+    carparks = _fetch_all(
+        client,
+        "carparks",
+        "park_id,name,district,google_area,latitude,longitude",
+        order_col="park_id",
+    )
+    if not carparks:
+        return pd.DataFrame(
+            columns=[
+                "park_id",
+                "name",
+                "district",
+                "google_area",
+                "latitude",
+                "longitude",
+            ]
+        )
+    return pd.DataFrame(carparks)
 
 
 def to_hk_naive(series: pd.Series) -> pd.Series:
@@ -128,41 +159,99 @@ def parse_api_timestamp(value: Any) -> Optional[str]:
         return text
 
 
-def load_vacancy_frame(client: Optional[Client] = None) -> pd.DataFrame:
+def load_vacancy_frame(
+    client: Optional[Client] = None,
+    *,
+    park_ids: Optional[Iterable[str]] = None,
+    since: Optional[datetime | str] = None,
+) -> pd.DataFrame:
     """
     等同舊 SQL：
     SELECT v.park_id, v.vacancy, v.collected_at, c.name, c.district,
            c.google_area, c.latitude, c.longitude
     FROM vacancy_records v LEFT JOIN carparks c ...
+
+    park_ids：只拉指定車場（附近查詢快很多）。
+    since：只拉 collected_at >= since 的紀錄。
     """
     client = client or get_read_client()
-    carparks = _fetch_all(
-        client,
-        "carparks",
-        "park_id,name,district,google_area,latitude,longitude",
-        order_col="park_id",
+    id_list = [str(p) for p in park_ids] if park_ids is not None else None
+    empty = pd.DataFrame(
+        columns=[
+            "park_id",
+            "vacancy",
+            "collected_at",
+            "name",
+            "district",
+            "google_area",
+            "latitude",
+            "longitude",
+        ]
     )
-    vacancies = _fetch_all(
-        client,
-        "vacancy_records",
-        "id,park_id,vacancy,collected_at",
-        order_col="id",
-    )
-    if not vacancies:
-        return pd.DataFrame(
-            columns=[
-                "park_id",
-                "vacancy",
-                "collected_at",
-                "name",
-                "district",
-                "google_area",
-                "latitude",
-                "longitude",
-            ]
+
+    if id_list is not None and not id_list:
+        return empty
+
+    if id_list is not None:
+        parks_rows: list[dict[str, Any]] = []
+        for i in range(0, len(id_list), PAGE_SIZE):
+            batch = id_list[i : i + PAGE_SIZE]
+            parks_rows.extend(
+                _fetch_all(
+                    client,
+                    "carparks",
+                    "park_id,name,district,google_area,latitude,longitude",
+                    order_col="park_id",
+                    filters=[("in_", "park_id", batch)],
+                )
+            )
+    else:
+        parks_rows = _fetch_all(
+            client,
+            "carparks",
+            "park_id,name,district,google_area,latitude,longitude",
+            order_col="park_id",
         )
 
-    parks_df = pd.DataFrame(carparks)
+    since_iso: Optional[str] = None
+    if since is not None:
+        if isinstance(since, datetime):
+            since_iso = since.isoformat()
+        else:
+            since_iso = str(since)
+
+    vacancies: list[dict[str, Any]] = []
+    if id_list is not None:
+        for i in range(0, len(id_list), PAGE_SIZE):
+            batch = id_list[i : i + PAGE_SIZE]
+            filters: list[tuple[str, str, Any]] = [("in_", "park_id", batch)]
+            if since_iso:
+                filters.append(("gte", "collected_at", since_iso))
+            vacancies.extend(
+                _fetch_all(
+                    client,
+                    "vacancy_records",
+                    "id,park_id,vacancy,collected_at",
+                    order_col="id",
+                    filters=filters,
+                )
+            )
+    else:
+        filters = []
+        if since_iso:
+            filters.append(("gte", "collected_at", since_iso))
+        vacancies = _fetch_all(
+            client,
+            "vacancy_records",
+            "id,park_id,vacancy,collected_at",
+            order_col="id",
+            filters=filters or None,
+        )
+
+    if not vacancies:
+        return empty
+
+    parks_df = pd.DataFrame(parks_rows)
     vac_df = pd.DataFrame(vacancies).drop(columns=["id"], errors="ignore")
     df = vac_df.merge(parks_df, on="park_id", how="left")
     df["collected_at"] = to_hk_naive(df["collected_at"])
