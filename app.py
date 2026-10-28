@@ -542,19 +542,25 @@ def render_header_context_panel() -> None:
         location_label = info["location"] or "無法取得地區"
         weather_label = info["weather"] or "暫時無法取得"
 
+    # 香港時間由前端 JS 用 data-mzd-clock + CSS ::after 顯示，唔好寫入 textContent，
+    # 否則同 React reconcile 搶子節點 → NotFoundError: removeChild。
     rows = [
-        ("香港時間", hk_time, "mzd-hk-time"),
+        ("香港時間", "", "mzd-hk-time"),
         ("你目前所在的地區", location_label, "mzd-location"),
         ("天氣", weather_label, "mzd-weather"),
     ]
     cells = []
     for label, value, value_class in rows:
         class_attr = f' class="{html.escape(value_class)}"' if value_class else ""
+        # 保留初始時間於 data attr（JS 未跑前／SEO）；之後只改 attribute
+        data_attr = ""
+        if value_class == "mzd-hk-time":
+            data_attr = f' data-mzd-clock="{html.escape(hk_time, quote=True)}"'
         cells.append(
             f'<div style="min-width:0;flex:1 1 0;">'
             f'<div style="font-size:0.85rem;line-height:1.2;opacity:0.65;margin-bottom:0.15rem;">'
             f"{html.escape(label)}</div>"
-            f'<div{class_attr} style="font-size:1.05rem;font-weight:600;line-height:1.35;'
+            f'<div{class_attr}{data_attr} style="font-size:1.05rem;font-weight:600;line-height:1.35;'
             f'word-break:break-word;">{html.escape(value)}</div></div>'
         )
     cells = "".join(cells)
@@ -894,6 +900,13 @@ def inject_layout_css() -> None:
     opacity: 0 !important;
     pointer-events: none !important;
     border: none !important;
+  }
+  /* 香港時間：用 ::after 顯示，避免 JS 改 React 子節點 */
+  .mzd-hk-time {
+    min-height: 1.35em;
+  }
+  .mzd-hk-time::after {
+    content: attr(data-mzd-clock);
   }
   /* Streamlit 1.51 會把 height=0 當 falsy 回落 ~150px；用 height=1 再收起。
      排除 mic_recorder，避免語音掣被一併藏起。 */
@@ -1534,20 +1547,13 @@ def inject_layout_css() -> None:
   }
 
   function blurUserQueryIfMarked() {
-    var mark = doc.querySelector(".mzd-blur-user-query");
-    if (!mark) return;
+    // 用 parent flag（唔注入／刪除 React markdown 節點）
+    if (!root.__hkParkingBlurQueryOnce) return;
+    root.__hkParkingBlurQueryOnce = false;
     blurUserQueryInput();
-    // 只 blur 一次；唔好每 400ms 搶 focus，否則用家改唔到字重新查詢
-    try {
-      mark.remove();
-    } catch (e) {
-      try {
-        if (mark.parentNode) mark.parentNode.removeChild(mark);
-      } catch (e2) {}
-    }
   }
 
-  // 與 format_hong_kong_now() 一致：只改 .mzd-hk-time 文字，唔重建 DOM
+  // 與 format_hong_kong_now() 一致：只改 data-mzd-clock，唔動 React 子節點
   var MZD_WEEKDAY = { Sun: "日", Mon: "一", Tue: "二", Wed: "三", Thu: "四", Fri: "五", Sat: "六" };
   function formatHongKongNow() {
     var parts = {};
@@ -1574,21 +1580,12 @@ def inject_layout_css() -> None:
     var el = doc.querySelector(".mzd-hk-time");
     if (!el) return;
     var text = formatHongKongNow();
-    if (el.textContent !== text) el.textContent = text;
+    if (el.getAttribute("data-mzd-clock") !== text) {
+      el.setAttribute("data-mzd-clock", text);
+    }
   }
 
-  styleMicButtons();
-  styleMicLikeActionButtons();
-  collapseJsEvalIframes();
-  collapseHiddenSpeechIframes();
-  bindQueryStopSpeech();
-  bindSuggestionSpeechButtons();
-  hideSpeechEndedSentinel();
-  bindQueryInputBlurOnSubmit();
-  bindQueryButtonBlur();
-  blurUserQueryIfMarked();
-  tickHkClock();
-  setInterval(function () {
+  function runUiPolish() {
     styleMicButtons();
     styleMicLikeActionButtons();
     collapseJsEvalIframes();
@@ -1600,7 +1597,13 @@ def inject_layout_css() -> None:
     bindQueryButtonBlur();
     blurUserQueryIfMarked();
     tickHkClock();
-  }, 400);
+  }
+  runUiPolish();
+  // 單一 parent interval：每次 Streamlit remount components.html 唔好再開一個
+  if (root.__hkParkingUiInterval) {
+    try { root.clearInterval(root.__hkParkingUiInterval); } catch (e) {}
+  }
+  root.__hkParkingUiInterval = root.setInterval(runUiPolish, 400);
 })();
 </script>
         """,
@@ -1755,11 +1758,25 @@ if st.session_state.search_history:
             st.session_state["_history_rerun"] = True
             st.rerun()
 
-# 送出後 blur 查詢欄（去掉 focus 紅邊），文字保留
+# 送出後 blur 查詢欄（去掉 focus 紅邊），文字保留。
+# 用 parent flag，唔好注入／刪除 React markdown 節點（會觸發 removeChild）。
 if submitted or st.session_state.get("auto_submit_query"):
-    st.markdown(
-        '<span class="mzd-blur-user-query" aria-hidden="true"></span>',
-        unsafe_allow_html=True,
+    components.html(
+        """
+        <script>
+        (function () {
+          var root = window.parent;
+          root.__hkParkingBlurQueryOnce = true;
+          try {
+            var doc = root.document;
+            var input = doc.querySelector(".st-key-user_query input")
+              || doc.querySelector('div[data-testid="stTextInput"] input');
+            if (input) input.blur();
+          } catch (e) {}
+        })();
+        </script>
+        """,
+        height=1,
     )
     st.info("正在處理查詢…（語音／首次載入歷史數據時可能需數秒）")
 
