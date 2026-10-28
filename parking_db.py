@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Iterable, Optional
 from zoneinfo import ZoneInfo
 
@@ -371,19 +372,97 @@ def list_carparks_missing_google_area(
 def insert_vacancy_records(
     records: list[dict[str, Any]], client: Optional[Client] = None
 ) -> int:
+    import time
+
     client = client or get_write_client()
     if not records:
         return 0
-    if uses_service_role():
-        for i in range(0, len(records), PAGE_SIZE):
-            client.table("vacancy_records").insert(records[i : i + PAGE_SIZE]).execute()
-        return len(records)
+
+    def _insert_batch(batch: list[dict[str, Any]]) -> int:
+        last_err: Exception | None = None
+        for attempt in range(5):
+            try:
+                if uses_service_role():
+                    client.table("vacancy_records").insert(batch).execute()
+                    return len(batch)
+                resp = client.rpc("ingest_vacancy_records", {"rows": batch}).execute()
+                return int(resp.data or len(batch))
+            except Exception as e:
+                last_err = e
+                time.sleep(1.5 * (attempt + 1))
+        assert last_err is not None
+        raise last_err
 
     total = 0
     for i in range(0, len(records), PAGE_SIZE):
-        batch = records[i : i + PAGE_SIZE]
-        resp = client.rpc("ingest_vacancy_records", {"rows": batch}).execute()
-        total += int(resp.data or len(batch))
+        total += _insert_batch(records[i : i + PAGE_SIZE])
+    return total
+
+
+def delete_vacancy_records_between(
+    start_iso: str,
+    end_iso: str,
+    client: Optional[Client] = None,
+) -> int:
+    """
+    刪除 collected_at ∈ [start_iso, end_iso) 的 vacancy_records。
+    需要 service role；按日分段刪除，避免 statement timeout。
+    回傳刪除筆數（各日 exact count 合計）。
+    """
+    if not uses_service_role():
+        raise RuntimeError("delete_vacancy_records_between 需要 SUPABASE_SERVICE_ROLE_KEY")
+    client = client or get_write_client()
+
+    start = pd.Timestamp(start_iso)
+    end = pd.Timestamp(end_iso)
+    if start.tzinfo is None:
+        start = start.tz_localize(HK_TZ)
+    else:
+        start = start.tz_convert(HK_TZ)
+    if end.tzinfo is None:
+        end = end.tz_localize(HK_TZ)
+    else:
+        end = end.tz_convert(HK_TZ)
+
+    total = 0
+    cur = start
+    while cur < end:
+        nxt = min(cur + pd.Timedelta(days=1), end)
+        start_s = cur.isoformat()
+        end_s = nxt.isoformat()
+        counted = (
+            client.table("vacancy_records")
+            .select("id", count="exact")
+            .gte("collected_at", start_s)
+            .lt("collected_at", end_s)
+            .limit(1)
+            .execute()
+        )
+        n = int(counted.count or 0)
+        if n:
+            # 大量列時再按小時切，降低 timeout 風險
+            if n > 80000:
+                hour = cur
+                while hour < nxt:
+                    hour2 = min(hour + pd.Timedelta(hours=1), nxt)
+                    (
+                        client.table("vacancy_records")
+                        .delete()
+                        .gte("collected_at", hour.isoformat())
+                        .lt("collected_at", hour2.isoformat())
+                        .execute()
+                    )
+                    hour = hour2
+            else:
+                (
+                    client.table("vacancy_records")
+                    .delete()
+                    .gte("collected_at", start_s)
+                    .lt("collected_at", end_s)
+                    .execute()
+                )
+            total += n
+        cur = nxt
     return total
 
 
@@ -401,3 +480,125 @@ def insert_weather_record(record: dict[str, Any], client: Optional[Client] = Non
             "p_update_time": record.get("update_time"),
         },
     ).execute()
+
+
+BASELINES_PARQUET = Path(__file__).resolve().parent / "data" / "vacancy_baselines.parquet"
+
+
+def load_baselines_dataframe(
+    park_ids: Optional[Iterable[str]] = None,
+    client: Optional[Client] = None,
+) -> pd.DataFrame:
+    """
+    載入方案 1 baseline 摘要。
+    優先本地 parquet（快）；否則由 Supabase vacancy_baselines 分頁拉取。
+    """
+    cols = [
+        "park_id",
+        "half_hour",
+        "dow",
+        "is_weekend",
+        "mean",
+        "n",
+        "window_start",
+        "window_end",
+        "updated_at",
+    ]
+    id_list = [str(p) for p in park_ids] if park_ids is not None else None
+
+    if BASELINES_PARQUET.exists():
+        df = pd.read_parquet(BASELINES_PARQUET)
+        if id_list is not None:
+            df = df[df["park_id"].astype(str).isin(id_list)]
+        if not df.empty:
+            return df.reset_index(drop=True)
+
+    try:
+        client = client or get_read_client()
+        targets = id_list if id_list is not None else sorted(list_park_ids(client))
+        rows: list[dict[str, Any]] = []
+        # 每個 park 有好多列；每次只查少量 park_id，再用 range 翻頁
+        park_batch = 20
+        for i in range(0, len(targets), park_batch):
+            batch = targets[i : i + park_batch]
+            start = 0
+            while True:
+                resp = (
+                    client.table("vacancy_baselines")
+                    .select(",".join(cols))
+                    .in_("park_id", batch)
+                    .order("park_id")
+                    .order("half_hour")
+                    .order("dow")
+                    .order("is_weekend")
+                    .range(start, start + PAGE_SIZE - 1)
+                    .execute()
+                )
+                page = resp.data or []
+                rows.extend(page)
+                if len(page) < PAGE_SIZE:
+                    break
+                start += PAGE_SIZE
+        df = pd.DataFrame(rows)
+        if not df.empty:
+            return df
+    except Exception:
+        pass
+
+    return pd.DataFrame(columns=cols)
+
+
+def baselines_frame_to_maps(
+    df: pd.DataFrame,
+) -> tuple[dict, dict, dict, dict, dict, dict, dict, dict]:
+    """
+    DataFrame → app.build_park_baselines 相容嘅 8 個 dict。
+    Encoding: slot_dow=(hh,dow,-1); slot_weekend=(hh,-1,0|1);
+              slot=(hh,-1,-1); park=(-1,-1,-1).
+    """
+    empty = ({}, {}, {}, {}, {}, {}, {}, {})
+    if df is None or df.empty:
+        return empty
+
+    by_slot_dow: dict = {}
+    n_slot_dow: dict = {}
+    by_slot_weekend: dict = {}
+    n_slot_weekend: dict = {}
+    by_slot: dict = {}
+    n_slot: dict = {}
+    by_park: dict = {}
+    n_park: dict = {}
+
+    for row in df.itertuples(index=False):
+        pid = str(row.park_id)
+        hh = int(row.half_hour)
+        dow = int(row.dow)
+        is_we = int(row.is_weekend)
+        mean = float(row.mean)
+        n = int(row.n)
+        if hh == -1 and dow == -1 and is_we == -1:
+            by_park[pid] = mean
+            n_park[pid] = n
+        elif dow == -1 and is_we == -1:
+            key = (pid, hh)
+            by_slot[key] = mean
+            n_slot[key] = n
+        elif dow == -1 and is_we in (0, 1):
+            key = (pid, hh, is_we)
+            by_slot_weekend[key] = mean
+            n_slot_weekend[key] = n
+        elif is_we == -1 and 0 <= dow <= 6:
+            key = (pid, hh, dow)
+            by_slot_dow[key] = mean
+            n_slot_dow[key] = n
+
+    return (
+        by_slot_dow,
+        by_slot_weekend,
+        by_slot,
+        by_park,
+        n_slot_dow,
+        n_slot_weekend,
+        n_slot,
+        n_park,
+    )

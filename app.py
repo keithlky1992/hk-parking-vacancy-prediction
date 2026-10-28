@@ -21,7 +21,13 @@ from zoneinfo import ZoneInfo
 from pyflac import StreamEncoder
 
 from google_areas import reverse_geocode_location_label
-from parking_db import get_secret, load_carparks_frame, load_vacancy_frame
+from parking_db import (
+    baselines_frame_to_maps,
+    get_secret,
+    load_baselines_dataframe,
+    load_carparks_frame,
+    load_vacancy_frame,
+)
 
 WEEKDAY_CN = {0: "週一", 1: "週二", 2: "週三", 3: "週四", 4: "週五", 5: "週六", 6: "週日"}
 WEEKDAY_SHORT = {0: "一", 1: "二", 2: "三", 3: "四", 4: "五", 5: "六", 6: "日"}
@@ -1859,7 +1865,14 @@ def build_park_baselines(
 def load_park_baselines(
     park_ids: tuple[str, ...] | None = None,
 ) -> tuple[dict, dict, dict, dict, dict, dict, dict, dict]:
-    """載入（可選：指定車場）歷史 baseline。"""
+    """
+    載入歷史 baseline（方案 1：優先摘要表／本地 parquet；
+    若無則退回由 vacancy_records 即時聚合）。
+    """
+    df = load_baselines_dataframe(park_ids=list(park_ids) if park_ids else None)
+    packed = baselines_frame_to_maps(df)
+    if any(packed):
+        return packed
     return build_park_baselines(load_data(park_ids))
 
 
@@ -4813,12 +4826,10 @@ def run_vacancy_prediction(intent: dict, query_text: str):
     district_label = "全港"
     target_park_ids: list[str] | None = None
 
-    # 非全港：先用靜態清單篩附近，再只拉該批歷史（加速）
+    # 非全港：先用靜態清單篩附近，再載入 baseline 摘要（方案 1）
     if _is_all_hong_kong(district):
-        with st.spinner("正在載入全港歷史空位（首次約需數十秒）…"):
-            df = load_data().copy()
+        with st.spinner("正在載入全港空位預測基準…"):
             baselines = load_park_baselines()
-        df_filtered = df
         park_info = (
             load_carparks_meta()
             .drop_duplicates(subset=["park_id"])
@@ -4844,13 +4855,11 @@ def run_vacancy_prediction(intent: dict, query_text: str):
             for pid, dist in zip(nearby["park_id"], nearby["distance_km"])
         }
         target_park_ids = [str(p) for p in nearby["park_id"].tolist()]
-        with st.spinner(f"正在載入「{district_label}」附近歷史空位…"):
+        with st.spinner(f"正在載入「{district_label}」附近預測基準…"):
             park_key = tuple(sorted(target_park_ids))
-            df = load_data(park_key).copy()
             baselines = load_park_baselines(park_key)
-        df_filtered = df[df["park_id"].astype(str).isin(target_park_ids)]
         park_info = nearby.set_index("park_id", drop=False)
-        if df_filtered.empty and park_info.empty:
+        if park_info.empty:
             render_feedback_with_speech(
                 f"「{district_label}」附近本系統沒有可用的空位預測資料。"
                 "請改試其他地點後重新輸入。",

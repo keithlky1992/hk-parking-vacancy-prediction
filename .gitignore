@@ -13,6 +13,9 @@
 parking.db
 .carparks_last_update
 
+# Historical archive ZIP cache
+data/historical/
+
 # Python
 __pycache__/
 *.py[cod]
