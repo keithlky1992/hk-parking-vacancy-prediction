@@ -2501,15 +2501,113 @@ def has_explicit_clock_time(query: str) -> bool:
         return True
     if re.search(r"[一二兩三两四五六七八九十廿][點时時]", q):
         return True
-    if re.search(r"(上午|下午|早上|朝早|凌晨|夜晚|晚上|傍晚)\d", q):
+    period = r"(上午|下午|上晝|下晝|晏晝|早上|朝早|凌晨|夜晚|晚上|傍晚)"
+    if re.search(period + r"\d", q):
         return True
-    if re.search(r"(上午|下午|早上|朝早|凌晨|夜晚|晚上|傍晚)[一二兩三两四五六七八九十廿]", q):
+    if re.search(period + r"[一二兩三两四五六七八九十廿]", q):
         return True
     if "中午" in q or "午晝" in q:
         return True
     if re.search(r"(a\.?m\.?|p\.?m\.?)", q, re.I):
         return True
     return False
+
+
+def _cn_hour_token_to_int(token: str) -> int | None:
+    """中文鐘點詞 → 1–12（或 0 表示十二點）；無法解析則 None。"""
+    token = (token or "").strip()
+    if not token:
+        return None
+    if token.isdigit():
+        return int(token)
+    mapping = {
+        "零": 0,
+        "〇": 0,
+        "一": 1,
+        "二": 2,
+        "兩": 2,
+        "两": 2,
+        "三": 3,
+        "四": 4,
+        "五": 5,
+        "六": 6,
+        "七": 7,
+        "八": 8,
+        "九": 9,
+        "十": 10,
+        "十一": 11,
+        "十二": 12,
+        "廿": 20,
+    }
+    if token in mapping:
+        return mapping[token]
+    if token.startswith("十") and len(token) == 2 and token[1] in mapping:
+        return 10 + mapping[token[1]]
+    return None
+
+
+def extract_clock_time_from_query(query: str) -> tuple[int, int] | None:
+    """規則抽出鐘點（hour 0–23, minute 0/30）；抽不到則 None。
+
+    用作 LLM 漏填 hour／minute 時的後備，避免「星期日上午10:30」被當無時間。
+    """
+    q = (query or "").replace(" ", "")
+    if not q:
+        return None
+
+    period_shift = None  # None / "am" / "pm"
+    if re.search(
+        r"下午|下晝|晏晝|夜晚|晚上|傍晚|黃昏|黄昏|深夜|今晚|聽晚|明晚|後晚|大後晚|今夜|明夜|p\.?m\.?",
+        q,
+        flags=re.I,
+    ):
+        period_shift = "pm"
+    elif re.search(
+        r"上午|上晝|早上|朝早|凌晨|清晨|今早|今朝|今晨|聽朝|明早|a\.?m\.?",
+        q,
+        flags=re.I,
+    ):
+        period_shift = "am"
+    elif "中午" in q or "午晝" in q or "正午" in q:
+        period_shift = "noon"
+
+    hour = None
+    minute = 0
+
+    m = re.search(r"(?<!\d)([0-2]?\d)[:：]([0-5]?\d)", q)
+    if m:
+        hour, minute = int(m.group(1)), int(m.group(2))
+    else:
+        m = re.search(
+            r"(?<!\d)([0-2]?\d|[一二兩三两四五六七八九十廿]+)[點时時](半)?",
+            q,
+        )
+        if not m:
+            return None
+        parsed = _cn_hour_token_to_int(m.group(1))
+        if parsed is None:
+            return None
+        hour = parsed
+        minute = 30 if m.group(2) else 0
+
+    if hour is None:
+        return None
+
+    # 已是 13–23 → 視為 24 小時制
+    if hour >= 13:
+        return normalize_half_hour(hour, minute)
+
+    if period_shift == "pm":
+        if hour < 12:
+            hour += 12
+    elif period_shift == "am":
+        if hour == 12:
+            hour = 0
+    elif period_shift == "noon" and hour < 12:
+        hour = 12
+    # 未標 am/pm 且 1–12：保留字面（稍後 ambiguous 檢查會攔截）
+
+    return normalize_half_hour(hour, minute)
 
 
 def is_now_query(query: str) -> bool:
@@ -3537,13 +3635,19 @@ def render_results_map(
         rank = row.get("")
         rank_txt = f"{rank} · " if rank not in (None, "") and not (isinstance(rank, float) and pd.isna(rank)) else ""
         detail_html = "".join(f"<br>{d}" for d in details)
-        label = str(vacancy_num) if vacancy_num is not None else "·"
+        # 無空位數時用藍色「P」，避免灰點喺地圖上幾乎睇唔到
+        if vacancy_num is not None:
+            label = str(vacancy_num)
+            color = _vacancy_color(vacancy_num)
+        else:
+            label = "P"
+            color = "#4285F4"
         markers.append(
             {
                 "lat": lat,
                 "lng": lon,
                 "title": name,
-                "color": _vacancy_color(vacancy_num),
+                "color": color,
                 "label": label,
                 "info": (
                     f"<strong>{html.escape(rank_txt + name)}</strong>{detail_html}"
@@ -3625,7 +3729,8 @@ def render_results_map(
     <div><span class="dot" style="background:#34a853"></span>空位充足（≥30）</div>
     <div><span class="dot" style="background:#f9ab00"></span>一般（10–29）</div>
     <div><span class="dot" style="background:#ea4335"></span>緊張（&lt;10）</div>
-    <div style="margin-top:2px;opacity:0.75">圓內數字＝空位數</div>
+    <div><span class="dot" style="background:#4285F4"></span>位置（無空位數）</div>
+    <div style="margin-top:2px;opacity:0.75">圓內數字＝空位數；P＝只有位置</div>
   </div>
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
     integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
@@ -4007,6 +4112,16 @@ def looks_like_vacancy_prediction_query(query: str) -> bool:
         "空位",
         "易泊",
         "較易泊",
+        "好泊",
+        "難泊",
+        "易拍",  # 語音／錯字常見：泊→拍
+        "好拍",
+        "比較易",
+        "較易",
+        "鬆啲",
+        "鬆位",
+        "易唔易泊",
+        "易唔易拍",
         "邊度泊",
         "邊度較易",
         "預測",
@@ -4017,7 +4132,24 @@ def looks_like_vacancy_prediction_query(query: str) -> bool:
         "車位夠",
         "夠唔夠位",
     )
-    return any(h in q for h in hints)
+    if any(h in q for h in hints):
+        return True
+    # 「星期日上午10:30邊啲停車場…」＝問邊度較易泊，唔係純名單
+    if looks_like_fee_query(query):
+        return False
+    if not looks_like_parking_query(query):
+        return False
+    if not (
+        has_explicit_clock_time(query)
+        or resolve_relative_day(query) is not None
+    ):
+        return False
+    return bool(
+        re.search(
+            r"邊[度啲個]|哪[裡里些個]|比較|推薦|建議|易[泊拍]|好[泊拍]",
+            q,
+        )
+    )
 
 
 def looks_like_fee_query(query: str) -> bool:
@@ -4063,6 +4195,7 @@ def looks_like_parking_info_query(query: str) -> bool:
         return True
     if not looks_like_parking_query(query):
         return False
+    # 唔用裸「邊啲停車場」：會誤傷「邊啲停車場比較易泊」
     patterns = (
         r"幾個停車場",
         r"幾多個?停車場",
@@ -4076,7 +4209,6 @@ def looks_like_parking_info_query(query: str) -> bool:
         r"有沒有停車場",
         r"有哪些停車場",
         r"有邊啲停車場",
-        r"邊啲停車場",
         r"列出.*停車場",
         r"停車場.*名單",
         r"停車場叫咩",
@@ -4126,12 +4258,12 @@ def parse_query_with_llm(query: str):
   - true：空位預測、較易泊、停車場數量／名單、某區有冇停車場、本系統用法等（只要與停車場／泊車有關）
   - false：天氣、食肆、純閒聊、新聞、或其他與泊車完全無關的問題
 - query_type: 查詢類型（只在 related 為 true 時有意義）
-  - "prediction"：想知邊度較易泊、某時某地空位、預測／推薦停車場等（即使沒寫「預測」二字）
-  - "info"：與停車場有關，但不是在問空位預測。例如：某區有幾個停車場、係咪得一個、有冇停車場、叫咩名、收費／價錢、本系統可以問咩
+  - "prediction"：想知邊度較易泊、某時某地空位、預測／推薦停車場等（即使沒寫「預測」二字）。「邊啲停車場比較易泊／好泊」屬 prediction，不是 info
+  - "info"：與停車場有關，但不是在問空位預測。例如：某區有幾個停車場、係咪得一個、有冇停車場、叫咩名、收費／價錢、本系統可以問咩。單純「有邊啲停車場」（無時間、無易泊）才用 info
 - district: 地點名稱，會交 Google Maps 定位。優先填用戶提到的具體地名（屋邨、商場、街道、地區，例如「彩雲邨」「栢慧豪園」「天水圍」）；沒有提到就填「全港」。related 為 false 時填「全港」。不要改寫成內部代號或加「／」合併名
-- hour: 小時（0-23）。只在句子有具體鐘點時填數字（如「三點」「15:30」「晚上九點」）；沒有具體鐘點則填 null（「後晚／聽晚／今晚／嚟緊」單獨出現不算具體鐘點）。問收費但無具體鐘點時填 null（系統會用當刻時間）
+- hour: 小時（0-23）。只在句子有具體鐘點時填數字（如「三點」「15:30」「晚上九點」「上午10:30」）；沒有具體鐘點則填 null（「後晚／聽晚／今晚／嚟緊」單獨出現不算具體鐘點）。問收費但無具體鐘點時填 null（系統會用當刻時間）
 - minute: 分鐘，時間以半小時為單位，只允許 0 或 30。規則：
-  - 「三點半／3:30／15:30」→ 30
+  - 「三點半／3:30／15:30／上午10:30」→ 30
   - 「三點／3:00／15:00」或只提到整點 → 0
   - 其他分鐘請四捨五入到最近的半小時（例如 15→30、45→下一小時的 0）
   - 如果沒有具體鐘點，填 null
@@ -4140,6 +4272,7 @@ def parse_query_with_llm(query: str):
   - 「今日／今晚／今天」→ {day_today}
   - 「聽日／聽晚／明天／明晚」→ {day_tomorrow}
   - 「後日／後晚／後天」→ {day_after}
+  - 「星期日／週日／星期六」等直接寫星期 → 填對應「週X」
   - 「下星期二／下週三／下個星期一」等 → 填對應「週X」（系統會解成下一個日曆週，不是本週已過或今日）
   - 「嚟緊」單獨或「嚟緊＋鐘點」：日期先填「{day_today}」（稍後會規則校正）
   - 如果句子沒有提到日期或星期，就填「{day_today}」
@@ -4155,16 +4288,19 @@ def parse_query_with_llm(query: str):
 範例（地點預測）：
 {{"related": true, "query_type": "prediction", "district": "天水圍", "hour": 20, "minute": 0, "day": "{day_today}", "top_n": null}}
 
+範例（指定星期＋鐘點＋較易泊；勿當 info、勿用而家時間）：
+{{"related": true, "query_type": "prediction", "district": "天水圍", "hour": 10, "minute": 30, "day": "週日", "top_n": null}}
+
 範例（屋邨／地標）：
 {{"related": true, "query_type": "prediction", "district": "彩雲邨", "hour": 16, "minute": 30, "day": "{day_tomorrow}", "top_n": null}}
 
-範例（停車場資料／非預測）：
+範例（停車場資料／非預測；句子如「掃管笏有冇停車場」）：
 {{"related": true, "query_type": "info", "district": "掃管笏", "hour": null, "minute": null, "day": "{day_today}", "top_n": null}}
 
-範例（問收費、無具體鐘點 → 當刻收費）：
+範例（問收費、無具體鐘點 → 當刻收費；句子如「天水圍停車場收費如何」）：
 {{"related": true, "query_type": "info", "district": "天水圍", "hour": null, "minute": null, "day": "{day_today}", "top_n": null}}
 
-範例（問某日某時收費）：
+範例（問某日某時收費；句子如「天水圍聽日晚上八點收費」）：
 {{"related": true, "query_type": "info", "district": "天水圍", "hour": 20, "minute": 0, "day": "{day_tomorrow}", "top_n": null}}
 
 範例（與停車場無關）：
@@ -4193,7 +4329,7 @@ def parse_query_with_llm(query: str):
     if looks_like_parking_query(query) or looks_like_parking_info_query(query):
         intent["related"] = True
 
-    # 規則覆寫 query_type（資料查詢 vs 空位預測）
+    # 規則覆寫 query_type（資料查詢 vs 空位預測；預測關鍵字優先）
     raw_qtype = str(intent.get("query_type") or "").strip().lower()
     if raw_qtype in ("info", "parking_info", "faq", "data"):
         intent["query_type"] = "info"
@@ -4201,10 +4337,10 @@ def parse_query_with_llm(query: str):
         intent["query_type"] = "prediction"
     else:
         intent["query_type"] = "prediction"
-    if looks_like_parking_info_query(query):
-        intent["query_type"] = "info"
-    elif looks_like_vacancy_prediction_query(query):
+    if looks_like_vacancy_prediction_query(query):
         intent["query_type"] = "prediction"
+    elif looks_like_parking_info_query(query):
+        intent["query_type"] = "info"
 
     # 規則覆寫相對日期，避免 LLM 算錯（例如後晚應為後日）
     resolved_day = resolve_relative_day(query, today)
@@ -4233,8 +4369,12 @@ def parse_query_with_llm(query: str):
         intent["top_n"] = None
         if looks_like_fee_query(query) and has_explicit_clock_time(query):
             if not intent_has_clock_time(intent.get("hour")):
-                intent["hour"] = None
-                intent["minute"] = None
+                extracted = extract_clock_time_from_query(query)
+                if extracted is not None:
+                    intent["hour"], intent["minute"] = extracted
+                else:
+                    intent["hour"] = None
+                    intent["minute"] = None
             elif intent.get("minute") is None or str(intent.get("minute")).strip() in (
                 "",
                 "null",
@@ -4252,6 +4392,12 @@ def parse_query_with_llm(query: str):
     future = is_future_day(day_cn, today, next_week=next_week)
     has_clock = has_explicit_clock_time(query)
     coming_soon = is_coming_soon_query(query)
+
+    # LLM 漏填鐘點時，用規則從句子補回（例如「上午10:30」）
+    if has_clock and not intent_has_clock_time(intent.get("hour")):
+        extracted = extract_clock_time_from_query(query)
+        if extracted is not None:
+            intent["hour"], intent["minute"] = extracted
 
     # 「嚟緊」＋具體鐘點 → 下一次即將到來的該鐘點（可跨日；曖昧 12 點取最近未來）
     if coming_soon and has_clock:
@@ -4412,15 +4558,21 @@ def resolve_fee_query_slot(
     now = now or hong_kong_now()
     explicit_day = resolve_relative_day(query, now)
 
-    if has_explicit_clock_time(query) and intent_has_clock_time(intent.get("hour")):
+    hour = intent.get("hour")
+    minute_raw = intent.get("minute")
+    if has_explicit_clock_time(query) and not intent_has_clock_time(hour):
+        extracted = extract_clock_time_from_query(query)
+        if extracted is not None:
+            hour, minute_raw = extracted
+
+    if has_explicit_clock_time(query) and intent_has_clock_time(hour):
         day = explicit_day or intent.get("day") or WEEKDAY_CN[now.weekday()]
-        minute_raw = intent.get("minute")
         minute = (
             0
             if minute_raw is None or str(minute_raw).strip() in ("", "null", "None")
             else int(minute_raw)
         )
-        hour, minute = normalize_half_hour(int(intent["hour"]), minute)
+        hour, minute = normalize_half_hour(int(hour), minute)
         return str(day), hour, minute, False
 
     return WEEKDAY_CN[now.weekday()], int(now.hour), int(now.minute), True
@@ -4432,7 +4584,11 @@ def needs_fee_missing_time_reentry(intent: dict, query_text: str) -> bool:
         return False
     if is_now_query(query_text):
         return False
-    if has_explicit_clock_time(query_text) and intent_has_clock_time(intent.get("hour")):
+    has_hour = intent_has_clock_time(intent.get("hour")) or (
+        has_explicit_clock_time(query_text)
+        and extract_clock_time_from_query(query_text) is not None
+    )
+    if has_explicit_clock_time(query_text) and has_hour:
         return False
     explicit_day = resolve_relative_day(query_text)
     if not explicit_day:
