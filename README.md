@@ -61,7 +61,8 @@ python scripts/build_vacancy_baselines.py
 - `scripts/build_vacancy_baselines.py`: 過去一年 ZIP → baseline 摘要
 - `scripts/import_historical_vacancy.py`:（可選）歷史 ZIP → raw `vacancy_records`
 - `data/vacancy_baselines.parquet`: 方案 1 摘要（build 後產生）
-- `explore_api.ipynb`: 建模／EDA
+- `explore_api_zh.ipynb`: EDA＋對齊咪再兜 baseline／推薦流程（中文版；全港 district）
+- `explore_api_en.ipynb`: Same notebook in English（英文版）
 - `parking.db`: 本機備份（可選）
 - `report_outline.md`: 報告大綱
 
