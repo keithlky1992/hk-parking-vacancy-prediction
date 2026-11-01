@@ -89,8 +89,78 @@ NEARBY_RADIUS_KM = 1.2
 NEARBY_RADIUS_FALLBACK_KM = 2.0
 # 地標「附近」排序：空位 ÷ (1+距離)^冪，較近車場優先
 NEARBY_DISTANCE_SCORE_POWER = 2.0
+# 「某地容唔容易泊」：視為該場所車場嘅距離上限（公里）
+# 適用所有同類問法（商場／邨／地標），唔限單一例子。
+PLACE_AT_VENUE_KM = 0.35
 # 極近且名稱實質相同 → 視為同一停車場（運輸署常有兩套 park_id）
 EQUIVALENT_CARPARK_MAX_KM = 0.06
+# 查詢地名 → 車場名稱常見別名（小階；可選加速對應，主邏輯仍靠名稱 token＋距離）
+PLACE_NAME_ALIASES = {
+    "yoho": ("yoho", "形點"),
+    "yohomall": ("yoho", "形點"),
+    "apm": ("apm",),
+    "mikiki": ("mikiki",),
+    "airside": ("airside",),
+    "ifc": ("ifc",),
+    "icc": ("icc",),
+    "elements": ("elements", "圓方"),
+    "landmark": ("landmark", "置地"),
+    "timesquare": ("timesquare", "時代廣場"),
+    "moko": ("moko", "摩企"),
+    "festivalwalk": ("festivalwalk", "又一城"),
+    "harbourcity": ("harbourcity", "海港城"),
+    "pacificplace": ("pacificplace", "太古廣場"),
+    "hysan": ("hysan", "希慎"),
+}
+# 廣域地區名：即使用「容唔容易泊」亦較似問成區，保持附近排名（唔當單一場所）
+MAJOR_AREA_PLACE_LABELS = frozenset(
+    {
+        "全港",
+        "香港",
+        "九龍",
+        "新界",
+        "港島",
+        "香港島",
+        "中西區",
+        "灣仔",
+        "東區",
+        "南區",
+        "油尖旺",
+        "深水埗",
+        "九龍城",
+        "黃大仙",
+        "觀塘",
+        "荃灣",
+        "屯門",
+        "元朗",
+        "北區",
+        "大埔",
+        "西貢",
+        "沙田",
+        "葵青",
+        "離島",
+        "天水圍",
+        "將軍澳",
+        "東涌",
+        "旺角",
+        "銅鑼灣",
+        "尖沙咀",
+        "中環",
+        "金鐘",
+        "佐敦",
+        "紅磡",
+        "旺角東",
+        "九龍灣",
+        "觀塘區",
+        "油麻地",
+        "太子",
+        "深水步",
+        "荃灣區",
+        "屯門區",
+        "元朗區",
+        "沙田區",
+    }
+)
 
 # 政府停車場 API：基本資料（含收費規則）
 CARPARK_INFO_VACANCY_URL = "https://api.data.gov.hk/v1/carpark-info-vacancy"
@@ -1617,6 +1687,68 @@ def inject_layout_css() -> None:
     )
 
 
+def normalize_asr_query(query: str) -> tuple[str, str | None]:
+    """校正常見粵語語音誤辨（例如「易泊」→「200」、「易唔易」→「252」）。
+
+    「比較200／邊度200／九點半252泊車」等喺本 app 幾乎一定係誤辨；
+    若數字後接價錢單位（蚊／元）則不改，避免誤傷。
+    回傳 (校正後句子, 提示字串或 None)。
+    """
+    original = (query or "").strip()
+    if not original:
+        return original, None
+
+    compact = re.sub(r"\s+", "", original)
+    # 「易泊」常被聽成 200／二百
+    yibo_mishear = r"(?:200|二百|兩百|两百|贰佰|貳佰|2百)"
+    # 「易唔易」常被聽成 252／250（例如「…九點半252泊車」）
+    yimyi_mishear = r"(?:252|250|二百五十二|兩百五十二|两百五十二)"
+    # 「比較二百蚊」＝價錢，唔好改成易泊
+    if re.search(
+        rf"(?:比較|較|较|邊度|哪[里裡]|好|易唔易){yibo_mishear}(?:蚊|元|塊|美金|港幣|hkd)",
+        compact,
+        flags=re.IGNORECASE,
+    ):
+        return original, None
+    if re.search(
+        rf"{yimyi_mishear}(?:蚊|元|塊|美金|港幣|hkd)",
+        compact,
+        flags=re.IGNORECASE,
+    ):
+        return original, None
+
+    replacements = (
+        # 易唔易 → 252／250（必須喺「泊／泊車」前，避免誤傷門牌）
+        (rf"{yimyi_mishear}\s*泊車", "易唔易泊車"),
+        (rf"{yimyi_mishear}\s*泊", "易唔易泊"),
+        # 要唔要泊 ≈ 易唔易泊（語音相近）
+        (r"要唔要\s*泊車", "易唔易泊車"),
+        (r"要唔要\s*泊", "易唔易泊"),
+        # 易泊 → 200／二百
+        (rf"比較\s*{yibo_mishear}", "比較易泊"),
+        (rf"较\s*{yibo_mishear}", "較易泊"),  # 簡體「较」
+        (rf"較\s*{yibo_mishear}", "較易泊"),
+        (rf"邊度\s*{yibo_mishear}", "邊度易泊"),
+        (rf"哪里\s*{yibo_mishear}", "哪里易泊"),
+        (rf"哪裡\s*{yibo_mishear}", "哪裡易泊"),
+        (rf"好\s*{yibo_mishear}", "好泊"),
+        (rf"易唔易\s*{yibo_mishear}", "易唔易泊"),
+    )
+
+    text = original
+    changed = False
+    for pattern, repl in replacements:
+        new_text, n = re.subn(pattern, repl, text, flags=re.IGNORECASE)
+        if n:
+            text = new_text
+            changed = True
+
+    if not changed or text == original:
+        return original, None
+    note = f"已校正語音／輸入：「{text}」（原：「{original}」）"
+    return text, note
+
+
 def apply_pending_input(widget_key: str, pending_key: str) -> None:
     """必須在對應 text_input 建立之前呼叫；把語音結果寫入 widget state。"""
     if pending_key not in st.session_state:
@@ -1647,8 +1779,14 @@ def handle_voice_transcription(
             voice_text = ""
             service_error = str(e)
 
+    voice_text = (voice_text or "").strip()
+    if voice_text:
+        voice_text, asr_note = normalize_asr_query(voice_text)
+        if asr_note:
+            st.session_state["_asr_correction_note"] = asr_note
+
     # 成功／空白／錯誤都更新；空字串會清空輸入框
-    st.session_state[pending_key] = (voice_text or "").strip()
+    st.session_state[pending_key] = voice_text
     if service_error:
         st.session_state[feedback_key] = (
             "error",
@@ -1709,7 +1847,10 @@ apply_pending_input("user_query", "_pending_history_query")
 
 # 文字輸入 + 查詢 + 語音同一列（Enter 或按「查詢」皆可送出）
 st.caption(
-    "輸入查詢（例如：天水圍今晚八點邊度較易泊？）"
+    "輸入查詢（例如：「天水圍今晚八點邊度較易泊？」；"
+    "「APM 星期三朝早九點附近邊五個停車場好泊？」；"
+    "「彩雲邨附近停車場收費如何？」；"
+    "「我想知道屯門兆康附近星期六下晝三點半有邊啲位拍」）"
     f"· 未指定數量時預設顯示前 {DEFAULT_TOP_N} 名"
 )
 form_col, voice_col = st.columns([6.2, 1], vertical_alignment="bottom")
@@ -1747,6 +1888,9 @@ handle_voice_transcription(
     feedback_key="_voice_feedback",
 )
 render_voice_feedback("_voice_feedback")
+asr_note = st.session_state.pop("_asr_correction_note", None)
+if asr_note:
+    st.caption(asr_note)
 
 # 搜尋歷史（可一鍵重查）
 if st.session_state.search_history:
@@ -1784,7 +1928,7 @@ if submitted or st.session_state.get("auto_submit_query"):
         """,
         height=1,
     )
-    st.info("正在處理查詢…（語音／首次載入歷史數據時可能需數秒）")
+    # 唔用 st.info「正在處理」：會同結果同一輪一齊顯示，睇落卡住；進度改靠下方 spinner
 
 
 
@@ -2689,9 +2833,31 @@ SPELL_OUT_LATIN_ACRONYMS = frozenset(
         "CWB",
     }
 )
-_ROMAN_NUMERAL_SPOKEN = {"II": "二", "III": "三", "IV": "四"}
+# 商場／品牌英文名：zh-HK TTS 直讀好怪 → 改口語／中文讀法（只影響朗讀，唔改畫面）
+LATIN_BRAND_SPOKEN = {
+    # 逼 TTS 按英文音節讀：Mi．ki．ki（唔好讀成一個怪詞／中文）
+    "MIKIKI": "Mi ki ki",
+}
+# TTS 詞庫常缺／跳過嘅罕用字 → 同音／常用字（只影響朗讀）
+TTS_CHAR_SPOKEN = str.maketrans(
+    {
+        "壐": "璽",  # 天壐·天 → 天璽（資料罕用字，Edge／系統 TTS 常唔出聲）
+    }
+)
+_ROMAN_NUMERAL_SPOKEN = {
+    "I": "一",
+    "II": "二",
+    "III": "三",
+    "IV": "四",
+    "V": "五",
+    "VI": "六",
+}
 # 英文詞／縮寫＋可選尾隨數字（AIRSIDE、KTR350、apm）
 _LATIN_SPEECH_TOKEN_RE = re.compile(r"[A-Za-z]+(?:\+[A-Za-z]*)?\d*|\d+[A-Za-z]+")
+# 名稱後括號英文別名，例如「元政路停車場 (Delta Parking)」
+_PAREN_LATIN_ALIAS_RE = re.compile(
+    r"\s*[（(][^）)]*[A-Za-z][^）)]*[）)]"
+)
 
 
 def _latin_token_to_hk_speech(token: str) -> str:
@@ -2706,7 +2872,9 @@ def _latin_token_to_hk_speech(token: str) -> str:
         letters, digits = m.group(1), m.group(2)
 
     upper = letters.upper()
-    if upper in _ROMAN_NUMERAL_SPOKEN:
+    if upper in LATIN_BRAND_SPOKEN:
+        spoken = LATIN_BRAND_SPOKEN[upper]
+    elif upper in _ROMAN_NUMERAL_SPOKEN:
         spoken = _ROMAN_NUMERAL_SPOKEN[upper]
     elif upper in SPELL_OUT_LATIN_ACRONYMS:
         # TKO / APM → "T K O"／"A P M"，逼 TTS 逐字母
@@ -2723,13 +2891,25 @@ def _latin_token_to_hk_speech(token: str) -> str:
 
 
 def prepare_spoken_text_for_tts(text: str) -> str:
-    """朗讀前處理：英文名稱跟香港習慣；日期括號星期改口語，唔改書面顯示。"""
+    """朗讀前處理：去掉括號英文別名；羅馬數字；罕用字；日期口語。唔改書面顯示。"""
     text = (text or "").strip()
     if not text:
         return text
+    text = text.translate(TTS_CHAR_SPOKEN)
+    # 間隔號「·」TTS 常停頓／吞字 → 改成輕頓
+    text = text.replace("·", "、").replace("•", "、")
     text = re.sub(r"\bM\+", "M plus", text, flags=re.IGNORECASE)
     # 「2026年10月27日（二）」→「…星期二」；否則 Edge TTS 只讀「二」，聽落似月份／亂碼
     text = re.sub(r"[（(]([一二三四五六日])[）)]", r"星期\1", text)
+    # 「元政路停車場 (Delta Parking)」→ 唔讀英文別名
+    text = _PAREN_LATIN_ALIAS_RE.sub("", text)
+    # 「較易泊／易泊」單字「易」粵語 TTS 常讀成 yik（改）而非 yi（容易）
+    # → 改寫成「容易」逼正確讀音（只影響朗讀）
+    text = text.replace("較易泊車", "比較容易泊車")
+    text = text.replace("較易泊", "比較容易泊")
+    text = text.replace("好易泊", "好容易泊")
+    text = re.sub(r"(?<!容)易泊", "容易泊", text)
+    text = re.sub(r"比較比較容易", "比較容易", text)
     return _LATIN_SPEECH_TOKEN_RE.sub(
         lambda m: _latin_token_to_hk_speech(m.group(0)), text
     )
@@ -3393,7 +3573,7 @@ def render_nearby_live_slots() -> None:
             "或直接輸入／語音查詢未來時段預測。"
         )
         st.caption(
-            "資料庫約每 10 分鐘自動採集運輸署開放數據（自動化，非人手 scrap）。"
+            "資料庫約每 10 分鐘自動採集運輸署開放數據。"
         )
         return
 
@@ -3463,11 +3643,7 @@ def render_day_profile_chart(profile_df: pd.DataFrame, *, day: str, half_hour: i
         return
     import altair as alt
 
-    st.markdown(f"**{day} 全日空位走勢（前列車場）**")
-    st.caption(
-        "曲線來自歷史同時段均值（含星期 shrinkage）。"
-        "樣本愈多信心愈高；垂直虛線為你查詢的時段。"
-    )
+    st.markdown(f"**{day} 全日預測空位走勢（前列車場）**")
     highlight_time = f"{half_hour // 2:02d}:{30 if half_hour % 2 else 0:02d}"
     chart = (
         alt.Chart(profile_df)
@@ -3476,7 +3652,7 @@ def render_day_profile_chart(profile_df: pd.DataFrame, *, day: str, half_hour: i
             x=alt.X("時間:N", sort=None, title="時間"),
             y=alt.Y("預測空位:Q", title="預測空位"),
             color=alt.Color("名稱:N", title="停車場"),
-            tooltip=["名稱", "時間", "預測空位", "信心"],
+            tooltip=["名稱", "時間", "預測空位"],
         )
         .properties(height=260)
     )
@@ -3501,6 +3677,7 @@ def render_saved_prediction(payload: dict, *, auto_speak: bool = False) -> None:
     shown = int(payload["shown"])
     asking_now = bool(payload.get("asking_now"))
     top_n_default = bool(payload.get("top_n_default"))
+    place_ease = bool(payload.get("place_ease"))
     time_str = format_time_12h(hour, minute)
     half_hour = to_half_hour_slot(hour, minute)
 
@@ -3515,9 +3692,23 @@ def render_saved_prediction(payload: dict, *, auto_speak: bool = False) -> None:
             f"你查詢的是「而家／現在」，因此顯示未來 1–30 分鐘內"
             f"下一個半小時（{time_str}）的預測結果。"
         )
-    if top_n_default:
+    if place_ease:
+        st.caption("你問的是該地點本身容唔容易泊，因此只顯示該場所停車場。")
+    elif top_n_default:
         st.caption(f"未指定顯示數量 → 預設顯示前 {top_n} 名")
-    if shown > top_n:
+    if place_ease:
+        ease = ""
+        if not result_df.empty and "預測空位" in result_df.columns:
+            try:
+                best = float(pd.to_numeric(result_df["預測空位"], errors="coerce").max())
+                ease = f"（整體：{vacancy_ease_label(best)}）"
+            except (TypeError, ValueError):
+                ease = ""
+        st.success(
+            f"{day} {time_str}「{district_label}」停車場空位預測"
+            f"（共 {shown} 個）{ease}"
+        )
+    elif shown > top_n:
         st.success(
             f"{day} {time_str} {district_label} 較易泊車的停車場"
             f"（前 {top_n} 名，含同分共 {shown} 個）"
@@ -3560,7 +3751,7 @@ def render_saved_prediction(payload: dict, *, auto_speak: bool = False) -> None:
 
 
 _TABLE_HIDDEN_COLS = frozenset(
-    {"latitude", "longitude", "park_id", "樣本數", "依據"}
+    {"latitude", "longitude", "park_id", "樣本數", "依據", "信心"}
 )
 
 
@@ -3616,11 +3807,6 @@ def render_results_map(
             except (TypeError, ValueError):
                 vacancy_txt = str(vacancy) if vacancy is not None else "—"
             details.append(f"{vacancy_col}：{html.escape(vacancy_txt)}")
-        conf = row.get("信心")
-        if conf is not None and not (isinstance(conf, float) and pd.isna(conf)):
-            conf_txt = str(conf).strip()
-            if conf_txt:
-                details.append(f"信心：{html.escape(conf_txt)}")
         fee = row.get("收費")
         if fee is not None and not (isinstance(fee, float) and pd.isna(fee)):
             fee_txt = str(fee).strip()
@@ -4017,10 +4203,118 @@ def date_for_weekday_cn(
     )
 
 
-def is_future_day(day_cn: str, today=None, *, next_week: bool = False) -> bool:
+def parse_absolute_date_from_query(query: str, today=None) -> datetime | None:
+    """解析絕對日期（如「11月29號」「2026年11月29日」「11/29」）。
+
+    無年份時：若今年該日未過用今年，已過則用明年。
+    """
+    today = (today or hong_kong_now()).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    q = (query or "").replace(" ", "")
+    if not q:
+        return None
+
+    year = month = day = None
+    m = re.search(
+        r"(?:(?P<year>\d{4})年)?(?P<month>\d{1,2})月(?P<day>\d{1,2})[號号日]?",
+        q,
+    )
+    if m:
+        year = int(m.group("year")) if m.group("year") else None
+        month = int(m.group("month"))
+        day = int(m.group("day"))
+    else:
+        m2 = re.search(r"(?<!\d)(\d{1,2})[/\-.](\d{1,2})(?!\d)", q)
+        if not m2:
+            return None
+        month, day = int(m2.group(1)), int(m2.group(2))
+
+    if not (1 <= month <= 12 and 1 <= day <= 31):
+        return None
+
+    def _safe(y: int, mo: int, d: int) -> datetime | None:
+        try:
+            return datetime(y, mo, d, tzinfo=today.tzinfo)
+        except ValueError:
+            return None
+
+    if year is not None:
+        return _safe(year, month, day)
+
+    candidate = _safe(today.year, month, day)
+    if candidate is None:
+        return None
+    if candidate.date() < today.date():
+        candidate = _safe(today.year + 1, month, day)
+    return candidate
+
+
+def absolute_date_from_intent(intent: dict | None, today=None) -> datetime | None:
+    """由 intent['absolute_date']（YYYY-MM-DD）還原日期。"""
+    if not intent:
+        return None
+    raw = intent.get("absolute_date")
+    if raw is None or str(raw).strip() in ("", "null", "None"):
+        return None
+    today = today or hong_kong_now()
+    try:
+        dt = datetime.strptime(str(raw).strip()[:10], "%Y-%m-%d")
+    except ValueError:
+        return None
+    return dt.replace(
+        hour=0, minute=0, second=0, microsecond=0, tzinfo=today.tzinfo
+    )
+
+
+def resolve_intent_calendar_date(
+    day_cn: str | None = None,
+    today=None,
+    *,
+    next_week: bool = False,
+    absolute_date=None,
+    intent: dict | None = None,
+) -> datetime | None:
+    """優先用絕對日期，否則用星期推算。"""
+    today = today or hong_kong_now()
+    if intent is not None and absolute_date is None:
+        absolute_date = intent.get("absolute_date")
+    if absolute_date is not None and str(absolute_date).strip() not in (
+        "",
+        "null",
+        "None",
+    ):
+        if isinstance(absolute_date, datetime):
+            return absolute_date.replace(
+                hour=0, minute=0, second=0, microsecond=0, tzinfo=today.tzinfo
+            )
+        try:
+            dt = datetime.strptime(str(absolute_date).strip()[:10], "%Y-%m-%d")
+            return dt.replace(
+                hour=0, minute=0, second=0, microsecond=0, tzinfo=today.tzinfo
+            )
+        except ValueError:
+            pass
+    if intent is not None and day_cn is None:
+        day_cn = intent.get("day")
+        next_week = bool(intent.get("day_next_week"))
+    if not day_cn:
+        return None
+    return date_for_weekday_cn(day_cn, today, next_week=next_week)
+
+
+def is_future_day(
+    day_cn: str,
+    today=None,
+    *,
+    next_week: bool = False,
+    absolute_date=None,
+) -> bool:
     """日子是否為明天或之後（相對今天）。"""
     today = today or hong_kong_now()
-    date_part = date_for_weekday_cn(day_cn, today, next_week=next_week)
+    date_part = resolve_intent_calendar_date(
+        day_cn, today, next_week=next_week, absolute_date=absolute_date
+    )
     if date_part is None:
         return False
     return date_part.date() > today.date()
@@ -4032,13 +4326,21 @@ def intent_has_clock_time(hour) -> bool:
 
 
 def intent_query_datetime(
-    day_cn: str, hour, minute, today=None, *, next_week: bool = False
+    day_cn: str,
+    hour,
+    minute,
+    today=None,
+    *,
+    next_week: bool = False,
+    absolute_date=None,
 ) -> datetime | None:
-    """將意圖的星期＋鐘點組合成具體日期時間；缺資料則回傳 None。"""
+    """將意圖的日期／星期＋鐘點組合成具體日期時間；缺資料則回傳 None。"""
     if not intent_has_clock_time(hour):
         return None
     today = today or hong_kong_now()
-    date_part = date_for_weekday_cn(day_cn, today, next_week=next_week)
+    date_part = resolve_intent_calendar_date(
+        day_cn, today, next_week=next_week, absolute_date=absolute_date
+    )
     if date_part is None:
         return None
     m = 0 if minute is None or str(minute).strip() in ("", "null", "None") else int(minute)
@@ -4047,12 +4349,23 @@ def intent_query_datetime(
 
 
 def is_past_intent_datetime(
-    day_cn: str, hour, minute, today=None, *, next_week: bool = False
+    day_cn: str,
+    hour,
+    minute,
+    today=None,
+    *,
+    next_week: bool = False,
+    absolute_date=None,
 ) -> bool:
     """意圖所指日期時間是否已過去（相對香港時間）。"""
     today = today or hong_kong_now()
     when = intent_query_datetime(
-        day_cn, hour, minute, today, next_week=next_week
+        day_cn,
+        hour,
+        minute,
+        today,
+        next_week=next_week,
+        absolute_date=absolute_date,
     )
     if when is None:
         return False
@@ -4066,11 +4379,17 @@ def format_time_ampm(hour: int, minute: int = 0) -> str:
     return f"{hour12}:{minute:02d}{suffix}"
 
 
-def format_intent_date(day_cn, today=None, *, next_week: bool = False) -> str:
+def format_intent_date(
+    day_cn,
+    today=None,
+    *,
+    next_week: bool = False,
+    absolute_date=None,
+) -> str:
     """例如：2026年10月24日（六）"""
     today = today or hong_kong_now()
-    date_part = (
-        date_for_weekday_cn(day_cn, today, next_week=next_week) if day_cn else None
+    date_part = resolve_intent_calendar_date(
+        day_cn, today, next_week=next_week, absolute_date=absolute_date
     )
     if date_part is None:
         return "未指定"
@@ -4122,6 +4441,8 @@ def looks_like_vacancy_prediction_query(query: str) -> bool:
         "鬆位",
         "易唔易泊",
         "易唔易拍",
+        "容唔容易",
+        "容不容易",
         "邊度泊",
         "邊度較易",
         "預測",
@@ -4150,6 +4471,264 @@ def looks_like_vacancy_prediction_query(query: str) -> bool:
             q,
         )
     )
+
+
+def looks_like_place_ease_query(query: str) -> bool:
+    """問某地點本身容唔容易泊（而非「附近邊啲較易泊」排名）。
+
+    通用規則（商場／邨／地標皆同）：
+    - 「YOHO mall／APM／彩雲邨…容唔容易／易唔易／有冇位」→ True
+    - 「天水圍今晚八點邊度較易泊」→ False（有邊度＝附近排名）
+    """
+    q = re.sub(r"\s+", "", query or "")
+    if not q:
+        return False
+    # 明確問「邊度／邊啲／推薦」→ 附近排名
+    if re.search(r"邊[度啲個]|哪[裡里些個]|推薦|建議邊", q):
+        return False
+    ease_hints = (
+        "容唔容易",
+        "容不容易",
+        "容不容易泊",
+        "易唔易",
+        "好唔好泊",
+        "好不好泊",
+        "難唔難泊",
+        "难不难泊",
+        "好泊唔好",
+        "易泊唔易",
+        "泊唔泊到",
+        "得唔得泊",
+        "泊得到嗎",
+        "泊得到吗",
+        "有冇位",
+        "有沒有位",
+        "有没有位",
+        "夠唔夠位",
+        "够不够位",
+        "車位夠唔夠",
+        "车位够不够",
+        "鬆唔鬆",
+        "挤不挤",
+        "擠不擠",
+        "會唔會冇位",
+        "会不会没位",
+        "是否容易泊",
+        "容易嗎",
+        "容易吗",
+    )
+    return any(h in q for h in ease_hints)
+
+
+def _normalize_place_key(place: str) -> str:
+    return re.sub(r"\s+", "", (place or "").strip()).lower()
+
+
+def _place_is_major_area(place: str) -> bool:
+    """廣域地區（區／市中心）而非單一商場／邨／地標。"""
+    key = _normalize_place_key(place)
+    if not key or _is_all_hong_kong(place):
+        return True
+    major_keys = {_normalize_place_key(x) for x in MAJOR_AREA_PLACE_LABELS}
+    if key in major_keys:
+        return True
+    # 「元朗區」「沙田區」等
+    if key.endswith("區") and key[:-1] in major_keys:
+        return True
+    return False
+
+
+def _place_match_tokens(place: str) -> list[str]:
+    """由用戶地名抽出用以對車場名稱嘅 token（小階／原文）。"""
+    raw = (place or "").strip()
+    if not raw or _is_all_hong_kong(raw):
+        return []
+    compact = _normalize_place_key(raw)
+    stripped = re.sub(
+        r"(mall|商場|廣場|中心|center|centre|parking|carpark|停車場)$",
+        "",
+        compact,
+        flags=re.I,
+    )
+    tokens: list[str] = []
+    if compact:
+        tokens.append(compact)
+    if stripped and stripped != compact:
+        tokens.append(stripped)
+    # 英文詞分段（YOHO mall → yoho）
+    for eng in re.findall(r"[A-Za-z]{2,}", raw):
+        tokens.append(eng.lower())
+    for key, aliases in PLACE_NAME_ALIASES.items():
+        if key in compact or compact in key or key in stripped:
+            tokens.extend(aliases)
+    # 中文片段；邨／苑／園等可再加詞幹（彩雲邨→彩雲）
+    for part in re.findall(r"[\u4e00-\u9fff]{2,}", raw):
+        tokens.append(part)
+        if len(part) >= 3 and part[-1] in "邨苑園城灣莊村":
+            tokens.append(part[:-1])
+    # 去重保序
+    seen: set[str] = set()
+    out: list[str] = []
+    for t in tokens:
+        t = (t or "").strip().lower()
+        if len(t) < 2 or t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+    return out
+
+
+def extract_place_mention_from_query(query: str) -> str | None:
+    """由原句盡量抽出地點片段（唔依賴 LLM district，避免被收成「元朗」等區名）。
+
+    例如「YOHO mall聽晚九點半容唔容易泊車」→「YOHO mall」
+    """
+    q = (query or "").strip()
+    if not q:
+        return None
+    cut = q
+    # 去掉相對／絕對日期、時段、鐘點
+    cut = re.sub(
+        r"(大後晚|大後日|後晚|後日|後天|聽朝|聽晚|聽日|今晚|今夜|今日|今天|今朝|今早|"
+        r"明早|明晚|明天|明日|今早|今晨|"
+        r"下(?:個)?星期[一二三四五六日天]|下(?:個)?週[一二三四五六日]|"
+        r"星期[一二三四五六日天]|週[一二三四五六日]|"
+        r"下晝|上晝|下午|上午|早上|朝早|夜晚|晚上|傍晚|凌晨|清晨|中午|午晝|深夜)",
+        " ",
+        cut,
+    )
+    cut = re.sub(r"(?:\d{4}年)?\d{1,2}月\d{1,2}[號号日]?", " ", cut)
+    cut = re.sub(r"(?<!\d)\d{1,2}[/\-.]\d{1,2}(?!\d)", " ", cut)
+    cut = re.sub(
+        r"\d{1,2}\s*[:：]\s*\d{1,2}|\d{1,2}\s*[點时時]\s*半?|"
+        r"[一二兩三两四五六七八九十廿]+\s*[點时時]\s*半?",
+        " ",
+        cut,
+    )
+    # 去掉「容唔容易泊…」等意圖尾巴
+    cut = re.sub(
+        r"(容唔容易|容不容易|易唔易|好唔好泊|好不好泊|難唔難泊|难不难泊|"
+        r"好泊唔好|易泊唔易|泊唔泊到|得唔得泊|有冇位|有沒有位|有没有位|"
+        r"夠唔夠位|够不够位|車位夠唔夠|车位够不够|鬆唔鬆|是否容易泊|"
+        r"容易嗎|容易吗|會唔會冇位|会不会没位|"
+        r"附近|邊[度啲個]|哪[裡里些個]|比較易|較易泊|好泊|難泊|"
+        r"停車場|泊車|停車|車位|空位|parking).*$",
+        " ",
+        cut,
+        flags=re.I,
+    )
+    cut = re.sub(r"\s+", " ", cut).strip(" ，,的嘅喺在")
+    if len(cut) >= 2:
+        return cut
+    return None
+
+
+def resolve_place_ease_label(query: str, district: str) -> str | None:
+    """若應走「該場所容唔容易泊」，回傳篩車場用地名；否則 None。
+
+    優先用原句抽出嘅地名（YOHO mall／APM／彩雲邨…），
+    唔好只信 LLM district（常被收窄成元朗／觀塘等廣域名而誤判）。
+    """
+    if not looks_like_place_ease_query(query):
+        return None
+    for candidate in (
+        extract_place_mention_from_query(query),
+        str(district or "").strip() or None,
+    ):
+        if not candidate or _is_all_hong_kong(candidate):
+            continue
+        if _place_is_major_area(candidate):
+            continue
+        return candidate
+    return None
+
+
+def should_use_place_ease_scope(query: str, place: str) -> bool:
+    """是否用「該場所車場」範圍（通用：任何具體地點＋容唔容易類問句）。
+
+    廣域地區（如觀塘／天水圍）即使講容唔容易，仍用附近排名，避免只剩地心附近幾場。
+    新碼請優先用 resolve_place_ease_label()。
+    """
+    return resolve_place_ease_label(query, place) is not None
+
+
+def filter_parks_at_queried_place(
+    df: pd.DataFrame,
+    place: str,
+    *,
+    max_km: float = PLACE_AT_VENUE_KM,
+) -> pd.DataFrame:
+    """只保留「該場所」車場：名稱吻合，或距離極近（喺地點範圍內）。
+
+    對所有具體地點一視同仁（唔限 YOHO）；別名表只係輔助。
+    """
+    if df is None or df.empty:
+        return df.iloc[0:0].copy() if df is not None else pd.DataFrame()
+    tokens = _place_match_tokens(place)
+    name_col = "名稱" if "名稱" in df.columns else ("name" if "name" in df.columns else None)
+    dist_col = "距離(公里)" if "距離(公里)" in df.columns else None
+
+    def _at_place(row) -> bool:
+        name = str(row[name_col]) if name_col else ""
+        name_l = name.lower()
+        name_n = _normalize_park_name(name)
+        for t in tokens:
+            if t in name_l or t in name_n:
+                return True
+        if dist_col is not None:
+            try:
+                d = float(row[dist_col])
+            except (TypeError, ValueError):
+                d = None
+            if d is not None and d <= max_km:
+                return True
+        return False
+
+    masked = df[df.apply(_at_place, axis=1)]
+    return masked.copy()
+
+
+def vacancy_ease_label(vacancy) -> str:
+    """由預測空位數轉口語鬆緊。"""
+    try:
+        n = float(vacancy)
+    except (TypeError, ValueError):
+        return "暫時無法判斷"
+    if n >= 30:
+        return "較易泊"
+    if n >= 10:
+        return "一般"
+    return "較緊張"
+
+
+def format_spoken_place_ease(
+    result_df: pd.DataFrame,
+    place_label: str,
+    hour: int,
+    minute: int = 0,
+) -> str:
+    """「某地容唔容易泊」專用粵語稿。"""
+    time_spoken = format_time_spoken_yue(hour, minute)
+    place = (place_label or "該處").strip() or "該處"
+    if result_df is None or result_df.empty:
+        raw = f"{place}喺{time_spoken}暫時冇可用嘅空位預測。"
+        return prepare_spoken_text_for_tts(raw)
+
+    rows = result_df.head(5)
+    parts = [f"關於{place}喺{time_spoken}泊車。"]
+    vacancies = []
+    for _, row in rows.iterrows():
+        name = str(row.get("名稱") or "停車場")
+        vac = row.get("預測空位")
+        try:
+            vac_i = int(vac)
+        except (TypeError, ValueError):
+            vac_i = 0
+        vacancies.append(vac_i)
+        parts.append(f"{name}預計大約有{vac_i}個空位。")
+    best = max(vacancies) if vacancies else 0
+    parts.append(f"整體嚟講{vacancy_ease_label(best)}。")
+    return prepare_spoken_text_for_tts("".join(parts))
 
 
 def looks_like_fee_query(query: str) -> bool:
@@ -4258,9 +4837,9 @@ def parse_query_with_llm(query: str):
   - true：空位預測、較易泊、停車場數量／名單、某區有冇停車場、本系統用法等（只要與停車場／泊車有關）
   - false：天氣、食肆、純閒聊、新聞、或其他與泊車完全無關的問題
 - query_type: 查詢類型（只在 related 為 true 時有意義）
-  - "prediction"：想知邊度較易泊、某時某地空位、預測／推薦停車場等（即使沒寫「預測」二字）。「邊啲停車場比較易泊／好泊」屬 prediction，不是 info
+  - "prediction"：想知邊度較易泊、某時某地空位、某地容唔容易泊、預測／推薦停車場等（即使沒寫「預測」二字）。「邊啲停車場比較易泊／好泊」屬 prediction，不是 info
   - "info"：與停車場有關，但不是在問空位預測。例如：某區有幾個停車場、係咪得一個、有冇停車場、叫咩名、收費／價錢、本系統可以問咩。單純「有邊啲停車場」（無時間、無易泊）才用 info
-- district: 地點名稱，會交 Google Maps 定位。優先填用戶提到的具體地名（屋邨、商場、街道、地區，例如「彩雲邨」「栢慧豪園」「天水圍」）；沒有提到就填「全港」。related 為 false 時填「全港」。不要改寫成內部代號或加「／」合併名
+- district: 地點名稱，會交 Google Maps 定位。優先填用戶提到的具體地名（屋邨、商場、街道、地區，例如「彩雲邨」「栢慧豪園」「YOHO mall」「天水圍」）；沒有提到就填「全港」。related 為 false 時填「全港」。不要改寫成內部代號或加「／」合併名。若用戶問某商場／地標「容唔容易泊／易唔易泊／有冇位」，district 必須保留該具體地名（不要只填所在行政區）
 - hour: 小時（0-23）。只在句子有具體鐘點時填數字（如「三點」「15:30」「晚上九點」「上午10:30」）；沒有具體鐘點則填 null（「後晚／聽晚／今晚／嚟緊」單獨出現不算具體鐘點）。問收費但無具體鐘點時填 null（系統會用當刻時間）
 - minute: 分鐘，時間以半小時為單位，只允許 0 或 30。規則：
   - 「三點半／3:30／15:30／上午10:30」→ 30
@@ -4268,12 +4847,13 @@ def parse_query_with_llm(query: str):
   - 其他分鐘請四捨五入到最近的半小時（例如 15→30、45→下一小時的 0）
   - 如果沒有具體鐘點，填 null
   - 「嚟緊12點／嚟緊十二點」若未寫中午／午夜：hour 先填 0（稍後會規則校正為下一次 12 點）
-- day: 星期（「週一」到「週日」）。必須依相對日期換算，今天是{today_day}：
+- day: 星期（「週一」到「週日」）。必須依日期換算，今天是{today_day}：
   - 「今日／今晚／今天」→ {day_today}
   - 「聽日／聽晚／明天／明晚」→ {day_tomorrow}
   - 「後日／後晚／後天」→ {day_after}
   - 「星期日／週日／星期六」等直接寫星期 → 填對應「週X」
   - 「下星期二／下週三／下個星期一」等 → 填對應「週X」（系統會解成下一個日曆週，不是本週已過或今日）
+  - 「11月29號／2026年11月29日」等絕對日期 → 填該日對應「週X」（不要填成今天；系統會再以規則鎖定該日曆日）
   - 「嚟緊」單獨或「嚟緊＋鐘點」：日期先填「{day_today}」（稍後會規則校正）
   - 如果句子沒有提到日期或星期，就填「{day_today}」
 - top_n: 要顯示幾個較易泊車的停車場（整數）。規則：
@@ -4291,8 +4871,14 @@ def parse_query_with_llm(query: str):
 範例（指定星期＋鐘點＋較易泊；勿當 info、勿用而家時間）：
 {{"related": true, "query_type": "prediction", "district": "天水圍", "hour": 10, "minute": 30, "day": "週日", "top_n": null}}
 
+範例（絕對日期 11月29號＝該日星期，勿當成今日）：
+{{"related": true, "query_type": "prediction", "district": "屯門兆康", "hour": 15, "minute": 30, "day": "週日", "top_n": null}}
+
 範例（屋邨／地標）：
 {{"related": true, "query_type": "prediction", "district": "彩雲邨", "hour": 16, "minute": 30, "day": "{day_tomorrow}", "top_n": null}}
+
+範例（某商場本身容唔容易泊；district 保留商場名，勿改成「元朗」）：
+{{"related": true, "query_type": "prediction", "district": "YOHO mall", "hour": 10, "minute": 30, "day": "{day_tomorrow}", "top_n": null}}
 
 範例（停車場資料／非預測；句子如「掃管笏有冇停車場」）：
 {{"related": true, "query_type": "info", "district": "掃管笏", "hour": null, "minute": null, "day": "{day_today}", "top_n": null}}
@@ -4342,11 +4928,18 @@ def parse_query_with_llm(query: str):
     elif looks_like_parking_info_query(query):
         intent["query_type"] = "info"
 
-    # 規則覆寫相對日期，避免 LLM 算錯（例如後晚應為後日）
-    resolved_day = resolve_relative_day(query, today)
-    if resolved_day:
-        intent["day"] = resolved_day
-    intent["day_next_week"] = query_implies_next_week_weekday(query)
+    # 規則覆寫日期：絕對日期（11月29號）優先於相對日期（後晚／聽日）
+    abs_dt = parse_absolute_date_from_query(query, today)
+    if abs_dt is not None:
+        intent["absolute_date"] = abs_dt.strftime("%Y-%m-%d")
+        intent["day"] = WEEKDAY_CN[abs_dt.weekday()]
+        intent["day_next_week"] = False
+    else:
+        intent.pop("absolute_date", None)
+        resolved_day = resolve_relative_day(query, today)
+        if resolved_day:
+            intent["day"] = resolved_day
+        intent["day_next_week"] = query_implies_next_week_weekday(query)
 
     # 保留 LLM 抽出的地點原文予 Google Geocoding；只把「全部」等正規成全港
     if _is_all_hong_kong(intent.get("district")):
@@ -4355,6 +4948,7 @@ def parse_query_with_llm(query: str):
     if is_now_query(query):
         intent["day"] = WEEKDAY_CN[today.weekday()]
         intent["day_next_week"] = False
+        intent.pop("absolute_date", None)
 
     # 與停車場無關 → 不推時間／不進入預測
     if not intent_is_parking_related(intent):
@@ -4389,9 +4983,15 @@ def parse_query_with_llm(query: str):
     intent["query_type"] = "prediction"
     day_cn = intent.get("day") or today_day
     next_week = bool(intent.get("day_next_week"))
-    future = is_future_day(day_cn, today, next_week=next_week)
+    future = is_future_day(
+        day_cn,
+        today,
+        next_week=next_week,
+        absolute_date=intent.get("absolute_date"),
+    )
     has_clock = has_explicit_clock_time(query)
     coming_soon = is_coming_soon_query(query)
+    has_absolute = bool(intent.get("absolute_date"))
 
     # LLM 漏填鐘點時，用規則從句子補回（例如「上午10:30」）
     if has_clock and not intent_has_clock_time(intent.get("hour")):
@@ -4400,10 +5000,10 @@ def parse_query_with_llm(query: str):
             intent["hour"], intent["minute"] = extracted
 
     # 「嚟緊」＋具體鐘點 → 下一次即將到來的該鐘點（可跨日；曖昧 12 點取最近未來）
-    if coming_soon and has_clock:
+    if coming_soon and has_clock and not has_absolute:
         intent = resolve_coming_soon_intent(intent, query, today)
-    # 明天或之後：未提供具體鐘點則保留 null（稍後提示用戶重新輸入完整查詢）
-    elif future and not has_clock:
+    # 明天或之後／已指定絕對日期：未提供具體鐘點則保留 null（稍後提示重新輸入）
+    elif (future or has_absolute) and not has_clock:
         intent["hour"] = None
         intent["minute"] = None
     # 「而家／現在／嚟緊」或今日未指明鐘點 → 下一個半小時（可跨日）
@@ -4413,6 +5013,7 @@ def parse_query_with_llm(query: str):
         intent["minute"] = dt.minute
         intent["day"] = WEEKDAY_CN[dt.weekday()]
         intent["day_next_week"] = False
+        intent.pop("absolute_date", None)
 
     return intent
 
@@ -4464,6 +5065,7 @@ def render_intent_summary(
                 format_intent_date(
                     intent.get("day"),
                     next_week=bool(intent.get("day_next_week")),
+                    absolute_date=intent.get("absolute_date"),
                 ),
             ),
             ("時間", format_intent_time(intent.get("hour"), intent.get("minute"))),
@@ -5072,28 +5674,61 @@ def run_vacancy_prediction(intent: dict, query_text: str):
         )
         # 保留 park_id／座標畀曲線同地圖；表格顯示時會隱藏
         pred_df = pred_df.drop(columns=["name"], errors="ignore")
-    if match_type == "nearby":
+
+    # 通用：原句問某商場／邨／地標「容唔容易泊」→ 只評該場所車場
+    # （用地名抽取，避免 LLM 把 YOHO mall 收成「元朗」後誤走附近排名）
+    place_label = resolve_place_ease_label(query_text, str(district or ""))
+    place_ease = match_type == "nearby" and place_label is not None
+
+    if place_ease:
+        at_place = filter_parks_at_queried_place(pred_df, place_label)
+        if not at_place.empty:
+            # 該場所全部車場（按空位）；唔再攤開附近其他場
+            result_df = select_top_with_ties(
+                at_place, max(len(at_place), 1)
+            )
+            district_label = place_label
+            top_n = len(result_df)
+            top_n_default = False
+        else:
+            # 搵唔到該場所車場 → 維持附近排名，避免空白
+            result_df = select_top_nearby_with_ties(pred_df, top_n)
+            district_label = f"{place_label}附近"
+            place_ease = False
+    elif match_type == "nearby":
         result_df = select_top_nearby_with_ties(pred_df, top_n)
-        district_label = f"{district_label}附近"
+        # 顯示優先用用戶原地名，其次 Google 地址
+        display_place = (
+            str(district or "").strip()
+            or (geo_label or "").strip()
+            or district_label
+        )
+        district_label = f"{display_place}附近"
     else:
         result_df = select_top_with_ties(pred_df, top_n)
-    # 欄位順序：排名、名稱、地區、（距離）、收費、預測空位、信心；（隱藏）座標／內部欄
-    preferred = ["", "名稱", "地區", "距離(公里)", "收費", "預測空位", "信心"]
+    # 欄位順序：排名、名稱、地區、（距離）、收費、預測空位；（隱藏）信心／座標／內部欄
+    preferred = ["", "名稱", "地區", "距離(公里)", "收費", "預測空位"]
     ordered = [c for c in preferred if c in result_df.columns]
     ordered += [
         c
         for c in result_df.columns
-        if c not in ordered and c not in {"park_id", "樣本數", "依據"}
+        if c not in ordered and c not in _TABLE_HIDDEN_COLS
     ]
     # 內部欄留喺 df 尾（表格會隱藏）
-    for hidden in ("park_id", "樣本數", "依據", "latitude", "longitude"):
+    for hidden in _TABLE_HIDDEN_COLS:
         if hidden in result_df.columns and hidden not in ordered:
             ordered.append(hidden)
     result_df = result_df[ordered]
 
     shown = len(result_df)
-    written = format_top_suggestion(result_df, hour, minute)
-    spoken = format_spoken_suggestion(result_df, hour, minute)
+    if place_ease:
+        written = format_top_suggestion(result_df, hour, minute)
+        spoken = format_spoken_place_ease(
+            result_df, place_label, hour, minute
+        )
+    else:
+        written = format_top_suggestion(result_df, hour, minute)
+        spoken = format_spoken_suggestion(result_df, hour, minute)
 
     profile_df = pd.DataFrame()
     if not result_df.empty and "park_id" in result_df.columns:
@@ -5122,6 +5757,7 @@ def run_vacancy_prediction(intent: dict, query_text: str):
         "top_n": top_n,
         "top_n_default": top_n_default,
         "shown": shown,
+        "place_ease": place_ease,
         "result_records": result_df.to_dict(orient="records"),
         "profile_records": profile_df.to_dict(orient="records"),
         "written": written,
@@ -5135,13 +5771,15 @@ def run_vacancy_prediction(intent: dict, query_text: str):
 
 
 def needs_missing_time_reentry(intent: dict, query_text: str) -> bool:
-    """明天或之後且未提供時間 → 不執行預測，要求重新輸入完整查詢。"""
+    """明天或之後（或已指定未來絕對日期）且未提供時間 → 要求重新輸入。"""
     asking_now = is_now_query(query_text)
     day = intent.get("day", WEEKDAY_CN[hong_kong_now().weekday()])
     if asking_now:
         return False
     return is_future_day(
-        day, next_week=bool(intent.get("day_next_week"))
+        day,
+        next_week=bool(intent.get("day_next_week")),
+        absolute_date=intent.get("absolute_date"),
     ) and not intent_has_clock_time(intent.get("hour"))
 
 
@@ -5164,7 +5802,7 @@ def needs_ambiguous_ampm_reentry(intent: dict, query_text: str) -> bool:
 
 
 def needs_past_time_followup(intent: dict, query_text: str) -> bool:
-    """今日（或最近該日）且鐘點已過去 → 不執行預測，要求重新輸入。"""
+    """所指日期時間已過去 → 不執行預測，要求重新輸入。"""
     if is_now_query(query_text):
         return False
     day = intent.get("day", WEEKDAY_CN[hong_kong_now().weekday()])
@@ -5173,6 +5811,7 @@ def needs_past_time_followup(intent: dict, query_text: str) -> bool:
         intent.get("hour"),
         intent.get("minute"),
         next_week=bool(intent.get("day_next_week")),
+        absolute_date=intent.get("absolute_date"),
     )
 
 
@@ -5180,7 +5819,9 @@ def render_missing_time_blocked(intent: dict, *, auto_speak: bool = True):
     """未來日期但未指明時間：顯示意圖並要求重新輸入完整查詢。"""
     day = intent.get("day", WEEKDAY_CN[hong_kong_now().weekday()])
     day_label = format_intent_date(
-        day, next_week=bool(intent.get("day_next_week"))
+        day,
+        next_week=bool(intent.get("day_next_week")),
+        absolute_date=intent.get("absolute_date"),
     )
     render_feedback_with_speech(
         f"你想查詢的是 **{day_label}**，但未提供具體時間。"
@@ -5198,8 +5839,12 @@ def render_fee_missing_time_blocked(
     intent: dict, query_text: str, *, auto_speak: bool = True
 ):
     """收費查詢指定非今日日子但未指明時間：要求重新輸入。"""
+    abs_dt = parse_absolute_date_from_query(query_text) or absolute_date_from_intent(
+        intent
+    )
     day = (
-        resolve_relative_day(query_text)
+        (WEEKDAY_CN[abs_dt.weekday()] if abs_dt is not None else None)
+        or resolve_relative_day(query_text)
         or intent.get("day")
         or WEEKDAY_CN[hong_kong_now().weekday()]
     )
@@ -5208,6 +5853,11 @@ def render_fee_missing_time_blocked(
         next_week=bool(
             intent.get("day_next_week")
             or query_implies_next_week_weekday(query_text)
+        ),
+        absolute_date=(
+            abs_dt.strftime("%Y-%m-%d")
+            if abs_dt is not None
+            else intent.get("absolute_date")
         ),
     )
     render_feedback_with_speech(
@@ -5246,7 +5896,7 @@ def render_past_time_blocked(intent: dict, *, auto_speak: bool = True):
     """查詢時間已過：顯示意圖並要求重新輸入完整查詢。"""
     day = intent.get("day", WEEKDAY_CN[hong_kong_now().weekday()])
     when = (
-        f"{format_intent_date(day, next_week=bool(intent.get('day_next_week')))} "
+        f"{format_intent_date(day, next_week=bool(intent.get('day_next_week')), absolute_date=intent.get('absolute_date'))} "
         f"{format_intent_time(intent.get('hour'), intent.get('minute'))}"
     )
     render_feedback_with_speech(
@@ -5260,6 +5910,11 @@ def render_past_time_blocked(intent: dict, *, auto_speak: bool = True):
 auto_submit = st.session_state.pop("auto_submit_query", False)
 should_query = submitted or auto_submit
 query_text = (user_query or "").strip()
+# 文字輸入同樣校正（語音已喺辨識後改過；此處作雙重保險）
+if query_text:
+    query_text, typed_asr_note = normalize_asr_query(query_text)
+    if typed_asr_note and not asr_note:
+        st.caption(typed_asr_note)
 
 # 新查詢：只清 session 狀態。
 # 唔喺呢度注入 stop JS，否則會同稍後嘅 auto-speak 搶跑（iframe 執行次序不穩 → 查詢後無聲）。
