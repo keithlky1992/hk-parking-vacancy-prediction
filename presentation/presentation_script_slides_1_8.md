@@ -2,7 +2,7 @@
 
 **範圍：** Slide 1–7 簡報內容 + Slide 8 Demo 過渡句（不含詳細 Demo／QR）。  
 **用法：** 每句英文下一行中文；講一種語言約 7 分鐘。  
-**對應簡報：** `Group4_HK_Parking_Vacancy_Prediction.pptx`（共 9 頁；詳細 Demo／Slide 9 QR 見 `presentation_script_demo_slides_8_9.md`）
+**對應簡報：** `Group4_HK_Parking_Vacancy_Prediction_Presentation.pptx`（共 9 頁；詳細 Demo／Slide 9 QR 見 `presentation_script_demo_slides_8_9.md`）
 
 ---
 
