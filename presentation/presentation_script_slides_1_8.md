@@ -1,8 +1,8 @@
-# Presentation Script · Slides 1–7（中英對照）· 約 7 分鐘
+# Presentation Script · Slides 1–8（中英對照）· 約 7 分鐘
 
-**範圍：** 只講 Slide 1–7（不含 Demo）。  
+**範圍：** Slide 1–7 簡報內容 + Slide 8 Demo 過渡句（不含詳細 Demo／QR）。  
 **用法：** 每句英文下一行中文；講一種語言約 7 分鐘。  
-**對應簡報：** `Group4_HK_Parking_Vacancy_Prediction.pptx`（共 8 頁；本檔不含第 8 頁 Demo）
+**對應簡報：** `Group4_HK_Parking_Vacancy_Prediction.pptx`（共 9 頁；詳細 Demo／Slide 9 QR 見 `presentation_script_demo_slides_8_9.md`）
 
 ---
 
@@ -230,8 +230,14 @@ richer weather and holiday features, persisted models,
 vacancy level classes, stronger Large Language Model suggestions, and deeper error analysis.  
 空位等級分類、更強的 Large Language Model 建議，以及更深入的誤差分析。
 
+---
+
+## Slide 8 — Product Demo — 咪再兜（約 10 秒）
+
 Next, we will demo the live product — 「咪再兜」.  
 接下來我們會演示線上產品——「咪再兜」。
+
+〔一句帶過；隨即切去 App 做 live demo。詳細 Demo 講稿見 `presentation_script_demo_slides_8_9.md`；QR 喺 Slide 9。〕
 
 ---
 
@@ -246,6 +252,7 @@ Next, we will demo the live product — 「咪再兜」.
 | 5      | EDA          | ~55 秒            |
 | 6      | Results      | ~80 秒            |
 | 7      | Challenges   | ~55 秒            |
+| 8      | Demo 過渡     | ~10 秒            |
 | **合計** |              | **約 7.0–7.2 分鐘** |
 
 **提示：** 若時間偏緊，可壓縮 Slide 3（數據源只點 TD／HKO／Supabase）與 Slide 7（Future work 只講 2 點）。  
