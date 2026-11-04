@@ -1,5 +1,4 @@
 streamlit
-streamlit-mic-recorder
 streamlit-js-eval
 pandas
 pyarrow

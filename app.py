@@ -1,7 +1,6 @@
 import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
-from streamlit_mic_recorder import mic_recorder
 from streamlit_js_eval import get_geolocation
 from dotenv import load_dotenv
 import asyncio
@@ -198,8 +197,37 @@ DAYNIGHT_FEE_LABEL = {
 }
 
 
+def _normalize_voice_audio(audio) -> dict | None:
+    """將 st.audio_input（UploadedFile）或舊 mic_recorder dict 統一成 {bytes, id, ...}。"""
+    if audio is None:
+        return None
+    if isinstance(audio, dict) and audio.get("bytes") is not None:
+        if not audio.get("id"):
+            raw = audio["bytes"]
+            audio = {
+                **audio,
+                "id": f"dict:{len(raw)}:{hash(bytes(raw[:2048]))}",
+            }
+        return audio
+    getval = getattr(audio, "getvalue", None)
+    if not callable(getval):
+        return None
+    raw = getval()
+    if not raw:
+        return None
+    name = getattr(audio, "name", None) or "voice.wav"
+    size = int(getattr(audio, "size", None) or len(raw))
+    file_id = getattr(audio, "file_id", None) or f"{name}:{size}:{hash(bytes(raw[:2048]))}"
+    return {
+        "bytes": raw,
+        "id": str(file_id),
+        "sample_rate": 16000,
+        "sample_width": 2,
+    }
+
+
 def _pcm_from_audio(audio: dict) -> tuple[np.ndarray, int]:
-    """從 mic_recorder 結果取出 mono int16 PCM 與 sample rate。"""
+    """從語音結果取出 mono int16 PCM 與 sample rate。"""
     raw = audio["bytes"]
     if raw[:4] == b"RIFF":
         with wave.open(io.BytesIO(raw), "rb") as wf:
@@ -257,7 +285,7 @@ def _parse_google_stt_response(response_text: str) -> str:
 
 
 def transcribe_audio(audio: dict) -> str:
-    """將 mic_recorder 音訊轉成文字。"""
+    """將語音音訊轉成文字。"""
     samples, rate = _pcm_from_audio(audio)
     if samples.size == 0:
         return ""
@@ -914,11 +942,32 @@ def inject_layout_css() -> None:
   div[data-testid="stButton"] button[kind="secondary"]:focus {
     box-shadow: none !important;
   }
-  iframe[title*="mic_recorder"] {
-    height: 2.5rem !important;
-    min-height: 2.5rem !important;
+  /* 語音：st.audio_input 收成接近查詢掣高度 */
+  .st-key-voice_input,
+  div[data-testid="stAudioInput"] {
     width: 100% !important;
-    display: block !important;
+  }
+  .st-key-voice_input [data-testid="stAudioInput"],
+  div[data-testid="stAudioInput"] {
+    min-height: 2.5rem !important;
+  }
+  .st-key-voice_input button,
+  div[data-testid="stAudioInput"] button {
+    min-height: 2.5rem !important;
+  }
+  /* 隱藏結果區原生 autoplay <audio> 外殼，只保留出聲 */
+  .mzd-native-autoplay,
+  [data-testid="stElementContainer"]:has(.mzd-native-autoplay) {
+    position: absolute !important;
+    width: 0 !important;
+    height: 0 !important;
+    min-height: 0 !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    overflow: hidden !important;
+    opacity: 0 !important;
+    pointer-events: none !important;
+    border: none !important;
   }
   div[data-testid="stTextInput"] input {
     height: 2.5rem !important;
@@ -999,10 +1048,9 @@ def inject_layout_css() -> None:
   .mzd-hk-time::after {
     content: attr(data-mzd-clock);
   }
-  /* Streamlit 1.51 會把 height=0 當 falsy 回落 ~150px；用 height=1 再收起。
-     排除 mic_recorder，避免語音掣被一併藏起。 */
-  iframe[height="0"]:not([title*="mic_recorder"]),
-  iframe[height="1"]:not([title*="mic_recorder"]) {
+  /* Streamlit 1.51 會把 height=0 當 falsy 回落 ~150px；用 height=1 再收起。 */
+  iframe[height="0"],
+  iframe[height="1"] {
     position: absolute !important;
     width: 0 !important;
     height: 0 !important;
@@ -1013,8 +1061,8 @@ def inject_layout_css() -> None:
     opacity: 0 !important;
     pointer-events: none !important;
   }
-  [data-testid="stElementContainer"]:has(iframe[height="0"]:not([title*="mic_recorder"])),
-  [data-testid="stElementContainer"]:has(iframe[height="1"]:not([title*="mic_recorder"])) {
+  [data-testid="stElementContainer"]:has(iframe[height="0"]),
+  [data-testid="stElementContainer"]:has(iframe[height="1"]) {
     position: absolute !important;
     width: 0 !important;
     height: 0 !important;
@@ -1206,9 +1254,36 @@ def inject_layout_css() -> None:
   }
   root.__hkParkingSetSpeechSpeakingUi = setSpeechSpeakingUi;
 
-  // 極短靜音 WAV：喺「查詢／語音」手勢內 play，之後結果頁可用同一 Audio／AudioContext 自動播（iOS／手機）
-  // 注意：解鎖後唔好立刻 pause；iOS 會當自動播放權限失效，結果頁就變要人手撳「播放」
-  var SILENT_WAV = "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQQAAAAAAA==";
+  // iOS／語音：撳掣手勢內開始「靜音 keepalive」loop，撑過辨識＋AI 等待；
+  // 結果 MP3 就緒後喺同一 Audio 元素換 src 再 play（中途 pause 會令 iOS 收回自動播權限）。
+  function buildSilentWavDataUri(seconds) {
+    var rate = 8000;
+    var n = Math.max(1, Math.floor(rate * (seconds || 0.5)));
+    var dataSize = n * 2;
+    var buffer = new ArrayBuffer(44 + dataSize);
+    var view = new DataView(buffer);
+    function wstr(offset, s) {
+      for (var i = 0; i < s.length; i++) view.setUint8(offset + i, s.charCodeAt(i));
+    }
+    wstr(0, "RIFF");
+    view.setUint32(4, 36 + dataSize, true);
+    wstr(8, "WAVE");
+    wstr(12, "fmt ");
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, rate, true);
+    view.setUint32(28, rate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    wstr(36, "data");
+    view.setUint32(40, dataSize, true);
+    var bytes = new Uint8Array(buffer);
+    var binary = "";
+    for (var i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    return "data:audio/wav;base64," + root.btoa(binary);
+  }
+  var SILENT_WAV = buildSilentWavDataUri(0.5);
 
   function ensureUnlockedMediaAudio() {
     if (!root.__hkParkingMediaAudio) {
@@ -1217,6 +1292,13 @@ def inject_layout_css() -> None:
       try { root.__hkParkingMediaAudio.playsInline = true; } catch (e) {}
       try { root.__hkParkingMediaAudio.setAttribute("playsinline", "true"); } catch (e) {}
       try { root.__hkParkingMediaAudio.setAttribute("webkit-playsinline", "true"); } catch (e) {}
+      // iOS：掛入 DOM 較易保持解鎖
+      try {
+        root.__hkParkingMediaAudio.style.cssText =
+          "position:fixed;width:0;height:0;opacity:0;pointer-events:none;";
+        (root.document.body || root.document.documentElement)
+          .appendChild(root.__hkParkingMediaAudio);
+      } catch (e) {}
     }
     return root.__hkParkingMediaAudio;
   }
@@ -1243,11 +1325,63 @@ def inject_layout_css() -> None:
     try { srcNode.disconnect(); } catch (e) {}
   }
 
+  function stopOscKeepalive() {
+    var osc = root.__hkParkingOscKeepalive;
+    root.__hkParkingOscKeepalive = null;
+    if (!osc) return;
+    try { osc.stop(); } catch (e) {}
+    try { osc.disconnect(); } catch (e) {}
+  }
+
+  function startOscKeepalive() {
+    try {
+      var ctx = ensureAudioContext();
+      if (!ctx) return;
+      stopOscKeepalive();
+      var gain = ctx.createGain();
+      // 極低音量：保持 context running，唔令人聽到
+      gain.gain.value = 0.0001;
+      gain.connect(ctx.destination);
+      var osc = ctx.createOscillator();
+      osc.frequency.value = 20;
+      osc.connect(gain);
+      osc.start(0);
+      root.__hkParkingOscKeepalive = osc;
+      root.__hkParkingAudioCtxUnlocked = true;
+    } catch (e) {}
+  }
+
+  function stopKeepaliveWatch() {
+    if (!root.__hkParkingKeepaliveWatch) return;
+    try { root.clearInterval(root.__hkParkingKeepaliveWatch); } catch (e) {}
+    root.__hkParkingKeepaliveWatch = null;
+  }
+
+  function startKeepaliveWatch() {
+    stopKeepaliveWatch();
+    root.__hkParkingKeepaliveWatch = root.setInterval(function () {
+      if (!root.__hkParkingMediaKeepalive) {
+        stopKeepaliveWatch();
+        return;
+      }
+      var a = root.__hkParkingMediaAudio;
+      if (!a) return;
+      try {
+        if (a.paused) {
+          var p = a.play();
+          if (p && typeof p.catch === "function") p.catch(function () {});
+        }
+      } catch (e) {}
+    }, 800);
+  }
+
   function stopUnlockedMedia() {
     root.__hkParkingMediaPlayPending = false;
     root.__hkParkingAudioCtxPlayGen = (root.__hkParkingAudioCtxPlayGen || 0) + 1;
     stopAudioContextSource();
+    stopOscKeepalive();
     root.__hkParkingMediaKeepalive = false;
+    stopKeepaliveWatch();
     var a = root.__hkParkingMediaAudio;
     if (!a) return;
     try { a.loop = false; } catch (e) {}
@@ -1259,56 +1393,41 @@ def inject_layout_css() -> None:
 
   function unlockMediaNow() {
     speech.unlock();
-    // 1) Web Audio：手勢內 resume，之後解碼 MP3 再播，iOS 延遲自動播較穩
+    // 1) Web Audio：必須喺手勢 call stack 同步 resume＋開 oscillator（唔好放 .then）
     try {
       var ctx = ensureAudioContext();
       if (ctx) {
-        var warm = function () {
-          try {
-            var buf = ctx.createBuffer(1, 1, 22050);
-            var node = ctx.createBufferSource();
-            node.buffer = buf;
-            node.connect(ctx.destination);
-            node.start(0);
-            root.__hkParkingAudioCtxUnlocked = true;
-          } catch (e) {}
-        };
         if (ctx.state === "suspended") {
-          var rp = ctx.resume();
-          if (rp && typeof rp.then === "function") {
-            rp.then(warm).catch(warm);
-          } else {
-            warm();
-          }
-        } else {
-          warm();
+          try { ctx.resume(); } catch (e) {}
         }
+        startOscKeepalive();
       }
     } catch (e) {}
-    // 2) HTML5 Audio：手勢內 play 靜音解鎖；結束後唔好 pause（pause 會令 iOS 之後拒自動播）
+    // 2) HTML5：靜音 loop keepalive（語音辨識可等十幾秒，唔 loop 會被 iOS 收回權限）
     try {
       var a = ensureUnlockedMediaAudio();
       a.muted = false;
       a.volume = 0.01;
-      try { a.loop = false; } catch (e) {}
+      a.loop = true;
       root.__hkParkingMediaKeepalive = true;
-      a.onended = function () {
-        // 保持 unlocked 旗標；唔 pause／唔清 src
-        root.__hkParkingMediaKeepalive = false;
-        root.__hkParkingMediaUnlocked = true;
-      };
+      a.onended = null;
       a.onerror = null;
-      a.src = SILENT_WAV;
+      // 已在播同一段 keepalive 就唔好重設 src（避免語音「開始→停止」兩下手勢打斷）
+      if (!(a.src === SILENT_WAV && !a.paused && a.loop)) {
+        a.src = SILENT_WAV;
+      }
       var p = a.play();
       if (p && typeof p.then === "function") {
         p.then(function () {
           root.__hkParkingMediaUnlocked = true;
+          startKeepaliveWatch();
         }).catch(function () {
-          // 即使 promise 失敗，手勢內呼叫過 play() 有時仍算解鎖
           root.__hkParkingMediaUnlocked = true;
+          startKeepaliveWatch();
         });
       } else {
         root.__hkParkingMediaUnlocked = true;
+        startKeepaliveWatch();
       }
     } catch (e) {}
   }
@@ -1316,6 +1435,8 @@ def inject_layout_css() -> None:
   function playViaAudioContext(src, cbs) {
     var ctx = root.__hkParkingAudioCtx;
     if (!ctx || !root.__hkParkingAudioCtxUnlocked) return false;
+    // keepalive 期間優先 HTML5 換 src；AudioContext 長等待後常係 suspended
+    if (root.__hkParkingMediaKeepalive) return false;
     var playGen = (root.__hkParkingAudioCtxPlayGen || 0) + 1;
     root.__hkParkingAudioCtxPlayGen = playGen;
     root.__hkParkingMediaPlayPending = true;
@@ -1335,8 +1456,9 @@ def inject_layout_css() -> None:
         .then(function (buffer) {
           if (!buffer || playGen !== root.__hkParkingAudioCtxPlayGen) return;
           stopAudioContextSource();
-          // 停 HTML5 keepalive，避免同 AudioContext 搶聲道
+          stopOscKeepalive();
           root.__hkParkingMediaKeepalive = false;
+          stopKeepaliveWatch();
           try {
             var aKeep = root.__hkParkingMediaAudio;
             if (aKeep) {
@@ -1379,25 +1501,14 @@ def inject_layout_css() -> None:
     }
   }
 
-  function playViaHtml5Audio(src, cbs) {
-    try {
-      var a = ensureUnlockedMediaAudio();
-      stopAudioContextSource();
-      root.__hkParkingMediaKeepalive = false;
-      root.__hkParkingMediaPlayPending = true;
-      try { a.loop = false; } catch (e) {}
-      try { a.pause(); } catch (e) {}
-      a.muted = false;
-      a.volume = 1;
-      a.onended = function () {
-        root.__hkParkingMediaPlayPending = false;
-        if (typeof cbs.onEnded === "function") cbs.onEnded();
-      };
-      a.onerror = function () {
-        root.__hkParkingMediaPlayPending = false;
-        if (typeof cbs.onError === "function") cbs.onError();
-      };
-      a.src = src;
+  function revokeMediaBlobUrl() {
+    if (!root.__hkParkingMediaBlobUrl) return;
+    try { root.URL.revokeObjectURL(root.__hkParkingMediaBlobUrl); } catch (e) {}
+    root.__hkParkingMediaBlobUrl = null;
+  }
+
+  function startHtml5Src(a, src, cbs, wasKeepalive) {
+    var finishStart = function () {
       var p = a.play();
       if (p && typeof p.then === "function") {
         p.then(function () {
@@ -1407,10 +1518,60 @@ def inject_layout_css() -> None:
           root.__hkParkingMediaPlayPending = false;
           if (typeof cbs.onError === "function") cbs.onError();
         });
-      } else if (typeof cbs.onStart === "function") {
+      } else {
         root.__hkParkingMediaPlayPending = false;
-        cbs.onStart();
+        if (typeof cbs.onStart === "function") cbs.onStart();
       }
+    };
+    // data URI 大 MP3 喺 iOS 常失敗 → 轉 blob URL
+    if (src && src.indexOf("data:audio/") === 0 && root.fetch && root.URL) {
+      root.fetch(src)
+        .then(function (res) { return res.blob(); })
+        .then(function (blob) {
+          revokeMediaBlobUrl();
+          root.__hkParkingMediaBlobUrl = root.URL.createObjectURL(blob);
+          a.src = root.__hkParkingMediaBlobUrl;
+          try { a.load(); } catch (e) {}
+          finishStart();
+        })
+        .catch(function () {
+          a.src = src;
+          try { a.load(); } catch (e) {}
+          finishStart();
+        });
+      return;
+    }
+    a.src = src;
+    try { a.load(); } catch (e) {}
+    finishStart();
+  }
+
+  function playViaHtml5Audio(src, cbs) {
+    try {
+      var a = ensureUnlockedMediaAudio();
+      stopAudioContextSource();
+      var wasKeepalive = !!root.__hkParkingMediaKeepalive;
+      root.__hkParkingMediaKeepalive = false;
+      stopKeepaliveWatch();
+      root.__hkParkingMediaPlayPending = true;
+      try { a.loop = false; } catch (e) {}
+      // keepalive 中唔好先 pause：iOS 會當解鎖失效
+      if (!wasKeepalive) {
+        try { a.pause(); } catch (e) {}
+      }
+      a.muted = false;
+      a.volume = 1;
+      a.onended = function () {
+        root.__hkParkingMediaPlayPending = false;
+        revokeMediaBlobUrl();
+        if (typeof cbs.onEnded === "function") cbs.onEnded();
+      };
+      a.onerror = function () {
+        root.__hkParkingMediaPlayPending = false;
+        revokeMediaBlobUrl();
+        if (typeof cbs.onError === "function") cbs.onError();
+      };
+      startHtml5Src(a, src, cbs, wasKeepalive);
       return true;
     } catch (e) {
       root.__hkParkingMediaPlayPending = false;
@@ -1425,14 +1586,15 @@ def inject_layout_css() -> None:
       if (typeof cbs.onError === "function") cbs.onError();
       return false;
     }
-    // 優先 AudioContext（iOS 查詢後數秒先有 MP3 都較易出聲）
+    // 語音長等待：優先同一 HTML5 元素（keepalive → 換 MP3）
+    if (root.__hkParkingMediaKeepalive || root.__hkParkingMediaUnlocked) {
+      stopOscKeepalive();
+      if (playViaHtml5Audio(src, cbs)) return true;
+    }
     var acCbs = {
       onStart: cbs.onStart,
       onEnded: cbs.onEnded,
-      onError: function () {
-        // AudioContext 失敗再退 HTML5 同一解鎖元素
-        playViaHtml5Audio(src, cbs);
-      }
+      onError: function () { playViaHtml5Audio(src, cbs); }
     };
     if (playViaAudioContext(src, acCbs)) return true;
     return playViaHtml5Audio(src, cbs);
@@ -1452,8 +1614,29 @@ def inject_layout_css() -> None:
     }
   }
 
+  function queueUnlockedMedia(src, cbs) {
+    // 語音結果 iframe 可能喺 setTimeout 先叫 play；改排隊由 parent keepalive 期間即播
+    root.__hkParkingPendingAutoSrc = src || null;
+    root.__hkParkingPendingAutoCbs = cbs || null;
+    flushPendingUnlockedMedia();
+  }
+
+  function flushPendingUnlockedMedia() {
+    var src = root.__hkParkingPendingAutoSrc;
+    if (!src) return false;
+    if (!(root.__hkParkingMediaKeepalive || root.__hkParkingMediaUnlocked || root.__hkParkingAudioCtxUnlocked)) {
+      return false;
+    }
+    root.__hkParkingPendingAutoSrc = null;
+    var cbs = root.__hkParkingPendingAutoCbs || {};
+    root.__hkParkingPendingAutoCbs = null;
+    return playUnlockedMedia(src, cbs);
+  }
+
   root.__hkParkingUnlockMedia = unlockMediaNow;
   root.__hkParkingPlayUnlockedMedia = playUnlockedMedia;
+  root.__hkParkingQueueUnlockedMedia = queueUnlockedMedia;
+  root.__hkParkingFlushPendingUnlockedMedia = flushPendingUnlockedMedia;
   root.__hkParkingStopUnlockedMedia = stopUnlockedMedia;
   root.__hkParkingIsUnlockedMediaPlaying = isUnlockedMediaPlaying;
 
@@ -1521,14 +1704,8 @@ def inject_layout_css() -> None:
 
   // Streamlit 1.51：height=0 會被當成 falsy 而用預設 ~150px，撐開「播放」下方空白。
   // 標記用 height=1 的 speech sync／speak／stop iframe，一律收起。
-  // 唔好收起 mic_recorder（語音掣）；佢可能短暫 height=0／未 setFrameHeight。
-  function isMicRecorderIframe(iframe) {
-    var title = iframe.title || "";
-    return title.indexOf("mic_recorder") !== -1;
-  }
   function collapseHiddenSpeechIframes() {
     doc.querySelectorAll("iframe").forEach(function (iframe) {
-      if (isMicRecorderIframe(iframe)) return;
       var srcdoc = "";
       try { srcdoc = iframe.srcdoc || iframe.getAttribute("srcdoc") || ""; } catch (e) {}
       // 可見嘅「播放」player 唔好收起
@@ -1587,63 +1764,28 @@ def inject_layout_css() -> None:
     }
   }
 
-  function styleMicButtons() {
-    doc.querySelectorAll('iframe[title*="mic_recorder"]').forEach(function (iframe) {
-      restoreMicIframeVisibility(iframe);
-      if (!iframe.dataset.stopSpeechBound) {
-        iframe.dataset.stopSpeechBound = "1";
-        // 語音掣手勢內解鎖 Media／TTS（先停舊播，再 unlock），之後結果頁先可自動播
-        iframe.addEventListener("pointerdown", function () {
-          stopSuggestionPlaybackOnly();
-          unlockSpeechNow();
-        }, true);
-        iframe.addEventListener("click", function () {
-          stopSuggestionPlaybackOnly();
-          unlockSpeechNow();
-        }, true);
-      }
-      try {
-        var btn = iframe.contentDocument && iframe.contentDocument.querySelector("button");
-        if (!btn) return;
-        btn.style.height = "2.5rem";
-        btn.style.minHeight = "2.5rem";
-        btn.style.width = "100%";
-        btn.style.padding = "0 0.6rem";
-        btn.style.margin = "0";
-        btn.style.borderRadius = "0.5rem";
-        btn.style.boxSizing = "border-box";
-        btn.style.display = "flex";
-        btn.style.alignItems = "center";
-        btn.style.justifyContent = "center";
-        btn.style.gap = "0.35rem";
-        btn.style.fontSize = "1rem";
-        btn.style.fontFamily = '"Source Sans Pro", "Segoe UI", sans-serif';
-        btn.style.fontWeight = "400";
-        btn.style.lineHeight = "1";
-        btn.style.whiteSpace = "nowrap";
+  function armVoiceUnlock(ev) {
+    // 語音掣喺主頁 DOM：手勢內 unlock／keepalive，先撑到辨識完自動播
+    try { unlockSpeechNow(); } catch (e) {}
+    try { stopSuggestionPlaybackOnly(); } catch (e) {}
+  }
 
-        var label = (btn.textContent || "").replace(/\\s+/g, "");
-        var mode = label.indexOf("停止") !== -1 ? "stop" : "voice";
-        if (btn.dataset.iconMode !== mode || !btn.querySelector("svg")) {
-          btn.dataset.iconMode = mode;
-          var icon = mode === "stop" ? micStopIconSvg() : micVoiceIconSvg();
-          var text = mode === "stop" ? "停止" : "語音";
-          btn.innerHTML = icon + "<span>" + text + "</span>";
-        }
-
-        if (!btn.dataset.stopSpeechBound) {
-          btn.dataset.stopSpeechBound = "1";
-          btn.addEventListener("click", function () {
-            stopSuggestionPlaybackOnly();
-            unlockSpeechNow();
-          }, true);
-          btn.addEventListener("pointerdown", function () {
-            stopSuggestionPlaybackOnly();
-            unlockSpeechNow();
-          }, true);
-        }
-      } catch (e) {}
+  function bindAudioInputUnlock() {
+    var nodes = doc.querySelectorAll(
+      '.st-key-voice_input, [data-testid="stAudioInput"], .st-key-voice_input button, [data-testid="stAudioInput"] button'
+    );
+    nodes.forEach(function (el) {
+      if (el.dataset.voiceUnlockBound) return;
+      el.dataset.voiceUnlockBound = "1";
+      el.addEventListener("touchstart", armVoiceUnlock, { capture: true, passive: true });
+      el.addEventListener("pointerdown", armVoiceUnlock, true);
+      el.addEventListener("click", armVoiceUnlock, true);
     });
+  }
+
+  function styleMicButtons() {
+    // 舊 mic_recorder 已棄用；改綁 st.audio_input（主頁手勢）
+    bindAudioInputUnlock();
   }
 
   var MZD_HOVER_RED = "#ff4b4b";
@@ -1841,6 +1983,7 @@ def inject_layout_css() -> None:
     bindQueryInputBlurOnSubmit();
     bindQueryButtonBlur();
     blurUserQueryIfMarked();
+    try { flushPendingUnlockedMedia(); } catch (e) {}
     tickHkClock();
   }
   runUiPolish();
@@ -1927,7 +2070,7 @@ def apply_pending_input(widget_key: str, pending_key: str) -> None:
 
 
 def handle_voice_transcription(
-    audio: dict | None,
+    audio,
     *,
     last_id_key: str,
     pending_key: str,
@@ -1937,12 +2080,13 @@ def handle_voice_transcription(
     """辨識後只寫入 pending_key（唔好直接改 text_input 的 key），再 rerun。"""
     if not pending_key.startswith("_pending_"):
         raise ValueError(f"pending_key 必須係暫存鍵，收到：{pending_key}")
-    if not audio or audio.get("id") == st.session_state.get(last_id_key):
+    normalized = _normalize_voice_audio(audio)
+    if not normalized or normalized.get("id") == st.session_state.get(last_id_key):
         return
-    st.session_state[last_id_key] = audio["id"]
+    st.session_state[last_id_key] = normalized["id"]
     with st.spinner("正在辨識語音..."):
         try:
-            voice_text = transcribe_audio(audio)
+            voice_text = transcribe_audio(normalized)
             service_error = None
         except Exception as e:
             voice_text = ""
@@ -1956,6 +2100,9 @@ def handle_voice_transcription(
 
     # 成功／空白／錯誤都更新；空字串會清空輸入框
     st.session_state[pending_key] = voice_text
+    # 下一輪清掉 audio_input，方便再錄；並標記今次係語音送出（自動播解鎖靠 parent 手勢）
+    st.session_state["_clear_voice_input"] = True
+    st.session_state["_voice_query_unlock"] = True
     if service_error:
         st.session_state[feedback_key] = (
             "error",
@@ -2022,7 +2169,11 @@ st.caption(
     "「我想知道屯門兆康附近星期六下晝三點半有邊啲位泊」）"
     f"· 未指定數量時預設顯示前 {DEFAULT_TOP_N} 名"
 )
-form_col, voice_col = st.columns([6.2, 1], vertical_alignment="bottom")
+# 語音改用 st.audio_input（主頁 DOM）：iPhone 手勢先解鎖得到自動朗讀
+if st.session_state.pop("_clear_voice_input", False):
+    st.session_state.pop("voice_input", None)
+
+form_col, voice_col = st.columns([5.6, 1.6], vertical_alignment="bottom")
 with form_col:
     with st.form("query_form", border=False):
         input_col, submit_col = st.columns([5.2, 1], vertical_alignment="bottom")
@@ -2040,12 +2191,10 @@ with form_col:
                 type="secondary",
             )
 with voice_col:
-    audio = mic_recorder(
-        start_prompt="語音",
-        stop_prompt="停止",
-        just_once=True,
-        use_container_width=True,
-        format="wav",
+    audio = st.audio_input(
+        "語音",
+        sample_rate=16000,
+        label_visibility="collapsed",
         key="voice_input",
     )
 # 只寫 _pending_user_query，唔會喺 widget 建立後改 user_query
@@ -3712,11 +3861,14 @@ def render_iframe_speech_player(spoken: str, *, auto_speak: bool = False) -> Non
   function tryAutoSpeak() {{
     if (uiSpeaking) return;
     var parent = window.parent;
-    // 優先：parent 喺查詢手勢解鎖過嘅 Audio（手機／iOS 自動播）
-    if (audioSrc && parent && typeof parent.__hkParkingPlayUnlockedMedia === "function") {{
+    // 優先：排隊畀 parent keepalive 期間播（語音／iOS 最穩）
+    if (audioSrc && parent && (
+      typeof parent.__hkParkingQueueUnlockedMedia === "function"
+      || typeof parent.__hkParkingPlayUnlockedMedia === "function"
+    )) {{
       var started = false;
       var failed = false;
-      parent.__hkParkingPlayUnlockedMedia(audioSrc, {{
+      var cbs = {{
         onStart: function () {{
           started = true;
           setUi(true);
@@ -3727,9 +3879,14 @@ def render_iframe_speech_player(spoken: str, *, auto_speak: bool = False) -> Non
           if (!started) tryLocalAutoSpeak();
           else setUi(false);
         }}
-      }});
+      }};
+      if (typeof parent.__hkParkingQueueUnlockedMedia === "function") {{
+        parent.__hkParkingQueueUnlockedMedia(audioSrc, cbs);
+      }} else {{
+        parent.__hkParkingPlayUnlockedMedia(audioSrc, cbs);
+      }}
       // MP3 data URI 有時 >500ms 先起播；唔好過早 speakNow() 打掉 parent 音訊
-      [700, 1400, 2200].forEach(function (ms) {{
+      [700, 1400, 2200, 4000].forEach(function (ms) {{
         setTimeout(function () {{
           if (started || failed || uiSpeaking || parentMediaPlaying()) {{
             if (!started && parentMediaPlaying()) {{
@@ -3738,6 +3895,12 @@ def render_iframe_speech_player(spoken: str, *, auto_speak: bool = False) -> Non
             }}
             return;
           }}
+          try {{
+            if (parent.__hkParkingFlushPendingUnlockedMedia) {{
+              parent.__hkParkingFlushPendingUnlockedMedia();
+            }}
+          }} catch (e) {{}}
+          if (started || parentMediaPlaying()) return;
           tryLocalAutoSpeak();
         }}, ms);
       }});
@@ -3748,7 +3911,7 @@ def render_iframe_speech_player(spoken: str, *, auto_speak: bool = False) -> Non
   }}
 
   if (wantAuto) {{
-    setTimeout(tryAutoSpeak, 200);
+    setTimeout(tryAutoSpeak, 50);
   }}
 }})();
 </script>
