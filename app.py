@@ -942,67 +942,18 @@ def inject_layout_css() -> None:
   div[data-testid="stButton"] button[kind="secondary"]:focus {
     box-shadow: none !important;
   }
-  /* 語音：st.audio_input 壓成同「查詢」掣一樣高／圓角／邊框 */
-  [class*="st-key-voice_input"] {
+  /* 語音：st.audio_input 收成接近查詢掣高度 */
+  .st-key-voice_input,
+  div[data-testid="stAudioInput"] {
     width: 100% !important;
   }
-  [class*="st-key-voice_input"] [data-testid="stAudioInput"] {
-    height: 2.5rem !important;
+  .st-key-voice_input [data-testid="stAudioInput"],
+  div[data-testid="stAudioInput"] {
     min-height: 2.5rem !important;
-    max-height: 2.5rem !important;
-    width: 100% !important;
-    overflow: hidden !important;
-    box-sizing: border-box !important;
-    padding: 0 0.35rem !important;
-    margin: 0 !important;
-    border: 1px solid rgba(250, 250, 250, 0.2) !important;
-    border-radius: 0.5rem !important;
-    background-color: #0e1117 !important;
-    display: flex !important;
-    align-items: center !important;
-    justify-content: center !important;
-    gap: 0.25rem !important;
   }
-  [class*="st-key-voice_input"] [data-testid="stAudioInput"]:hover {
-    border-color: #ff4b4b !important;
-  }
-  /* 只留錄音／停止掣；藏起波形、計時、播放、下載、清除（唔好撐高） */
-  [class*="st-key-voice_input"] [data-testid="stAudioInputWaveSurfer"],
-  [class*="st-key-voice_input"] [data-testid="stAudioInputWaveformTimeCode"],
-  [class*="st-key-voice_input"] audio,
-  [class*="st-key-voice_input"] button[aria-label*="Download"],
-  [class*="st-key-voice_input"] button[aria-label*="Clear"],
-  [class*="st-key-voice_input"] button[title*="Download"],
-  [class*="st-key-voice_input"] button[title*="Clear"],
-  [class*="st-key-voice_input"] button[aria-label*="Play"],
-  [class*="st-key-voice_input"] button[aria-label*="Pause"],
-  [class*="st-key-voice_input"] button[title*="Play"],
-  [class*="st-key-voice_input"] button[title*="Pause"] {
-    display: none !important;
-    width: 0 !important;
-    height: 0 !important;
-    margin: 0 !important;
-    padding: 0 !important;
-    overflow: hidden !important;
-  }
-  [class*="st-key-voice_input"] [data-testid="stAudioInput"] button {
-    height: 2.5rem !important;
+  .st-key-voice_input button,
+  div[data-testid="stAudioInput"] button {
     min-height: 2.5rem !important;
-    max-height: 2.5rem !important;
-    margin: 0 !important;
-    padding: 0 0.4rem !important;
-    border: none !important;
-    background: transparent !important;
-    box-shadow: none !important;
-    color: rgba(250, 250, 250, 0.95) !important;
-  }
-  [class*="st-key-voice_input"] [data-testid="stAudioInput"] button:hover,
-  [class*="st-key-voice_input"] [data-testid="stAudioInput"] button:focus-visible {
-    color: #ff4b4b !important;
-  }
-  [class*="st-key-voice_input"] [data-testid="stAudioInput"] svg {
-    width: 1.15rem !important;
-    height: 1.15rem !important;
   }
   /* 隱藏結果區原生 autoplay <audio> 外殼，只保留出聲 */
   .mzd-native-autoplay,
@@ -1821,7 +1772,7 @@ def inject_layout_css() -> None:
 
   function bindAudioInputUnlock() {
     var nodes = doc.querySelectorAll(
-      '[class*="st-key-voice_input"], [data-testid="stAudioInput"], [class*="st-key-voice_input"] button, [data-testid="stAudioInput"] button'
+      '.st-key-voice_input, [data-testid="stAudioInput"], .st-key-voice_input button, [data-testid="stAudioInput"] button'
     );
     nodes.forEach(function (el) {
       if (el.dataset.voiceUnlockBound) return;
@@ -1832,40 +1783,9 @@ def inject_layout_css() -> None:
     });
   }
 
-  function polishVoiceInputChrome() {
-    // 補上「語音」字，外觀贴近查詢掣
-    doc.querySelectorAll('[class*="st-key-voice_input"] [data-testid="stAudioInput"]').forEach(function (wrap) {
-      wrap.querySelectorAll("button").forEach(function (btn) {
-        var label = ((btn.getAttribute("aria-label") || btn.title || btn.textContent || "") + "").toLowerCase();
-        var isRecord = label.indexOf("record") !== -1 || label.indexOf("錄音") !== -1 || label.indexOf("mic") !== -1;
-        var isStop = label.indexOf("stop") !== -1 || label.indexOf("停止") !== -1;
-        if (!isRecord && !isStop) return;
-        if (btn.dataset.mzdVoiceLabel === "1" && btn.querySelector(".mzd-voice-label")) return;
-        btn.dataset.mzdVoiceLabel = "1";
-        btn.style.display = "inline-flex";
-        btn.style.alignItems = "center";
-        btn.style.justifyContent = "center";
-        btn.style.gap = "0.35rem";
-        btn.style.width = "100%";
-        if (!btn.querySelector(".mzd-voice-label")) {
-          var span = doc.createElement("span");
-          span.className = "mzd-voice-label";
-          span.textContent = isStop ? "停止" : "語音";
-          span.style.fontSize = "1rem";
-          span.style.lineHeight = "1";
-          span.style.fontFamily = '"Source Sans Pro", "Segoe UI", sans-serif';
-          btn.appendChild(span);
-        } else {
-          btn.querySelector(".mzd-voice-label").textContent = isStop ? "停止" : "語音";
-        }
-      });
-    });
-  }
-
   function styleMicButtons() {
     // 舊 mic_recorder 已棄用；改綁 st.audio_input（主頁手勢）
     bindAudioInputUnlock();
-    polishVoiceInputChrome();
   }
 
   var MZD_HOVER_RED = "#ff4b4b";
@@ -2250,17 +2170,10 @@ st.caption(
     f"· 未指定數量時預設顯示前 {DEFAULT_TOP_N} 名"
 )
 # 語音改用 st.audio_input（主頁 DOM）：iPhone 手勢先解鎖得到自動朗讀
-# 錄完用 nonce remount，清掉波形播放器，高度先同「查詢」掣一致
-if "_voice_input_nonce" not in st.session_state:
-    st.session_state._voice_input_nonce = 0
 if st.session_state.pop("_clear_voice_input", False):
-    st.session_state._voice_input_nonce = int(st.session_state._voice_input_nonce) + 1
-    for _k in list(st.session_state.keys()):
-        if str(_k) == "voice_input" or str(_k).startswith("voice_input_"):
-            st.session_state.pop(_k, None)
+    st.session_state.pop("voice_input", None)
 
-_voice_key = f"voice_input_{st.session_state._voice_input_nonce}"
-form_col, voice_col = st.columns([6.2, 1], vertical_alignment="bottom")
+form_col, voice_col = st.columns([5.6, 1.6], vertical_alignment="bottom")
 with form_col:
     with st.form("query_form", border=False):
         input_col, submit_col = st.columns([5.2, 1], vertical_alignment="bottom")
@@ -2282,7 +2195,7 @@ with voice_col:
         "語音",
         sample_rate=16000,
         label_visibility="collapsed",
-        key=_voice_key,
+        key="voice_input",
     )
 # 只寫 _pending_user_query，唔會喺 widget 建立後改 user_query
 handle_voice_transcription(
