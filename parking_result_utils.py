@@ -1,0 +1,320 @@
+"""結果表：收費缺漏判斷、地標置頂、收費優先排序、等效 park_id 收費別名。"""
+
+from __future__ import annotations
+
+import math
+import re
+from typing import Callable
+
+import pandas as pd
+
+FEE_MISSING_TOKENS = frozenset(
+    {"", "未提供", "—", "-", "–", "n/a", "na", "none", "null", "nan"}
+)
+
+
+def fee_value_missing(value) -> bool:
+    """收費欄是否視為無資料。"""
+    if value is None:
+        return True
+    try:
+        if pd.isna(value):
+            return True
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip().lower()
+    return text in FEE_MISSING_TOKENS
+
+
+def first_available_fee(values) -> str | None:
+    """由一組收費值取第一個有效者。"""
+    for value in values:
+        if not fee_value_missing(value):
+            return str(value).strip()
+    return None
+
+
+def pin_venue_parks_into_ranking(
+    at_place: pd.DataFrame,
+    nearby_ranked: pd.DataFrame,
+    top_n: int,
+    *,
+    id_col: str = "park_id",
+    vacancy_col: str = "預測空位",
+) -> pd.DataFrame:
+    """把「該場所」車場置頂，再用附近排名補滿至 top_n。"""
+    if top_n <= 0:
+        return nearby_ranked.iloc[0:0].copy() if nearby_ranked is not None else pd.DataFrame()
+    if at_place is None or at_place.empty:
+        return nearby_ranked.copy() if nearby_ranked is not None else pd.DataFrame()
+
+    venue = at_place.copy()
+    if vacancy_col in venue.columns:
+        venue = venue.sort_values(vacancy_col, ascending=False, kind="mergesort")
+    venue = venue.reset_index(drop=True)
+
+    seen = set(venue[id_col].astype(str)) if id_col in venue.columns else set()
+    extras = (
+        nearby_ranked.copy()
+        if nearby_ranked is not None and not nearby_ranked.empty
+        else pd.DataFrame(columns=venue.columns)
+    )
+    if id_col in extras.columns and seen:
+        extras = extras[~extras[id_col].astype(str).isin(seen)]
+
+    # 該場所車場全數保留（通常只有數個）；其餘用附近排名補位
+    # 丟掉舊名次欄，交由呼叫端 add_dense_ranks 重算
+    venue = venue.drop(columns=[""], errors="ignore")
+    extras = extras.drop(columns=[""], errors="ignore")
+    need = max(int(top_n) - len(venue), 0)
+    parts = [venue]
+    if need > 0 and not extras.empty:
+        parts.append(extras.head(need))
+    return pd.concat(parts, ignore_index=True)
+
+
+def order_parks_for_fee_display(
+    parks_df: pd.DataFrame,
+    *,
+    at_place_ids: set[str] | None = None,
+    id_col: str = "park_id",
+    fee_col: str = "收費",
+) -> pd.DataFrame:
+    """收費問句／地標：該場所有費 → 該場無費 → 其他有費 → 其他無費。"""
+    if parks_df is None or parks_df.empty or fee_col not in parks_df.columns:
+        return parks_df.copy() if parks_df is not None else pd.DataFrame()
+
+    work = parks_df.copy().reset_index(drop=True)
+    has_fee = ~work[fee_col].map(fee_value_missing)
+    if at_place_ids and id_col in work.columns:
+        at_mask = work[id_col].astype(str).isin({str(x) for x in at_place_ids})
+        parts = [
+            work[at_mask & has_fee],
+            work[at_mask & ~has_fee],
+            work[~at_mask & has_fee],
+            work[~at_mask & ~has_fee],
+        ]
+    else:
+        parts = [work[has_fee], work[~has_fee]]
+    return pd.concat(parts, ignore_index=True)
+
+
+def build_fee_park_id_aliases(
+    parks_df: pd.DataFrame,
+    fee_ids: set[str] | frozenset[str],
+    *,
+    max_distance_km: float,
+    normalize_name: Callable[[str], str],
+    haversine_km: Callable[[float, float, float, float], float] | None = None,
+    id_col: str = "park_id",
+    name_col: str = "name",
+    lat_col: str = "latitude",
+    lon_col: str = "longitude",
+) -> dict[str, str]:
+    """
+    將無收費規則嘅 park_id 映射到名稱＋距離等效、且有收費規則嘅 id。
+    有收費嘅 id 映射到自己。
+    """
+    fee_ids = {str(x) for x in fee_ids}
+    aliases = {fid: fid for fid in fee_ids}
+    if parks_df is None or parks_df.empty or not fee_ids:
+        return aliases
+
+    work = parks_df.dropna(subset=[lat_col, lon_col]).copy()
+    if work.empty:
+        return aliases
+    work[id_col] = work[id_col].astype(str)
+    work["_norm"] = work[name_col].map(normalize_name)
+
+    fee_rows = work[work[id_col].isin(fee_ids)]
+    if fee_rows.empty:
+        return aliases
+
+    def _dist(lat1, lon1, lat2, lon2) -> float:
+        if haversine_km is not None:
+            return float(haversine_km(lat1, lon1, lat2, lon2))
+        return _haversine_km_fallback(lat1, lon1, lat2, lon2)
+
+    for _, row in work.iterrows():
+        pid = str(row[id_col])
+        if pid in fee_ids:
+            continue
+        norm = row["_norm"]
+        if not norm:
+            continue
+        lat1, lon1 = float(row[lat_col]), float(row[lon_col])
+        best_id = None
+        best_key = None
+        for _, fee_row in fee_rows.iterrows():
+            if fee_row["_norm"] != norm:
+                continue
+            dist = _dist(lat1, lon1, float(fee_row[lat_col]), float(fee_row[lon_col]))
+            if dist > max_distance_km:
+                continue
+            fid = str(fee_row[id_col])
+            # 偏好純數字 id
+            key = (0 if fid.isdigit() else 1, dist, fid)
+            if best_key is None or key < best_key:
+                best_key = key
+                best_id = fid
+        if best_id:
+            aliases[pid] = best_id
+    return aliases
+
+
+def _haversine_km_fallback(
+    lat1: float, lon1: float, lat2: float, lon2: float
+) -> float:
+    radius = 6371.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * radius * math.asin(math.sqrt(a))
+
+
+def normalize_park_name_basic(name: str) -> str:
+    """同 app._normalize_park_name 對齊嘅基本正規化（測試／別名用）。"""
+    s = (name or "").strip().lower()
+    s = re.sub(r"[\s\-_/·．.]+", "", s)
+    s = s.replace("停車場", "").replace("車場", "")
+    s = re.sub(r"parking|carpark", "", s, flags=re.I)
+    return s
+
+
+def park_name_matches_place_tokens(
+    park_name: str,
+    tokens: list[str] | tuple[str, ...],
+    *,
+    normalize_name: Callable[[str], str] | None = None,
+) -> bool:
+    """車場名稱是否命中地點 token（名稱／別名匹配；唔靠距離）。"""
+    norm_fn = normalize_name or normalize_park_name_basic
+    name_l = (park_name or "").lower()
+    name_n = norm_fn(park_name or "")
+    for token in tokens:
+        t = (token or "").strip().lower()
+        if len(t) < 2:
+            continue
+        if t in name_l or t in name_n:
+            return True
+    return False
+
+
+def coerce_park_id(value) -> str:
+    """統一 park_id 為字串，避免 int／str key 對唔上。"""
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return str(value).strip()
+
+
+def merge_baseline_packs(
+    primary: tuple,
+    extra: tuple,
+) -> tuple:
+    """合併兩套 baseline dict（後者補前者缺 key；適用 parquet 缺部分 park）。"""
+    if not extra or not any(extra):
+        return primary
+    if not primary or not any(primary):
+        return extra
+    merged = []
+    for left, right in zip(primary, extra):
+        out = dict(left or {})
+        out.update(right or {})
+        merged.append(out)
+    return tuple(merged)
+
+
+def parks_present_in_baselines(packed: tuple) -> set[str]:
+    """由 baseline pack 抽出已有資料嘅 park_id。"""
+    have: set[str] = set()
+    if not packed:
+        return have
+    by_slot_dow, by_slot_weekend, by_slot, by_park = packed[:4]
+    have.update(str(k) for k in (by_park or {}))
+    for key in by_slot_dow or {}:
+        have.add(str(key[0]))
+    for key in by_slot_weekend or {}:
+        have.add(str(key[0]))
+    for key in by_slot or {}:
+        have.add(str(key[0]))
+    return have
+
+
+def build_equivalent_park_id_map(
+    parks_df: pd.DataFrame,
+    *,
+    max_distance_km: float,
+    normalize_name: Callable[[str], str],
+    haversine_km: Callable[[float, float, float, float], float] | None = None,
+    id_col: str = "park_id",
+    name_col: str = "name",
+    lat_col: str = "latitude",
+    lon_col: str = "longitude",
+) -> dict[str, tuple[str, ...]]:
+    """
+    名稱＋距離等效車場：park_id -> 其他等效 id（唔包自己）。
+    用於 baseline／收費互相借資料（運輸署雙編號）。
+    """
+    if parks_df is None or parks_df.empty:
+        return {}
+    work = parks_df.dropna(subset=[lat_col, lon_col]).copy()
+    if work.empty:
+        return {}
+    work = work.reset_index(drop=True)
+    work[id_col] = work[id_col].map(coerce_park_id)
+    work["_norm"] = work[name_col].map(normalize_name)
+    n = len(work)
+    parent = list(range(n))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i: int, j: int) -> None:
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[rj] = ri
+
+    def _dist(lat1, lon1, lat2, lon2) -> float:
+        if haversine_km is not None:
+            return float(haversine_km(lat1, lon1, lat2, lon2))
+        return _haversine_km_fallback(lat1, lon1, lat2, lon2)
+
+    lats = work[lat_col].astype(float).tolist()
+    lons = work[lon_col].astype(float).tolist()
+    norms = work["_norm"].tolist()
+    for i in range(n):
+        if not norms[i]:
+            continue
+        for j in range(i + 1, n):
+            if norms[i] != norms[j]:
+                continue
+            if _dist(lats[i], lons[i], lats[j], lons[j]) <= max_distance_km:
+                union(i, j)
+
+    clusters: dict[int, list[str]] = {}
+    ids = work[id_col].tolist()
+    for i in range(n):
+        clusters.setdefault(find(i), []).append(ids[i])
+
+    out: dict[str, tuple[str, ...]] = {}
+    for members in clusters.values():
+        uniq = []
+        seen = set()
+        for pid in members:
+            if pid and pid not in seen:
+                seen.add(pid)
+                uniq.append(pid)
+        if len(uniq) < 2:
+            continue
+        for pid in uniq:
+            out[pid] = tuple(x for x in uniq if x != pid)
+    return out

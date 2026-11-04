@@ -28,6 +28,17 @@ from parking_db import (
     load_carparks_frame,
     load_vacancy_frame,
 )
+from parking_result_utils import (
+    build_equivalent_park_id_map,
+    build_fee_park_id_aliases,
+    coerce_park_id,
+    first_available_fee,
+    merge_baseline_packs,
+    order_parks_for_fee_display,
+    park_name_matches_place_tokens,
+    parks_present_in_baselines,
+    pin_venue_parks_into_ranking,
+)
 
 WEEKDAY_CN = {0: "週一", 1: "週二", 2: "週三", 3: "週四", 4: "週五", 5: "週六", 6: "週日"}
 WEEKDAY_SHORT = {0: "一", 1: "二", 2: "三", 3: "四", 4: "五", 5: "六", 6: "日"}
@@ -111,6 +122,10 @@ PLACE_NAME_ALIASES = {
     "harbourcity": ("harbourcity", "海港城"),
     "pacificplace": ("pacificplace", "太古廣場"),
     "hysan": ("hysan", "希慎"),
+    "telford": ("telford", "德福"),
+    "telfordplaza": ("telford", "德福"),
+    "德福": ("德福", "telford"),
+    "德福廣場": ("德福", "telford"),
 }
 # 廣域地區名：即使用「容唔容易泊」亦較似問成區，保持附近排名（唔當單一場所）
 MAJOR_AREA_PLACE_LABELS = frozenset(
@@ -1938,6 +1953,8 @@ def load_carparks_meta() -> pd.DataFrame:
     df = load_carparks_frame()
     if df.empty:
         return df
+    # 一律字串：避免 31（int）同 baseline key「31」對唔上而整場被 skip
+    df["park_id"] = df["park_id"].astype(str)
     df["sub_district"] = df["google_area"].fillna(df["district"])
     return df
 
@@ -1951,6 +1968,7 @@ def load_data(park_ids: tuple[str, ...] | None = None) -> pd.DataFrame:
     df = load_vacancy_frame(park_ids=list(park_ids) if park_ids else None)
     if df.empty:
         return df
+    df["park_id"] = df["park_id"].astype(str)
     df["collected_at"] = pd.to_datetime(df["collected_at"])
     # 半小時槽位：0=12:00am … 30=3:00pm、31=3:30pm … 47=11:30pm
     df["half_hour"] = (
@@ -1980,6 +1998,7 @@ def build_park_baselines(
     valid = df[df["vacancy"] >= 0].copy()
     if valid.empty:
         return empty
+    valid["park_id"] = valid["park_id"].astype(str)
     valid["is_weekend"] = (valid["dow"] >= 5).astype(int)
 
     def _maps(keys: list[str]) -> tuple[dict, dict]:
@@ -2008,16 +2027,59 @@ def build_park_baselines(
 @st.cache_data(ttl=600, show_spinner="")
 def load_park_baselines(
     park_ids: tuple[str, ...] | None = None,
+    _cache_ver: str = "v4-equiv-baselines",
 ) -> tuple[dict, dict, dict, dict, dict, dict, dict, dict]:
     """
     載入歷史 baseline（方案 1：優先摘要表／本地 parquet；
     若無則退回由 vacancy_records 即時聚合）。
+
+    重要：parquet／摘要表可能只有 tdc* id、冇政府數字 id。
+    對缺失嘅 park_id 會再用 vacancy_records 補建，避免成批有收費／地標場被 skip。
+
+    附近查詢會先 dedupe 雙編號，可能淨留政府數字 id；呢度會一併載入
+    等效 tdc* 基準，避免預測跌去「即時空位」而令唔同日子／時段睇落冇變化。
     """
-    df = load_baselines_dataframe(park_ids=list(park_ids) if park_ids else None)
+    id_list = [coerce_park_id(p) for p in park_ids] if park_ids is not None else None
+    id_list = [p for p in id_list if p] if id_list is not None else None
+    if id_list is not None:
+        eq_map = load_equivalent_park_ids()
+        expanded: list[str] = []
+        seen: set[str] = set()
+        for pid in id_list:
+            for cand in (pid, *eq_map.get(pid, ())):
+                c = coerce_park_id(cand)
+                if c and c not in seen:
+                    seen.add(c)
+                    expanded.append(c)
+        id_list = expanded
+    df = load_baselines_dataframe(park_ids=id_list)
     packed = baselines_frame_to_maps(df)
+    if id_list is not None:
+        have = parks_present_in_baselines(packed)
+        missing = [p for p in id_list if p not in have]
+        if missing:
+            extra = build_park_baselines(
+                load_data(tuple(sorted(set(missing))))
+            )
+            packed = merge_baseline_packs(packed, extra)
+        return packed
     if any(packed):
         return packed
     return build_park_baselines(load_data(park_ids))
+
+
+@st.cache_data(ttl=6 * 3600)
+def load_equivalent_park_ids() -> dict[str, tuple[str, ...]]:
+    """等效車場 id（運輸署雙編號）：借 baseline／收費時用。"""
+    meta = load_carparks_meta()[
+        ["park_id", "name", "latitude", "longitude"]
+    ].drop_duplicates(subset=["park_id"])
+    return build_equivalent_park_id_map(
+        meta,
+        max_distance_km=EQUIVALENT_CARPARK_MAX_KM,
+        normalize_name=_normalize_park_name,
+        haversine_km=_haversine_km,
+    )
 
 
 def _shrink_mean(
@@ -2038,17 +2100,13 @@ def _shrink_mean(
     return float(w * primary + (1.0 - w) * prior)
 
 
-def predict_park_vacancy_baseline(
-    park_id,
+def _predict_park_vacancy_for_id(
+    park_id: str,
     half_hour: int,
     dow: int,
-    baselines: tuple | None = None,
+    packed: tuple,
 ) -> tuple[float | None, dict]:
-    """
-    Per-park baseline（含 shrinkage）：優先同車場＋半小時＋星期，
-    向平日／週末／同時段均值收斂。回傳 (預測值, 元資料)。
-    """
-    packed = baselines or load_park_baselines()
+    """單一 park_id 嘅 baseline 預測（唔做等效回退）。"""
     (
         by_slot_dow,
         by_slot_weekend,
@@ -2107,6 +2165,65 @@ def predict_park_vacancy_baseline(
         "mean_dow": None if mean_dow is None else float(mean_dow),
         "mean_weekend_group": None if mean_we is None else float(mean_we),
     }
+
+
+def predict_park_vacancy_baseline(
+    park_id,
+    half_hour: int,
+    dow: int,
+    baselines: tuple | None = None,
+) -> tuple[float | None, dict]:
+    """
+    Per-park baseline（含 shrinkage）：優先同車場＋半小時＋星期，
+    向平日／週末／同時段均值收斂。回傳 (預測值, 元資料)。
+
+    通用後備（適用全部車場，唔限單一商場）：
+    1) 本 id 歷史基準
+    2) 名稱＋距離等效雙編號嘅歷史基準
+    3) 政府即時空位（歷史摘要缺數字 id 時仍可上榜同顯示收費）
+    """
+    packed = baselines or load_park_baselines()
+    park_id = coerce_park_id(park_id)
+    if not park_id:
+        return None, {"source": "無資料", "n": 0, "confidence": "低"}
+
+    candidates = [park_id]
+    for alt in load_equivalent_park_ids().get(park_id, ()):
+        alt = coerce_park_id(alt)
+        if alt and alt not in candidates:
+            candidates.append(alt)
+
+    for pid in candidates:
+        pred, meta = _predict_park_vacancy_for_id(pid, half_hour, dow, packed)
+        if pred is None:
+            continue
+        if pid != park_id:
+            meta = dict(meta)
+            meta["source"] = f"{meta.get('source', '')}（等效資料）".strip()
+            meta["equivalent_park_id"] = pid
+        return pred, meta
+
+    # 歷史基準完全無：用即時空位頂住（多數有收費規則嘅政府數字 id 屬此情況）
+    live_map = load_live_private_car_vacancies()
+    for pid in candidates:
+        live = live_map.get(pid)
+        if not live:
+            continue
+        try:
+            vac = float(live.get("vacancy"))
+        except (TypeError, ValueError):
+            continue
+        if vac < 0:
+            continue
+        return vac, {
+            "source": "即時空位（無歷史基準）",
+            "n": 1,
+            "confidence": "低",
+            "mean_dow": None,
+            "mean_weekend_group": None,
+            "equivalent_park_id": None if pid == park_id else pid,
+        }
+    return None, {"source": "無資料", "n": 0, "confidence": "低"}
 
 
 @st.cache_data(ttl=120, show_spinner="")
@@ -2187,6 +2304,24 @@ def load_carpark_fee_rules() -> dict[str, dict]:
     return out
 
 
+@st.cache_data(ttl=6 * 3600)
+def load_fee_park_id_aliases() -> dict[str, str]:
+    """無收費規則嘅 park_id → 等效且有規則嘅 id（解決運輸署雙 id）。"""
+    fee_map = load_carpark_fee_rules()
+    if not fee_map:
+        return {}
+    meta = load_carparks_meta()[
+        ["park_id", "name", "latitude", "longitude"]
+    ].drop_duplicates(subset=["park_id"])
+    return build_fee_park_id_aliases(
+        meta,
+        set(fee_map.keys()),
+        max_distance_km=EQUIVALENT_CARPARK_MAX_KM,
+        normalize_name=_normalize_park_name,
+        haversine_km=_haversine_km,
+    )
+
+
 def _minutes_from_hhmm(value: str | None) -> int | None:
     """將 '08:00'／'24:00' 轉成分鐘數（0–1440）。"""
     if not value or not isinstance(value, str):
@@ -2256,10 +2391,15 @@ def format_carpark_fee(
 ) -> str:
     """
     依查詢星期／時間，取出適用時租（無則日夜泊套餐；再無則 —）。
+    若 park_id 本身無規則，會試等效 id（運輸署雙編號）。
     """
-    rules = (fee_map if fee_map is not None else load_carpark_fee_rules()).get(
-        str(park_id)
-    )
+    fee_map = fee_map if fee_map is not None else load_carpark_fee_rules()
+    pid = str(park_id)
+    rules = fee_map.get(pid)
+    if not rules:
+        alias = load_fee_park_id_aliases().get(pid)
+        if alias and alias != pid:
+            rules = fee_map.get(alias)
     if not rules:
         return "未提供"
 
@@ -2377,13 +2517,20 @@ def dedupe_equivalent_carparks(
             best = group.sort_values(
                 prefer_higher_col, ascending=False, kind="mergesort"
             ).iloc[0]
-            keep_indices.append(int(best.name))
+            winner_idx = int(best.name)
         else:
-            best_idx = min(
+            winner_idx = min(
                 members,
                 key=lambda idx: _prefer_canonical_park_id(work.iloc[idx][id_col]),
             )
-            keep_indices.append(best_idx)
+        # 去重後仍保留叢集內任一有效收費（避免 tdc 分身蓋過有規則嘅 id）
+        if "收費" in work.columns:
+            merged_fee = first_available_fee(
+                work.loc[members, "收費"].tolist()
+            )
+            if merged_fee is not None:
+                work.at[winner_idx, "收費"] = merged_fee
+        keep_indices.append(winner_idx)
 
     out = work.iloc[sorted(keep_indices)].drop(columns=["_norm_name"])
     return out.reset_index(drop=True)
@@ -2919,22 +3066,56 @@ def _suggestion_rank_groups(
     result_df: pd.DataFrame,
 ) -> list[tuple[str, list[str], int]]:
     """最多前三名（含同分）→ [(名次, 名稱列表, 預測空位), ...]。"""
-    if result_df.empty:
+    if result_df is None or result_df.empty:
         return []
+    work = result_df
     rank_col = ""
-    unique_ranks = list(dict.fromkeys(result_df[rank_col].tolist()))
+    # 地標置頂後可能未有／弄亂名次欄 → 自動補密集聚名，避免 iloc 爆
+    if rank_col not in work.columns or work[rank_col].isna().all():
+        if "預測空位" not in work.columns:
+            return []
+        work = add_dense_ranks(
+            work.drop(columns=[rank_col], errors="ignore").copy()
+        )
+    unique_ranks: list = []
+    for rank in work[rank_col].tolist():
+        if rank is None or (isinstance(rank, float) and pd.isna(rank)):
+            continue
+        if str(rank).strip() == "":
+            continue
+        if rank not in unique_ranks:
+            unique_ranks.append(rank)
     selected_ranks = unique_ranks[:3]
     groups: list[tuple[str, list[str], int]] = []
     for rank in selected_ranks:
-        group = result_df[result_df[rank_col] == rank]
+        group = work[work[rank_col] == rank]
+        if group.empty or "名稱" not in group.columns or "預測空位" not in group.columns:
+            continue
         names = [str(n) for n in group["名稱"].tolist()]
-        vacancy = int(group.iloc[0]["預測空位"])
-        groups.append((rank, names, vacancy))
+        if not names:
+            continue
+        try:
+            vacancy = int(group.iloc[0]["預測空位"])
+        except (TypeError, ValueError, IndexError):
+            continue
+        groups.append((str(rank), names, vacancy))
     return groups
 
 
+def _hour_spoken_yue_12(hour_12: int) -> str:
+    """12 小時制鐘點 → 粵語口語（2 用「兩」唔用「二」）。"""
+    h = int(hour_12)
+    if h == 12:
+        return "十二"
+    if h == 11:
+        return "十一"
+    if h == 10:
+        return "十"
+    return NUM_CN.get(h, str(h))
+
+
 def format_time_spoken_yue(hour: int, minute: int = 0) -> str:
-    """口語時間，例如 14:30 → 下晝2點半。"""
+    """口語時間，例如 14:30 → 下晝兩點半。"""
     hour, minute = normalize_half_hour(hour, minute)
     if hour < 6:
         period = "凌晨"
@@ -2947,9 +3128,10 @@ def format_time_spoken_yue(hour: int, minute: int = 0) -> str:
     else:
         period = "夜晚"
     h12 = hour % 12 or 12
+    h_spoken = _hour_spoken_yue_12(h12)
     if minute == 0:
-        return f"{period}{h12}點"
-    return f"{period}{h12}點半"
+        return f"{period}{h_spoken}點"
+    return f"{period}{h_spoken}點半"
 
 
 def _join_names_spoken_yue(names: list[str]) -> str:
@@ -4483,13 +4665,17 @@ def looks_like_place_ease_query(query: str) -> bool:
     q = re.sub(r"\s+", "", query or "")
     if not q:
         return False
-    # 明確問「邊度／邊啲／推薦」→ 附近排名
-    if re.search(r"邊[度啲個]|哪[裡里些個]|推薦|建議邊", q):
+    # 「附近／邊度／邊啲／推薦」→ 附近排名（唔當單一場所）
+    if re.search(r"附近|邊[度啲個]|哪[裡里些個]|推薦|建議邊", q):
         return False
     ease_hints = (
         "容唔容易",
         "容不容易",
         "容不容易泊",
+        "用唔容易",  # 語音／打字常誤「容」→「用」
+        "用不容易",
+        "容易唔容易",
+        "容易不容易",
         "易唔易",
         "好唔好泊",
         "好不好泊",
@@ -4605,13 +4791,15 @@ def extract_place_mention_from_query(query: str) -> str | None:
         " ",
         cut,
     )
-    # 去掉「容唔容易泊…」等意圖尾巴
+    # 去掉「容唔容易泊…／收費如何」等意圖尾巴
     cut = re.sub(
-        r"(容唔容易|容不容易|易唔易|好唔好泊|好不好泊|難唔難泊|难不难泊|"
+        r"(容唔容易|容不容易|用唔容易|用不容易|容易唔容易|容易不容易|易唔易|"
+        r"好唔好泊|好不好泊|難唔難泊|难不难泊|"
         r"好泊唔好|易泊唔易|泊唔泊到|得唔得泊|有冇位|有沒有位|有没有位|"
         r"夠唔夠位|够不够位|車位夠唔夠|车位够不够|鬆唔鬆|是否容易泊|"
         r"容易嗎|容易吗|會唔會冇位|会不会没位|"
         r"附近|邊[度啲個]|哪[裡里些個]|比較易|較易泊|好泊|難泊|"
+        r"收費|价钱|價錢|價格|几钱|幾錢|多少錢|幾多錢|如何|怎麼樣|怎么样|"
         r"停車場|泊車|停車|車位|空位|parking).*$",
         " ",
         cut,
@@ -4631,6 +4819,14 @@ def resolve_place_ease_label(query: str, district: str) -> str | None:
     """
     if not looks_like_place_ease_query(query):
         return None
+    return resolve_venue_focus_label(query, district)
+
+
+def resolve_venue_focus_label(query: str, district: str) -> str | None:
+    """具體商場／邨／地標（非廣域）→ 結果應優先顯示該場所車場。
+
+    適用「德福廣場」「德福廣場今晚收費如何」等；廣域如觀塘／天水圍回傳 None。
+    """
     for candidate in (
         extract_place_mention_from_query(query),
         str(district or "").strip() or None,
@@ -4657,10 +4853,12 @@ def filter_parks_at_queried_place(
     place: str,
     *,
     max_km: float = PLACE_AT_VENUE_KM,
+    name_match_required: bool = False,
 ) -> pd.DataFrame:
     """只保留「該場所」車場：名稱吻合，或距離極近（喺地點範圍內）。
 
     對所有具體地點一視同仁（唔限 YOHO）；別名表只係輔助。
+    name_match_required=True：只用名稱／別名（附近排名置頂時避免把隔壁邨當該商場）。
     """
     if df is None or df.empty:
         return df.iloc[0:0].copy() if df is not None else pd.DataFrame()
@@ -4668,13 +4866,17 @@ def filter_parks_at_queried_place(
     name_col = "名稱" if "名稱" in df.columns else ("name" if "name" in df.columns else None)
     dist_col = "距離(公里)" if "距離(公里)" in df.columns else None
 
-    def _at_place(row) -> bool:
+    def _name_hit(row) -> bool:
         name = str(row[name_col]) if name_col else ""
-        name_l = name.lower()
-        name_n = _normalize_park_name(name)
-        for t in tokens:
-            if t in name_l or t in name_n:
-                return True
+        return park_name_matches_place_tokens(
+            name, tokens, normalize_name=_normalize_park_name
+        )
+
+    def _at_place(row) -> bool:
+        if _name_hit(row):
+            return True
+        if name_match_required:
+            return False
         if dist_col is not None:
             try:
                 d = float(row[dist_col])
@@ -5444,6 +5646,20 @@ def run_parking_info_answer(intent: dict, query_text: str) -> None:
             fee_slot_label = f"現在 {format_time_ampm(hour, minute)}"
         else:
             fee_slot_label = f"{day_cn} {format_time_12h(hour, minute)}"
+        # 地標置頂；問收費時把有規則嘅車場排前，避免成表「未提供」
+        venue_label = resolve_venue_focus_label(query_text, str(district or ""))
+        at_ids: set[str] | None = None
+        if venue_label:
+            at_place = filter_parks_at_queried_place(
+                parks_df, venue_label, name_match_required=True
+            )
+            if not at_place.empty and "park_id" in at_place.columns:
+                at_ids = set(at_place["park_id"].astype(str))
+        if wants_fee or at_ids:
+            parks_df = order_parks_for_fee_display(
+                parks_df,
+                at_place_ids=at_ids,
+            )
 
     if match_type == "nearby" and parks_df.empty:
         intent_for_summary = dict(intent)
@@ -5641,16 +5857,26 @@ def run_vacancy_prediction(intent: dict, query_text: str):
         return
 
     fee_map = load_carpark_fee_rules()
+    # 確保 index／欄位一律字串 id，避免數字 id 整場消失
+    if "park_id" in park_info.columns:
+        park_info = park_info.copy()
+        park_info["park_id"] = park_info["park_id"].map(coerce_park_id)
+        park_info = park_info.set_index("park_id", drop=False)
     results = []
     for park_id in park_info.index:
+        park_id = coerce_park_id(park_id)
+        if not park_id:
+            continue
         pred, meta = predict_park_vacancy_baseline(
             park_id, half_hour, dow_num, baselines
         )
         if pred is None:
             continue
         info = park_info.loc[park_id]
+        if isinstance(info, pd.DataFrame):
+            info = info.iloc[0]
         row = {
-            "park_id": str(park_id),
+            "park_id": park_id,
             "name": info["name"],
             "latitude": info.get("latitude"),
             "longitude": info.get("longitude"),
@@ -5662,9 +5888,8 @@ def run_vacancy_prediction(intent: dict, query_text: str):
             "樣本數": meta.get("n", 0),
             "依據": meta.get("source", ""),
         }
-        pid_key = str(park_id)
-        if match_type == "nearby" and pid_key in dist_map:
-            row["距離(公里)"] = round(dist_map[pid_key], 1)
+        if match_type == "nearby" and park_id in dist_map:
+            row["距離(公里)"] = round(dist_map[park_id], 1)
         results.append(row)
 
     pred_df = pd.DataFrame(results)
@@ -5681,7 +5906,11 @@ def run_vacancy_prediction(intent: dict, query_text: str):
     place_ease = match_type == "nearby" and place_label is not None
 
     if place_ease:
-        at_place = filter_parks_at_queried_place(pred_df, place_label)
+        # 一律以名稱／別名認場（適用所有商場／邨／地標）；
+        # 唔用距離，避免密集積偶把隔壁邨誤當「該場所」。
+        at_place = filter_parks_at_queried_place(
+            pred_df, place_label, name_match_required=True
+        )
         if not at_place.empty:
             # 該場所全部車場（按空位）；唔再攤開附近其他場
             result_df = select_top_with_ties(
@@ -5691,21 +5920,45 @@ def run_vacancy_prediction(intent: dict, query_text: str):
             top_n = len(result_df)
             top_n_default = False
         else:
-            # 搵唔到該場所車場 → 維持附近排名，避免空白
-            result_df = select_top_nearby_with_ties(pred_df, top_n)
+            # 名稱對唔上（資料缺該場名）→ 附近排名＋地標置頂（同樣只靠名稱）
+            nearby_ranked = select_top_nearby_with_ties(pred_df, top_n)
+            pinned = filter_parks_at_queried_place(
+                pred_df, place_label, name_match_required=True
+            )
+            result_df = pin_venue_parks_into_ranking(
+                pinned, nearby_ranked, top_n
+            )
             district_label = f"{place_label}附近"
             place_ease = False
     elif match_type == "nearby":
-        result_df = select_top_nearby_with_ties(pred_df, top_n)
         # 顯示優先用用戶原地名，其次 Google 地址
         display_place = (
             str(district or "").strip()
             or (geo_label or "").strip()
             or district_label
         )
+        nearby_ranked = select_top_nearby_with_ties(pred_df, top_n)
+        # 「德福廣場」等具體地標：該場所車場置頂，再補附近較易泊
+        venue_label = resolve_venue_focus_label(query_text, str(district or ""))
+        if venue_label:
+            at_place = filter_parks_at_queried_place(
+                pred_df, venue_label, name_match_required=True
+            )
+            result_df = pin_venue_parks_into_ranking(
+                at_place, nearby_ranked, top_n
+            )
+        else:
+            result_df = nearby_ranked
         district_label = f"{display_place}附近"
     else:
         result_df = select_top_with_ties(pred_df, top_n)
+
+    # 置頂／合併後重算名次（避免名次欄 NaN → 建議文案 IndexError）
+    if not result_df.empty and "預測空位" in result_df.columns:
+        result_df = add_dense_ranks(
+            result_df.drop(columns=[""], errors="ignore")
+        )
+
     # 欄位順序：排名、名稱、地區、（距離）、收費、預測空位；（隱藏）信心／座標／內部欄
     preferred = ["", "名稱", "地區", "距離(公里)", "收費", "預測空位"]
     ordered = [c for c in preferred if c in result_df.columns]

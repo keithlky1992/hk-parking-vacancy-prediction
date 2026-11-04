@@ -508,8 +508,11 @@ def load_baselines_dataframe(
 
     if BASELINES_PARQUET.exists():
         df = pd.read_parquet(BASELINES_PARQUET)
-        if id_list is not None:
-            df = df[df["park_id"].astype(str).isin(id_list)]
+        if not df.empty and "park_id" in df.columns:
+            df = df.copy()
+            df["park_id"] = df["park_id"].astype(str)
+        if id_list is not None and not df.empty:
+            df = df[df["park_id"].isin(id_list)]
         if not df.empty:
             return df.reset_index(drop=True)
 
