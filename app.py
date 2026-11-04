@@ -942,7 +942,8 @@ def inject_layout_css() -> None:
   div[data-testid="stButton"] button[kind="secondary"]:focus {
     box-shadow: none !important;
   }
-  /* 語音：st.audio_input 高度同查詢掣 */
+  /* 語音：st.audio_input 高度同查詢掣。
+     Streamlit 真正撐高嘅係內層 emotion div（預設 height: 4.25rem），唔係外層 testid。 */
   .st-key-voice_input,
   div[data-testid="stAudioInput"] {
     width: 100% !important;
@@ -950,6 +951,11 @@ def inject_layout_css() -> None:
   .st-key-voice_input [data-testid="stAudioInput"],
   div[data-testid="stAudioInput"] {
     height: 2.5rem !important;
+  }
+  .st-key-voice_input [data-testid="stAudioInput"] > div,
+  div[data-testid="stAudioInput"] > div {
+    height: 2.5rem !important;
+    max-height: 2.5rem !important;
   }
   .st-key-voice_input button,
   div[data-testid="stAudioInput"] button {
