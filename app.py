@@ -942,18 +942,24 @@ def inject_layout_css() -> None:
   div[data-testid="stButton"] button[kind="secondary"]:focus {
     box-shadow: none !important;
   }
-  /* 語音：st.audio_input 收成接近查詢掣高度 */
+  /* 語音：只統一高度（2.5rem＝查詢掣），其他樣式唔改 */
   .st-key-voice_input,
   div[data-testid="stAudioInput"] {
     width: 100% !important;
   }
   .st-key-voice_input [data-testid="stAudioInput"],
   div[data-testid="stAudioInput"] {
+    height: 2.5rem !important;
     min-height: 2.5rem !important;
+    max-height: 2.5rem !important;
+    box-sizing: border-box !important;
+    overflow: hidden !important;
   }
   .st-key-voice_input button,
   div[data-testid="stAudioInput"] button {
+    height: 2.5rem !important;
     min-height: 2.5rem !important;
+    max-height: 2.5rem !important;
   }
   /* 隱藏結果區原生 autoplay <audio> 外殼，只保留出聲 */
   .mzd-native-autoplay,
