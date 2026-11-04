@@ -1206,7 +1206,8 @@ def inject_layout_css() -> None:
   }
   root.__hkParkingSetSpeechSpeakingUi = setSpeechSpeakingUi;
 
-  // 極短靜音 WAV：喺「查詢／語音」手勢內 play 一次，之後結果頁可用同一 Audio 自動播（iOS／手機）
+  // 極短靜音 WAV：喺「查詢／語音」手勢內 play，之後結果頁可用同一 Audio／AudioContext 自動播（iOS／手機）
+  // 注意：解鎖後唔好立刻 pause；iOS 會當自動播放權限失效，結果頁就變要人手撳「播放」
   var SILENT_WAV = "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQQAAAAAAA==";
 
   function ensureUnlockedMediaAudio() {
@@ -1220,9 +1221,36 @@ def inject_layout_css() -> None:
     return root.__hkParkingMediaAudio;
   }
 
+  function ensureAudioContext() {
+    var AC = root.AudioContext || root.webkitAudioContext;
+    if (!AC) return null;
+    try {
+      if (!root.__hkParkingAudioCtx || root.__hkParkingAudioCtx.state === "closed") {
+        root.__hkParkingAudioCtx = new AC();
+      }
+      return root.__hkParkingAudioCtx;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function stopAudioContextSource() {
+    var srcNode = root.__hkParkingAudioCtxSource;
+    root.__hkParkingAudioCtxSource = null;
+    if (!srcNode) return;
+    try { srcNode.onended = null; } catch (e) {}
+    try { srcNode.stop(); } catch (e) {}
+    try { srcNode.disconnect(); } catch (e) {}
+  }
+
   function stopUnlockedMedia() {
+    root.__hkParkingMediaPlayPending = false;
+    root.__hkParkingAudioCtxPlayGen = (root.__hkParkingAudioCtxPlayGen || 0) + 1;
+    stopAudioContextSource();
+    root.__hkParkingMediaKeepalive = false;
     var a = root.__hkParkingMediaAudio;
     if (!a) return;
+    try { a.loop = false; } catch (e) {}
     try { a.pause(); } catch (e) {}
     try { a.currentTime = 0; } catch (e) {}
     a.onended = null;
@@ -1231,26 +1259,164 @@ def inject_layout_css() -> None:
 
   function unlockMediaNow() {
     speech.unlock();
+    // 1) Web Audio：手勢內 resume，之後解碼 MP3 再播，iOS 延遲自動播較穩
+    try {
+      var ctx = ensureAudioContext();
+      if (ctx) {
+        var warm = function () {
+          try {
+            var buf = ctx.createBuffer(1, 1, 22050);
+            var node = ctx.createBufferSource();
+            node.buffer = buf;
+            node.connect(ctx.destination);
+            node.start(0);
+            root.__hkParkingAudioCtxUnlocked = true;
+          } catch (e) {}
+        };
+        if (ctx.state === "suspended") {
+          var rp = ctx.resume();
+          if (rp && typeof rp.then === "function") {
+            rp.then(warm).catch(warm);
+          } else {
+            warm();
+          }
+        } else {
+          warm();
+        }
+      }
+    } catch (e) {}
+    // 2) HTML5 Audio：手勢內 play 靜音解鎖；結束後唔好 pause（pause 會令 iOS 之後拒自動播）
     try {
       var a = ensureUnlockedMediaAudio();
-      // iOS：必須非 muted 解鎖，否則之後只能自動播靜音
       a.muted = false;
-      a.volume = 1;
-      a.src = SILENT_WAV;
-      var finish = function () {
-        try { a.pause(); a.currentTime = 0; } catch (e) {}
+      a.volume = 0.01;
+      try { a.loop = false; } catch (e) {}
+      root.__hkParkingMediaKeepalive = true;
+      a.onended = function () {
+        // 保持 unlocked 旗標；唔 pause／唔清 src
+        root.__hkParkingMediaKeepalive = false;
         root.__hkParkingMediaUnlocked = true;
       };
+      a.onerror = null;
+      a.src = SILENT_WAV;
       var p = a.play();
       if (p && typeof p.then === "function") {
-        p.then(finish).catch(function () {
+        p.then(function () {
+          root.__hkParkingMediaUnlocked = true;
+        }).catch(function () {
           // 即使 promise 失敗，手勢內呼叫過 play() 有時仍算解鎖
           root.__hkParkingMediaUnlocked = true;
         });
       } else {
-        finish();
+        root.__hkParkingMediaUnlocked = true;
       }
     } catch (e) {}
+  }
+
+  function playViaAudioContext(src, cbs) {
+    var ctx = root.__hkParkingAudioCtx;
+    if (!ctx || !root.__hkParkingAudioCtxUnlocked) return false;
+    var playGen = (root.__hkParkingAudioCtxPlayGen || 0) + 1;
+    root.__hkParkingAudioCtxPlayGen = playGen;
+    root.__hkParkingMediaPlayPending = true;
+    var fail = function () {
+      if (playGen !== root.__hkParkingAudioCtxPlayGen) return;
+      root.__hkParkingMediaPlayPending = false;
+      if (typeof cbs.onError === "function") cbs.onError();
+    };
+    var resumeAndDecode = function () {
+      if (playGen !== root.__hkParkingAudioCtxPlayGen) return;
+      root.fetch(src)
+        .then(function (res) { return res.arrayBuffer(); })
+        .then(function (ab) {
+          if (playGen !== root.__hkParkingAudioCtxPlayGen) return null;
+          return ctx.decodeAudioData(ab.slice(0));
+        })
+        .then(function (buffer) {
+          if (!buffer || playGen !== root.__hkParkingAudioCtxPlayGen) return;
+          stopAudioContextSource();
+          // 停 HTML5 keepalive，避免同 AudioContext 搶聲道
+          root.__hkParkingMediaKeepalive = false;
+          try {
+            var aKeep = root.__hkParkingMediaAudio;
+            if (aKeep) {
+              aKeep.loop = false;
+              aKeep.pause();
+            }
+          } catch (e) {}
+          var node = ctx.createBufferSource();
+          node.buffer = buffer;
+          node.connect(ctx.destination);
+          node.onended = function () {
+            if (root.__hkParkingAudioCtxSource === node) {
+              root.__hkParkingAudioCtxSource = null;
+            }
+            root.__hkParkingMediaPlayPending = false;
+            if (typeof cbs.onEnded === "function") cbs.onEnded();
+          };
+          root.__hkParkingAudioCtxSource = node;
+          root.__hkParkingMediaPlayPending = false;
+          node.start(0);
+          if (typeof cbs.onStart === "function") cbs.onStart();
+        })
+        .catch(fail);
+    };
+    try {
+      if (ctx.state === "suspended") {
+        var rp = ctx.resume();
+        if (rp && typeof rp.then === "function") {
+          rp.then(resumeAndDecode).catch(fail);
+        } else {
+          resumeAndDecode();
+        }
+      } else {
+        resumeAndDecode();
+      }
+      return true;
+    } catch (e) {
+      root.__hkParkingMediaPlayPending = false;
+      return false;
+    }
+  }
+
+  function playViaHtml5Audio(src, cbs) {
+    try {
+      var a = ensureUnlockedMediaAudio();
+      stopAudioContextSource();
+      root.__hkParkingMediaKeepalive = false;
+      root.__hkParkingMediaPlayPending = true;
+      try { a.loop = false; } catch (e) {}
+      try { a.pause(); } catch (e) {}
+      a.muted = false;
+      a.volume = 1;
+      a.onended = function () {
+        root.__hkParkingMediaPlayPending = false;
+        if (typeof cbs.onEnded === "function") cbs.onEnded();
+      };
+      a.onerror = function () {
+        root.__hkParkingMediaPlayPending = false;
+        if (typeof cbs.onError === "function") cbs.onError();
+      };
+      a.src = src;
+      var p = a.play();
+      if (p && typeof p.then === "function") {
+        p.then(function () {
+          root.__hkParkingMediaPlayPending = false;
+          if (typeof cbs.onStart === "function") cbs.onStart();
+        }).catch(function () {
+          root.__hkParkingMediaPlayPending = false;
+          if (typeof cbs.onError === "function") cbs.onError();
+        });
+      } else if (typeof cbs.onStart === "function") {
+        root.__hkParkingMediaPlayPending = false;
+        cbs.onStart();
+      }
+      return true;
+    } catch (e) {
+      root.__hkParkingMediaPlayPending = false;
+      if (typeof cbs.onError === "function") cbs.onError();
+      return false;
+    }
   }
 
   function playUnlockedMedia(src, cbs) {
@@ -1259,39 +1425,27 @@ def inject_layout_css() -> None:
       if (typeof cbs.onError === "function") cbs.onError();
       return false;
     }
-    try {
-      var a = ensureUnlockedMediaAudio();
-      stopUnlockedMedia();
-      a.muted = false;
-      a.volume = 1;
-      a.src = src;
-      a.onended = function () {
-        if (typeof cbs.onEnded === "function") cbs.onEnded();
-      };
-      a.onerror = function () {
-        if (typeof cbs.onError === "function") cbs.onError();
-      };
-      var p = a.play();
-      if (p && typeof p.then === "function") {
-        p.then(function () {
-          if (typeof cbs.onStart === "function") cbs.onStart();
-        }).catch(function () {
-          if (typeof cbs.onError === "function") cbs.onError();
-        });
-      } else if (typeof cbs.onStart === "function") {
-        cbs.onStart();
+    // 優先 AudioContext（iOS 查詢後數秒先有 MP3 都較易出聲）
+    var acCbs = {
+      onStart: cbs.onStart,
+      onEnded: cbs.onEnded,
+      onError: function () {
+        // AudioContext 失敗再退 HTML5 同一解鎖元素
+        playViaHtml5Audio(src, cbs);
       }
-      return true;
-    } catch (e) {
-      if (typeof cbs.onError === "function") cbs.onError();
-      return false;
-    }
+    };
+    if (playViaAudioContext(src, acCbs)) return true;
+    return playViaHtml5Audio(src, cbs);
   }
 
   function isUnlockedMediaPlaying() {
+    if (root.__hkParkingMediaPlayPending) return true;
+    if (root.__hkParkingAudioCtxSource) return true;
     var a = root.__hkParkingMediaAudio;
     if (!a) return false;
     try {
+      // keepalive 靜音 loop 唔算「正在朗讀」
+      if (root.__hkParkingMediaKeepalive) return false;
       return !a.paused && !a.ended && a.currentTime > 0;
     } catch (e) {
       return false;
@@ -3349,7 +3503,8 @@ def render_iframe_speech_player(spoken: str, *, auto_speak: bool = False) -> Non
     """iframe 內建播放掣：優先播伺服器 MP3（iOS 可用），否則退回 Web Speech。
 
     手動撳掣：同一 iframe 內同步 play()／speak()。
-    自動播：用 parent 喺「查詢」手勢解鎖過嘅 Audio（手機／iOS 先得）。
+    自動播（每個新結果第一次）：用 parent 喺「查詢」手勢解鎖過嘅
+    AudioContext／Audio；同一段講稿重聽要撳播放掣。
     """
     spoken = prepare_spoken_text_for_tts((spoken or "").strip())
     if not spoken:
