@@ -571,11 +571,11 @@ def build() -> Path:
         "The product screenshots below are taken from the live Streamlit Cloud demo "
         "(https://hk-parking-vacancy-prediction.streamlit.app/). They show the full loop from home screen → "
         "natural-language query → AI intent parsing → ranked nearby car parks → map → day-ahead vacancy trend. "
-        "The demo query is 「彩雲邨附近下星期三下晝三點半邊度比較容易泊車？」 (Near Choi Wan Estate, where is it easier "
-        "to park next Wednesday at 3:30 p.m.?). DeepSeek parses this into place ≈ Choi Wan (I) Estate / Choi Wan Mall, "
-        "date = Wednesday 11 Nov 2026, and time = 3:30 p.m. The UI then returns the top 10 nearby parks (default when "
+        "The demo query is 「啟德附近下星期五下晝兩點半邊度比較易泊車？」 (Near Kai Tak, where is it easier "
+        "to park next Friday at 2:30 p.m.?). DeepSeek parses this into place ≈ Kai Tak, Kowloon, Hong Kong, "
+        "date = Friday 13 Nov 2026, and time = 2:30 p.m. The UI then returns the top 10 nearby parks (default when "
         "count is unspecified), with distance and fee fields (fee shown as 未提供 when open data has no rule for the "
-        "selected period), a colour-coded map, and a Wednesday all-day predicted-vacancy trend for the leading parks.",
+        "selected period), a colour-coded map, and a Friday all-day predicted-vacancy trend for the leading parks.",
         align="justify",
     )
     add_figure(
@@ -590,7 +590,7 @@ def build() -> Path:
         width=5.4,
         caption=(
             "Figure 10. Natural-language query and AI intent panel "
-            "(Choi Wan Estate · next Wednesday 3:30 p.m.)."
+            "(Kai Tak · next Friday 2:30 p.m.)."
         ),
     )
     add_figure(
@@ -598,7 +598,7 @@ def build() -> Path:
         f("fig10_app_results"),
         width=5.4,
         caption=(
-            "Figure 11. Ranked nearby car parks for Wednesday 3:30 p.m. near Choi Wan Estate "
+            "Figure 11. Ranked nearby car parks for Friday 2:30 p.m. near Kai Tak "
             "(top 10; distance in km; predicted vacancy)."
         ),
     )
@@ -607,7 +607,7 @@ def build() -> Path:
         f("fig11_app_map"),
         width=5.4,
         caption=(
-            "Figure 12. Map view for the same Choi Wan Estate query "
+            "Figure 12. Map view for the same Kai Tak query "
             "(colour = vacancy tightness; number = predicted vacancy)."
         ),
     )
@@ -616,8 +616,8 @@ def build() -> Path:
         f("fig14_app_trend"),
         width=5.4,
         caption=(
-            "Figure 13. Wednesday all-day predicted vacancy trend for leading parks near Choi Wan Estate "
-            "(vertical marker at 15:30)."
+            "Figure 13. Friday all-day predicted vacancy trend for leading parks near Kai Tak "
+            "(vertical marker at 14:30)."
         ),
     )
     add_para(
