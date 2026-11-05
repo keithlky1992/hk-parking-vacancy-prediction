@@ -39,6 +39,7 @@ from parking_result_utils import (
     first_available_fee,
     looks_like_fee_availability_query,
     merge_baseline_packs,
+    normalize_asr_query_text,
     order_parks_for_fee_display,
     park_name_matches_place_tokens,
     parks_present_in_baselines,
@@ -2018,62 +2019,15 @@ def inject_layout_css() -> None:
 
 
 def normalize_asr_query(query: str) -> tuple[str, str | None]:
-    """校正常見粵語語音誤辨（例如「易泊」→「200」、「易唔易」→「252」）。
+    """校正常見粵語語音誤辨（例如「易泊」→「200」、「易唔易」→「252」、「容」→「用」）。
 
     「比較200／邊度200／九點半252泊車」等喺本 app 幾乎一定係誤辨；
     若數字後接價錢單位（蚊／元）則不改，避免誤傷。
     回傳 (校正後句子, 提示字串或 None)。
     """
     original = (query or "").strip()
-    if not original:
-        return original, None
-
-    compact = re.sub(r"\s+", "", original)
-    # 「易泊」常被聽成 200／二百
-    yibo_mishear = r"(?:200|二百|兩百|两百|贰佰|貳佰|2百)"
-    # 「易唔易」常被聽成 252／250（例如「…九點半252泊車」）
-    yimyi_mishear = r"(?:252|250|二百五十二|兩百五十二|两百五十二)"
-    # 「比較二百蚊」＝價錢，唔好改成易泊
-    if re.search(
-        rf"(?:比較|較|较|邊度|哪[里裡]|好|易唔易){yibo_mishear}(?:蚊|元|塊|美金|港幣|hkd)",
-        compact,
-        flags=re.IGNORECASE,
-    ):
-        return original, None
-    if re.search(
-        rf"{yimyi_mishear}(?:蚊|元|塊|美金|港幣|hkd)",
-        compact,
-        flags=re.IGNORECASE,
-    ):
-        return original, None
-
-    replacements = (
-        # 易唔易 → 252／250（必須喺「泊／泊車」前，避免誤傷門牌）
-        (rf"{yimyi_mishear}\s*泊車", "易唔易泊車"),
-        (rf"{yimyi_mishear}\s*泊", "易唔易泊"),
-        # 要唔要泊 ≈ 易唔易泊（語音相近）
-        (r"要唔要\s*泊車", "易唔易泊車"),
-        (r"要唔要\s*泊", "易唔易泊"),
-        # 易泊 → 200／二百
-        (rf"比較\s*{yibo_mishear}", "比較易泊"),
-        (rf"较\s*{yibo_mishear}", "較易泊"),  # 簡體「较」
-        (rf"較\s*{yibo_mishear}", "較易泊"),
-        (rf"邊度\s*{yibo_mishear}", "邊度易泊"),
-        (rf"哪里\s*{yibo_mishear}", "哪里易泊"),
-        (rf"哪裡\s*{yibo_mishear}", "哪裡易泊"),
-        (rf"好\s*{yibo_mishear}", "好泊"),
-        (rf"易唔易\s*{yibo_mishear}", "易唔易泊"),
-    )
-
-    text = original
-    changed = False
-    for pattern, repl in replacements:
-        new_text, n = re.subn(pattern, repl, text, flags=re.IGNORECASE)
-        if n:
-            text = new_text
-            changed = True
-
-    if not changed or text == original:
+    text, changed = normalize_asr_query_text(original)
+    if not changed:
         return original, None
     note = f"已校正語音／輸入：「{text}」（原：「{original}」）"
     return text, note
@@ -4961,6 +4915,8 @@ def looks_like_vacancy_prediction_query(query: str) -> bool:
         "易唔易拍",
         "容唔容易",
         "容不容易",
+        "用唔容易",  # 語音常誤「容」→「用」（normalize_asr_query 亦會校正）
+        "用不容易",
         "邊度泊",
         "邊度較易",
         "預測",

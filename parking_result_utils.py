@@ -1,4 +1,4 @@
-"""結果表：收費缺漏判斷、地標置頂、收費優先排序、等效 park_id 收費別名。"""
+"""結果表／查詢輔助：收費缺漏、地標置頂、ASR 常見誤辨校正等。"""
 
 from __future__ import annotations
 
@@ -11,6 +11,65 @@ import pandas as pd
 FEE_MISSING_TOKENS = frozenset(
     {"", "未提供", "—", "-", "–", "n/a", "na", "none", "null", "nan"}
 )
+
+
+def normalize_asr_query_text(query: str) -> tuple[str, bool]:
+    """校正常見粵語語音誤辨。回傳 (校正後句子, 是否有改動)。"""
+    original = (query or "").strip()
+    if not original:
+        return original, False
+
+    compact = re.sub(r"\s+", "", original)
+    # 「易泊」常被聽成 200／二百
+    yibo_mishear = r"(?:200|二百|兩百|两百|贰佰|貳佰|2百)"
+    # 「易唔易」常被聽成 252／250（例如「…九點半252泊車」）
+    yimyi_mishear = r"(?:252|250|二百五十二|兩百五十二|两百五十二)"
+    # 「比較二百蚊」＝價錢，唔好改成易泊
+    if re.search(
+        rf"(?:比較|較|较|邊度|哪[里裡]|好|易唔易){yibo_mishear}(?:蚊|元|塊|美金|港幣|hkd)",
+        compact,
+        flags=re.IGNORECASE,
+    ):
+        return original, False
+    if re.search(
+        rf"{yimyi_mishear}(?:蚊|元|塊|美金|港幣|hkd)",
+        compact,
+        flags=re.IGNORECASE,
+    ):
+        return original, False
+
+    replacements = (
+        # 容唔容易 → 用唔容易（粵語語音常把「容」聽成「用」）
+        (r"用唔容易", "容唔容易"),
+        (r"用不容易", "容不容易"),
+        # 易唔易 → 252／250（必須喺「泊／泊車」前，避免誤傷門牌）
+        (rf"{yimyi_mishear}\s*泊車", "易唔易泊車"),
+        (rf"{yimyi_mishear}\s*泊", "易唔易泊"),
+        # 要唔要泊 ≈ 易唔易泊（語音相近）
+        (r"要唔要\s*泊車", "易唔易泊車"),
+        (r"要唔要\s*泊", "易唔易泊"),
+        # 易泊 → 200／二百
+        (rf"比較\s*{yibo_mishear}", "比較易泊"),
+        (rf"较\s*{yibo_mishear}", "較易泊"),  # 簡體「较」
+        (rf"較\s*{yibo_mishear}", "較易泊"),
+        (rf"邊度\s*{yibo_mishear}", "邊度易泊"),
+        (rf"哪里\s*{yibo_mishear}", "哪里易泊"),
+        (rf"哪裡\s*{yibo_mishear}", "哪裡易泊"),
+        (rf"好\s*{yibo_mishear}", "好泊"),
+        (rf"易唔易\s*{yibo_mishear}", "易唔易泊"),
+    )
+
+    text = original
+    changed = False
+    for pattern, repl in replacements:
+        new_text, n = re.subn(pattern, repl, text, flags=re.IGNORECASE)
+        if n:
+            text = new_text
+            changed = True
+
+    if not changed or text == original:
+        return original, False
+    return text, True
 
 
 def fee_value_missing(value) -> bool:
