@@ -38,6 +38,7 @@ from parking_result_utils import (
     filter_parks_without_fee,
     first_available_fee,
     looks_like_fee_availability_query,
+    looks_like_hard_to_park_ranking_query,
     merge_baseline_packs,
     normalize_asr_query_text,
     order_parks_for_fee_display,
@@ -6631,6 +6632,28 @@ def render_past_time_blocked(intent: dict, *, auto_speak: bool = True):
     )
 
 
+def render_hard_to_park_unsupported(intent: dict, *, auto_speak: bool = True):
+    """用戶問較難／冇咁易泊：本系統只提供較易泊排名。"""
+    district = (
+        intent.get("geo_label")
+        or intent.get("district")
+        or "該地區"
+    )
+    if _is_all_hong_kong(intent.get("district")):
+        district = "全港"
+    example = f"{district}今晚八點邊度較易泊？"
+    render_feedback_with_speech(
+        "本系統只能夠顯示較易泊車的停車場，暫時未能排列「冇咁容易／較難泊」的名單。"
+        f"請改問較易泊（例如：{example}）。",
+        spoken=(
+            "本系統只能夠顯示較易泊車嘅停車場，暫時未能排列冇咁容易或者較難泊嘅名單。"
+            f"請改問較易泊，例如{example}"
+        ),
+        intent=intent,
+        auto_speak=auto_speak,
+    )
+
+
 auto_submit = st.session_state.pop("auto_submit_query", False)
 should_query = submitted or auto_submit
 query_text = (user_query or "").strip()
@@ -6673,6 +6696,9 @@ if should_query and query_text:
             ),
             auto_speak=True,
         )
+    elif looks_like_hard_to_park_ranking_query(query_text):
+        # 「冇咁容易泊／較難泊」：只提示可查較易泊，唔好誤顯示較易泊名單
+        render_hard_to_park_unsupported(intent)
     else:
         geo_error = None
         if not _is_all_hong_kong(intent.get("district")):

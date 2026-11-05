@@ -269,6 +269,48 @@ def looks_like_fee_availability_query(query: str) -> bool:
     return fee_availability_mode(query) is not None
 
 
+def looks_like_hard_to_park_ranking_query(query: str) -> bool:
+    """問邊啲較難／冇咁易泊（本系統只支援較易泊排名，應攔截提示）。
+
+    「難唔難泊／容唔容易／易唔易」屬鬆緊評估，唔當難泊名單。
+    """
+    q = re.sub(r"\s+", "", query or "")
+    if not q:
+        return False
+    if re.search(
+        r"難唔難|难不难|容唔容易|用唔容易|容不容易|用不容易|"
+        r"容易唔容易|容易不容易|易唔易|好唔好泊",
+        q,
+    ):
+        return False
+    hard_patterns = (
+        r"冇咁容易",
+        r"冇咁易",
+        r"沒那麼容易",
+        r"沒有那麼容易",
+        r"不太容易",
+        r"不那麼容易",
+        r"較難泊",
+        r"比较难泊",
+        r"比較難泊",
+        r"最難泊",
+        r"最难泊",
+        r"邊[度啲個].*難泊",
+        r"哪[裡里些個].*難泊",
+        r"哪些.*難泊",
+        r"難泊.*邊[度啲個]",
+        r"唔好泊",
+        r"不好泊",
+        r"最唔易泊",
+        r"最不易泊",
+        r"較唔易泊",
+        r"比較唔易泊",
+        r"比較難",
+        r"較難",
+    )
+    return any(re.search(p, q) for p in hard_patterns)
+
+
 def build_fee_park_id_aliases(
     parks_df: pd.DataFrame,
     fee_ids: set[str] | frozenset[str],

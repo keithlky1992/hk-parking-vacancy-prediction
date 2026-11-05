@@ -16,6 +16,7 @@ from parking_result_utils import (
     filter_parks_without_fee,
     first_available_fee,
     looks_like_fee_availability_query,
+    looks_like_hard_to_park_ranking_query,
     merge_baseline_packs,
     normalize_park_name_basic,
     order_parks_for_fee_display,
@@ -106,6 +107,21 @@ class FeeAvailabilityQueryTest(unittest.TestCase):
         self.assertFalse(looks_like_fee_availability_query("彩雲邨今晚收費幾錢"))
         self.assertFalse(looks_like_fee_availability_query("德福廣場時租"))
         self.assertIsNone(fee_availability_mode("德福廣場時租"))
+
+
+class HardToParkRankingQueryTest(unittest.TestCase):
+    def test_detects_not_so_easy_queries(self):
+        self.assertTrue(
+            looks_like_hard_to_park_ranking_query("啟德有邊啲停車場冇咁容易泊車")
+        )
+        self.assertTrue(looks_like_hard_to_park_ranking_query("觀塘邊啲難泊"))
+        self.assertTrue(looks_like_hard_to_park_ranking_query("天水圍較難泊嘅停車場"))
+
+    def test_ease_assessment_is_not_hard_ranking(self):
+        self.assertFalse(looks_like_hard_to_park_ranking_query("YOHO mall 容唔容易泊"))
+        self.assertFalse(looks_like_hard_to_park_ranking_query("APM 易唔易泊"))
+        self.assertFalse(looks_like_hard_to_park_ranking_query("彩雲邨難唔難泊"))
+        self.assertFalse(looks_like_hard_to_park_ranking_query("天水圍今晚八點邊度較易泊"))
 
 
 class FilterParksWithFeeTest(unittest.TestCase):
