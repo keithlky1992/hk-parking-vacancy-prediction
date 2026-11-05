@@ -111,6 +111,18 @@ def filter_parks_with_fee(
     return work[~work[fee_col].map(fee_value_missing)].reset_index(drop=True)
 
 
+def filter_parks_without_fee(
+    parks_df: pd.DataFrame,
+    *,
+    fee_col: str = "收費",
+) -> pd.DataFrame:
+    """只保留無收費資料嘅車場。"""
+    if parks_df is None or parks_df.empty or fee_col not in parks_df.columns:
+        return parks_df.copy() if parks_df is not None else pd.DataFrame()
+    work = parks_df.copy()
+    return work[work[fee_col].map(fee_value_missing)].reset_index(drop=True)
+
+
 def fee_coverage_counts(
     parks_df: pd.DataFrame,
     *,
@@ -126,19 +138,52 @@ def fee_coverage_counts(
     return with_fee, total
 
 
-def looks_like_fee_availability_query(query: str) -> bool:
-    """問邊啲車場「有顯示／有資料」收費，而非問價錢本身。"""
+def fee_availability_mode(query: str) -> str | None:
+    """收費資料有／無查詢：回傳 'present'｜'missing'｜None。
+
+    「冇／沒有顯示收費」要優先於「顯示收費」判斷，避免誤當成有資料。
+    """
     q = re.sub(r"\s+", "", query or "").lower()
     if not q:
-        return False
+        return None
     # 明確問價錢／點收費 → 當收費查詢，唔當「有冇顯示」
     if re.search(
         r"收費如何|收費怎樣|收費怎麼|收費點樣|收費點算|"
         r"幾錢|多少錢|幾多錢|價錢|價格|時租|日泊|夜泊",
         q,
     ):
-        return False
-    patterns = (
+        return None
+
+    missing_patterns = (
+        r"冇顯示收費",
+        r"沒有顯示收費",
+        r"未有顯示收費",
+        r"無顯示收費",
+        r"冇收費資料",
+        r"沒有收費資料",
+        r"未有收費資料",
+        r"無收費資料",
+        r"冇收費規則",
+        r"沒有收費規則",
+        r"未有收費規則",
+        r"無收費規則",
+        r"冇收費資訊",
+        r"沒有收費資訊",
+        r"未提供收費",
+        r"收費未提供",
+        r"邊[啲個].*冇(?:顯示)?收費",
+        r"邊[啲個].*沒有(?:顯示)?收費",
+        r"邊[啲個].*無(?:顯示)?收費",
+        r"哪[些個].*沒有(?:顯示)?收費",
+        r"哪些.*沒有(?:顯示)?收費",
+        r"有邊[啲個].*冇(?:顯示)?收費",
+        r"有邊[啲個].*沒有(?:顯示)?收費",
+        r"有邊[啲個].*無(?:顯示)?收費",
+    )
+    if any(re.search(p, q) for p in missing_patterns):
+        return "missing"
+
+    present_patterns = (
         r"有顯示收費",
         r"顯示收費",
         r"顯示.*收費",
@@ -155,7 +200,14 @@ def looks_like_fee_availability_query(query: str) -> bool:
         r"哪些.*有(?:顯示)?收費",
         r"有邊[啲個].*(?:有)?(?:顯示)?收費",
     )
-    return any(re.search(p, q) for p in patterns)
+    if any(re.search(p, q) for p in present_patterns):
+        return "present"
+    return None
+
+
+def looks_like_fee_availability_query(query: str) -> bool:
+    """問邊啲車場有／冇顯示收費資料（而非問價錢本身）。"""
+    return fee_availability_mode(query) is not None
 
 
 def build_fee_park_id_aliases(

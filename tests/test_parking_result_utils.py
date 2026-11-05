@@ -9,9 +9,11 @@ import pandas as pd
 from parking_result_utils import (
     build_equivalent_park_id_map,
     build_fee_park_id_aliases,
+    fee_availability_mode,
     fee_coverage_counts,
     fee_value_missing,
     filter_parks_with_fee,
+    filter_parks_without_fee,
     first_available_fee,
     looks_like_fee_availability_query,
     merge_baseline_packs,
@@ -79,16 +81,31 @@ class OrderFeeDisplayTest(unittest.TestCase):
 
 class FeeAvailabilityQueryTest(unittest.TestCase):
     def test_detects_which_lots_show_fees(self):
-        self.assertTrue(
-            looks_like_fee_availability_query("全香港既停車場有邊啲有顯示收費")
+        self.assertEqual(
+            fee_availability_mode("全香港既停車場有邊啲有顯示收費"),
+            "present",
         )
         self.assertTrue(looks_like_fee_availability_query("邊啲停車場有收費資料"))
         self.assertTrue(looks_like_fee_availability_query("觀塘哪些有顯示收費"))
+
+    def test_detects_which_lots_lack_fees(self):
+        self.assertEqual(
+            fee_availability_mode("全香港有邊啲停車場冇顯示收費"),
+            "missing",
+        )
+        self.assertEqual(
+            fee_availability_mode("邊啲停車場沒有收費資料"),
+            "missing",
+        )
+        self.assertTrue(
+            looks_like_fee_availability_query("全香港有邊啲停車場冇顯示收費")
+        )
 
     def test_price_questions_are_not_availability(self):
         self.assertFalse(looks_like_fee_availability_query("天水圍停車場收費如何"))
         self.assertFalse(looks_like_fee_availability_query("彩雲邨今晚收費幾錢"))
         self.assertFalse(looks_like_fee_availability_query("德福廣場時租"))
+        self.assertIsNone(fee_availability_mode("德福廣場時租"))
 
 
 class FilterParksWithFeeTest(unittest.TestCase):
@@ -102,6 +119,16 @@ class FilterParksWithFeeTest(unittest.TestCase):
         out = filter_parks_with_fee(df)
         self.assertEqual(out["park_id"].tolist(), ["b"])
         self.assertEqual(fee_coverage_counts(df), (1, 3))
+
+    def test_keeps_only_rows_without_fee(self):
+        df = pd.DataFrame(
+            {
+                "park_id": ["a", "b", "c"],
+                "收費": ["未提供", "$18／小時", ""],
+            }
+        )
+        out = filter_parks_without_fee(df)
+        self.assertEqual(out["park_id"].tolist(), ["a", "c"])
 
 
 class FeeAliasTest(unittest.TestCase):
