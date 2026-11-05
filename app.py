@@ -75,8 +75,10 @@ LIVE_NEARBY_TOP_N = 8
 SHOW_WRITTEN_SUGGESTION = False
 # 停車場資料／說明類：書面答覆唔顯示（保留朗讀掣／自動播；表格／地圖仍會出）
 SHOW_WRITTEN_INFO_ANSWER = False
-# 資料答覆表格預覽上限（超過仍會顯示前 N 行＋摘要，唔再空白）
-INFO_TABLE_PREVIEW_MAX = 40
+# 資料答覆：表格顯示完整名單；地圖標記過多會卡，只畫前 N 個
+INFO_MAP_MARKER_MAX = 40
+# LLM／fallback 名單抽樣上限（同地圖預覽對齊）
+INFO_TABLE_PREVIEW_MAX = INFO_MAP_MARKER_MAX
 # 朗讀自然結束時由 JS 點擊；放頁頂並以 CSS 收起，唔插入結果區
 SPEECH_ENDED_SENTINEL_LABEL = "SPEECH_ENDED"
 
@@ -6079,47 +6081,38 @@ def render_saved_info_answer(payload: dict, *, auto_speak: bool = False) -> None
     )
     parks_df = parks_df_for_display(pd.DataFrame(payload.get("park_records") or []))
     if not parks_df.empty:
-        preview_n = min(len(parks_df), INFO_TABLE_PREVIEW_MAX)
-        preview_df = parks_df.head(preview_n)
-        # 保留 latitude／longitude 畀地圖；表格顯示時隱藏
-        display_df = preview_df.drop(columns=list(_TABLE_HIDDEN_COLS), errors="ignore")
+        # 表格顯示完整名單；地圖只取前 N 個標記，避免幾百點卡死瀏覽器
+        map_n = min(len(parks_df), INFO_MAP_MARKER_MAX)
+        map_df = parks_df.head(map_n)
+        display_df = parks_df.drop(columns=list(_TABLE_HIDDEN_COLS), errors="ignore")
         st.dataframe(display_df, use_container_width=True, hide_index=True)
-        render_results_map(preview_df, intent=intent)
+        render_results_map(map_df, intent=intent)
+        map_note = (
+            f"地圖先標示前 {map_n} 個（共 {count} 個）。"
+            if count > map_n
+            else ""
+        )
         if fee_availability and missing_fees:
             st.caption(
-                "上表為政府開放資料暫無私家車收費規則的停車場"
-                + (
-                    f"（共 {count} 個，先顯示前 {preview_n} 個；範圍總數 {total}）。"
-                    if count > preview_n
-                    else f"（共 {count} 個；範圍總數 {total}）。"
-                )
-                + "可指定地區再問以收窄名單。"
+                f"上表為政府開放資料暫無私家車收費規則的停車場"
+                f"（共 {count} 個；範圍總數 {total}）。"
+                f"{map_note}"
+                "可指定地區再問以收窄名單。"
             )
         elif fee_availability:
             st.caption(
-                "上表為有政府開放資料私家車收費規則的停車場"
-                + (
-                    f"（共 {count} 個，先顯示前 {preview_n} 個；範圍總數 {total}）。"
-                    if count > preview_n
-                    else f"（共 {count} 個；範圍總數 {total}）。"
-                )
-                + "想知某場幾錢可再問該區／該場收費。"
+                f"上表為有政府開放資料私家車收費規則的停車場"
+                f"（共 {count} 個；範圍總數 {total}）。"
+                f"{map_note}"
+                "想知某場幾錢可再問該區／該場收費。"
             )
         elif fee_slot_label and "收費" in parks_df.columns:
-            extra = (
-                f"名單較長，先顯示前 {preview_n} 個（共 {count} 個）。"
-                if count > preview_n
-                else ""
-            )
             st.caption(
                 f"收費為「{fee_slot_label}」時段（政府開放資料私家車規則；無資料則顯示未提供）。"
-                f"{extra}"
+                f"{map_note}"
             )
-        elif count > preview_n:
-            st.caption(
-                f"該範圍共有 {count} 個停車場，名單較長，先顯示前 {preview_n} 個；"
-                "可指定地區再問。"
-            )
+        elif map_note:
+            st.caption(f"該範圍共有 {count} 個停車場。{map_note}可指定地區再問。")
     flush_deferred_speech_browser_ops()
     if need_rerun:
         st.rerun()
