@@ -71,8 +71,8 @@ SEARCH_HISTORY_MAX = 8
 LIVE_NEARBY_TOP_N = 8
 # 暫時隱藏「預測建議」書面文字；朗讀掣／自動播仍然保留。改 True 即可恢復顯示
 SHOW_WRITTEN_SUGGESTION = False
-# 停車場資料／說明類：書面答覆要顯示（尤其長名單唔出完整表時）
-SHOW_WRITTEN_INFO_ANSWER = True
+# 停車場資料／說明類：書面答覆唔顯示（保留朗讀掣／自動播；表格／地圖仍會出）
+SHOW_WRITTEN_INFO_ANSWER = False
 # 資料答覆表格預覽上限（超過仍會顯示前 N 行＋摘要，唔再空白）
 INFO_TABLE_PREVIEW_MAX = 40
 # 朗讀自然結束時由 JS 點擊；放頁頂並以 CSS 收起，唔插入結果區
@@ -6056,7 +6056,7 @@ def render_saved_info_answer(payload: dict, *, auto_speak: bool = False) -> None
         elif count > preview_n:
             st.caption(
                 f"該範圍共有 {count} 個停車場，名單較長，先顯示前 {preview_n} 個；"
-                "詳情見上方說明，亦可指定地區再問。"
+                "可指定地區再問。"
             )
     flush_deferred_speech_browser_ops()
     if need_rerun:
