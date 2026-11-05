@@ -99,6 +99,65 @@ def order_parks_for_fee_display(
     return pd.concat(parts, ignore_index=True)
 
 
+def filter_parks_with_fee(
+    parks_df: pd.DataFrame,
+    *,
+    fee_col: str = "收費",
+) -> pd.DataFrame:
+    """只保留有收費資料嘅車場。"""
+    if parks_df is None or parks_df.empty or fee_col not in parks_df.columns:
+        return parks_df.copy() if parks_df is not None else pd.DataFrame()
+    work = parks_df.copy()
+    return work[~work[fee_col].map(fee_value_missing)].reset_index(drop=True)
+
+
+def fee_coverage_counts(
+    parks_df: pd.DataFrame,
+    *,
+    fee_col: str = "收費",
+) -> tuple[int, int]:
+    """回傳 (有收費資料數, 總數)。"""
+    if parks_df is None or parks_df.empty:
+        return 0, 0
+    total = int(len(parks_df))
+    if fee_col not in parks_df.columns:
+        return 0, total
+    with_fee = int((~parks_df[fee_col].map(fee_value_missing)).sum())
+    return with_fee, total
+
+
+def looks_like_fee_availability_query(query: str) -> bool:
+    """問邊啲車場「有顯示／有資料」收費，而非問價錢本身。"""
+    q = re.sub(r"\s+", "", query or "").lower()
+    if not q:
+        return False
+    # 明確問價錢／點收費 → 當收費查詢，唔當「有冇顯示」
+    if re.search(
+        r"收費如何|收費怎樣|收費怎麼|收費點樣|收費點算|"
+        r"幾錢|多少錢|幾多錢|價錢|價格|時租|日泊|夜泊",
+        q,
+    ):
+        return False
+    patterns = (
+        r"有顯示收費",
+        r"顯示收費",
+        r"顯示.*收費",
+        r"有收費資料",
+        r"有收費規則",
+        r"有收費資訊",
+        r"有收費顯示",
+        r"收費資料",
+        r"收費規則",
+        r"有冇.*收費.*(資料|顯示|規則|資訊)",
+        r"有沒有.*收費.*(資料|顯示|規則|資訊)",
+        r"邊[啲個].*有(?:顯示)?收費",
+        r"哪[些個].*有(?:顯示)?收費",
+        r"哪些.*有(?:顯示)?收費",
+        r"有邊[啲個].*(?:有)?(?:顯示)?收費",
+    )
+    return any(re.search(p, q) for p in patterns)
+
+
 def build_fee_park_id_aliases(
     parks_df: pd.DataFrame,
     fee_ids: set[str] | frozenset[str],

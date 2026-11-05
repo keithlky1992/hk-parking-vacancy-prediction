@@ -9,8 +9,11 @@ import pandas as pd
 from parking_result_utils import (
     build_equivalent_park_id_map,
     build_fee_park_id_aliases,
+    fee_coverage_counts,
     fee_value_missing,
+    filter_parks_with_fee,
     first_available_fee,
+    looks_like_fee_availability_query,
     merge_baseline_packs,
     normalize_park_name_basic,
     order_parks_for_fee_display,
@@ -72,6 +75,33 @@ class OrderFeeDisplayTest(unittest.TestCase):
         )
         out = order_parks_for_fee_display(df, at_place_ids={"31", "32"})
         self.assertEqual(out["park_id"].tolist(), ["31", "32", "b", "a"])
+
+
+class FeeAvailabilityQueryTest(unittest.TestCase):
+    def test_detects_which_lots_show_fees(self):
+        self.assertTrue(
+            looks_like_fee_availability_query("全香港既停車場有邊啲有顯示收費")
+        )
+        self.assertTrue(looks_like_fee_availability_query("邊啲停車場有收費資料"))
+        self.assertTrue(looks_like_fee_availability_query("觀塘哪些有顯示收費"))
+
+    def test_price_questions_are_not_availability(self):
+        self.assertFalse(looks_like_fee_availability_query("天水圍停車場收費如何"))
+        self.assertFalse(looks_like_fee_availability_query("彩雲邨今晚收費幾錢"))
+        self.assertFalse(looks_like_fee_availability_query("德福廣場時租"))
+
+
+class FilterParksWithFeeTest(unittest.TestCase):
+    def test_keeps_only_rows_with_fee(self):
+        df = pd.DataFrame(
+            {
+                "park_id": ["a", "b", "c"],
+                "收費": ["未提供", "$18／小時", ""],
+            }
+        )
+        out = filter_parks_with_fee(df)
+        self.assertEqual(out["park_id"].tolist(), ["b"])
+        self.assertEqual(fee_coverage_counts(df), (1, 3))
 
 
 class FeeAliasTest(unittest.TestCase):

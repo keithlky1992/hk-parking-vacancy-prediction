@@ -31,7 +31,11 @@ from parking_result_utils import (
     build_equivalent_park_id_map,
     build_fee_park_id_aliases,
     coerce_park_id,
+    fee_coverage_counts,
+    fee_value_missing,
+    filter_parks_with_fee,
     first_available_fee,
+    looks_like_fee_availability_query,
     merge_baseline_packs,
     order_parks_for_fee_display,
     park_name_matches_place_tokens,
@@ -65,8 +69,12 @@ DEFAULT_TOP_N = 10
 BASELINE_PRIOR_K = 3.0
 SEARCH_HISTORY_MAX = 8
 LIVE_NEARBY_TOP_N = 8
-# 暫時隱藏建議／資料答覆書面文字；朗讀掣／自動播仍然保留。改 True 即可恢復顯示
+# 暫時隱藏「預測建議」書面文字；朗讀掣／自動播仍然保留。改 True 即可恢復顯示
 SHOW_WRITTEN_SUGGESTION = False
+# 停車場資料／說明類：書面答覆要顯示（尤其長名單唔出完整表時）
+SHOW_WRITTEN_INFO_ANSWER = True
+# 資料答覆表格預覽上限（超過仍會顯示前 N 行＋摘要，唔再空白）
+INFO_TABLE_PREVIEW_MAX = 40
 # 朗讀自然結束時由 JS 點擊；放頁頂並以 CSS 收起，唔插入結果區
 SPEECH_ENDED_SENTINEL_LABEL = "SPEECH_ENDED"
 
@@ -5364,7 +5372,7 @@ def parse_query_with_llm(query: str):
   - false：天氣、食肆、純閒聊、新聞、或其他與泊車完全無關的問題
 - query_type: 查詢類型（只在 related 為 true 時有意義）
   - "prediction"：想知邊度較易泊、某時某地空位、某地容唔容易泊、預測／推薦停車場等（即使沒寫「預測」二字）。「邊啲停車場比較易泊／好泊」屬 prediction，不是 info
-  - "info"：與停車場有關，但不是在問空位預測。例如：某區有幾個停車場、係咪得一個、有冇停車場、叫咩名、收費／價錢、本系統可以問咩。單純「有邊啲停車場」（無時間、無易泊）才用 info
+  - "info"：與停車場有關，但不是在問空位預測。例如：某區有幾個停車場、係咪得一個、有冇停車場、叫咩名、收費／價錢、邊啲有顯示收費／有收費資料、本系統可以問咩。單純「有邊啲停車場」（無時間、無易泊）才用 info
 - district: 地點名稱，會交 Google Maps 定位。優先填用戶提到的具體地名（屋邨、商場、街道、地區，例如「彩雲邨」「栢慧豪園」「YOHO mall」「天水圍」）；沒有提到就填「全港」。related 為 false 時填「全港」。不要改寫成內部代號或加「／」合併名。若用戶問某商場／地標「容唔容易泊／易唔易泊／有冇位」，district 必須保留該具體地名（不要只填所在行政區）
 - hour: 小時（0-23）。只在句子有具體鐘點時填數字（如「三點」「15:30」「晚上九點」「上午10:30」）；沒有具體鐘點則填 null（「後晚／聽晚／今晚／嚟緊」單獨出現不算具體鐘點）。問收費但無具體鐘點時填 null（系統會用當刻時間）
 - minute: 分鐘，時間以半小時為單位，只允許 0 或 30。規則：
@@ -5710,6 +5718,9 @@ def needs_fee_missing_time_reentry(intent: dict, query_text: str) -> bool:
     """收費查詢：非今天（聽日／某一日）且未提供時間 → 要求重新輸入。"""
     if not looks_like_fee_query(query_text):
         return False
+    # 「有顯示收費／有收費資料」唔使指定鐘點
+    if looks_like_fee_availability_query(query_text):
+        return False
     if is_now_query(query_text):
         return False
     has_hour = intent_has_clock_time(intent.get("hour")) or (
@@ -5757,24 +5768,75 @@ def parks_df_for_display(parks_df: pd.DataFrame) -> pd.DataFrame:
     return parks_df[cols] if cols else parks_df.drop(columns=["park_id"], errors="ignore")
 
 
+def _parking_info_name_block(
+    parks_df: pd.DataFrame,
+    *,
+    include_fees: bool,
+    limit: int = INFO_TABLE_PREVIEW_MAX,
+) -> str:
+    """組 LLM／fallback 用嘅車場名單摘要（長名單都會抽樣，唔好交空白）。"""
+    n = len(parks_df)
+    if n == 0:
+        return "（無）"
+    lines = []
+    for i, (_, row) in enumerate(parks_df.head(limit).iterrows(), start=1):
+        district = row.get("地區")
+        district_bit = f"（{district}）" if district not in (None, "") else ""
+        line = f"{i}. {row.get('名稱', '未命名')}{district_bit}"
+        if include_fees and "收費" in parks_df.columns:
+            line += f"｜收費：{row.get('收費') or '未提供'}"
+        lines.append(line)
+    listed = "\n".join(lines)
+    if n > limit:
+        listed += f"\n…另有 {n - limit} 個未列出"
+    return listed
+
+
 def _fallback_parking_info_answer(
     query: str,
     district_label: str,
     parks_df: pd.DataFrame,
     *,
     fee_slot_label: str | None = None,
+    fee_availability: bool = False,
+    scope_total: int | None = None,
 ) -> tuple[str, str]:
     """LLM 失敗時的規則回覆。"""
     n = len(parks_df)
     names = parks_df["名稱"].tolist() if "名稱" in parks_df.columns else []
-    has_fees = fee_slot_label and "收費" in parks_df.columns and n > 0
+    has_fees = bool(fee_slot_label) and "收費" in parks_df.columns and n > 0
+    total = int(scope_total) if scope_total is not None else n
 
-    if n == 0:
+    if n == 0 and not fee_availability:
         written = (
             f"本系統在「{district_label}」附近目前沒有停車場紀錄。"
             f"你可以改試其他地點，或直接問空位預測"
             f"（例如：天水圍今晚八點邊度較易泊？）。"
         )
+    elif fee_availability:
+        if n == 0:
+            written = (
+                f"以本系統資料，「{district_label}」目前錄得 {total} 個停車場，"
+                f"但暫時未有政府開放資料可顯示嘅私家車收費規則。"
+                f"你可以改問某區收費（例如：觀塘停車場收費如何？），"
+                f"或問空位預測（例如：觀塘今晚八點邊度較易泊？）。"
+            )
+        else:
+            samples = []
+            for _, row in parks_df.head(8).iterrows():
+                fee = str(row.get("收費") or "").strip()
+                if fee and not fee_value_missing(fee):
+                    samples.append(f"「{row['名稱']}」{fee}")
+                else:
+                    samples.append(f"「{row['名稱']}」")
+            sample_txt = "、".join(samples)
+            more = f" 等共 {n} 個" if n > 8 else f"，共 {n} 個"
+            written = (
+                f"「{district_label}」範圍本系統共 {total} 個停車場，"
+                f"其中 {n} 個有顯示收費（政府開放資料私家車規則）。"
+                f"例如：{sample_txt}{more}。"
+                f"詳細見下表；想知某場幾錢可直接問該區／該場收費。"
+            )
     elif has_fees:
         samples = []
         for _, row in parks_df.head(5).iterrows():
@@ -5819,45 +5881,55 @@ def answer_parking_info_with_llm(
     parks_df: pd.DataFrame,
     *,
     fee_slot_label: str | None = None,
+    fee_availability: bool = False,
+    scope_total: int | None = None,
 ) -> tuple[str, str]:
     """根據本系統停車場名單，用 LLM 認真回答非預測問題。"""
     n = len(parks_df)
-    has_fees = bool(fee_slot_label) and "收費" in parks_df.columns
-    if district_label == "全港" and n > 30:
-        name_block = f"（全港共 {n} 個，名單過長不逐一列出）"
-    else:
-        lines = []
-        for i, (_, row) in enumerate(parks_df.head(40).iterrows(), start=1):
-            line = f"{i}. {row['名稱']}（{row['地區']}）"
-            if has_fees:
-                line += f"｜收費：{row.get('收費') or '未提供'}"
-            lines.append(line)
-        listed = "\n".join(lines)
-        if n > 40:
-            listed += f"\n…另有 {n - 40} 個未列出"
-        name_block = listed or "（無）"
+    total = int(scope_total) if scope_total is not None else n
+    with_fee, _ = fee_coverage_counts(parks_df)
+    if fee_availability and scope_total is not None:
+        with_fee = n
+    include_fees = bool(fee_slot_label or fee_availability) and "收費" in parks_df.columns
+    # 長名單／全港都要抽樣（優先已排好嘅有費車場），避免 LLM 無事實可答
+    name_block = _parking_info_name_block(parks_df, include_fees=include_fees)
 
     fee_fact = ""
     fee_guidance = ""
-    if has_fees:
-        fee_fact = f"- 收費時段：{fee_slot_label}\n- 收費來源：政府停車場開放資料（私家車時租／日夜泊；無資料則顯示未提供）\n"
+    if fee_availability:
+        fee_fact = (
+            f"- 有顯示收費的停車場：{with_fee} 個（範圍總數 {total}）\n"
+            f"- 收費來源：政府停車場開放資料（私家車時租／日夜泊；無規則則無顯示）\n"
+        )
         fee_guidance = (
-            "用戶在問收費：請依事實說明該時段收費概況，可舉數個例子，"
-            "並提醒下表有完整名單；不要捏造價錢。\n"
+            "用戶在問邊啲停車場有顯示收費／有收費資料："
+            "請直接根據事實說明有顯示收費的數量，並舉幾個名稱例子；"
+            "不要改答成「全港收費一覽」或捏造價錢。"
+            "可提醒下表列出有收費資料的車場；範圍太大時建議再收窄地區。\n"
+        )
+    elif fee_slot_label and "收費" in parks_df.columns:
+        fee_fact = (
+            f"- 收費時段：{fee_slot_label}\n"
+            f"- 有收費資料：{with_fee}／{total}\n"
+            f"- 收費來源：政府停車場開放資料（私家車時租／日夜泊；無資料則顯示未提供）\n"
+        )
+        fee_guidance = (
+            "用戶在問收費：請依事實說明該時段收費概況，可舉數個有資料的例子，"
+            "並提醒下表可見更多；不要捏造價錢。範圍太大時建議指定地區再問。\n"
         )
 
     prompt = f"""
 你是「咪再兜」香港停車場空位預測系統的助手。用戶的問題與停車場有關，但不是在問空位預測。
-請根據「本系統資料庫事實」認真回答，用繁體中文、簡潔清楚（可用粵語口語）。
-只根據事實作答，不要捏造停車場或收費；若資料不足就誠實說明。
+請根據「本系統資料庫事實」認真、盡力正確回答，用繁體中文、簡潔清楚（可用粵語口語）。
+只根據事實作答，不要捏造停車場或收費；若資料不足就誠實說明，並建議可怎樣收窄問題。
 {fee_guidance}回答後可自然地提一句：若要查某時段較易泊／空位，可以再問預測問題。
 
 用戶問題：{query}
 
 事實：
 - 查詢地區：{district_label}
-- 該範圍停車場數量：{n}
-{fee_fact}- 停車場名單：
+- 該範圍停車場數量：{total}
+{fee_fact}- 停車場名單（抽樣，已按相關性排序）：
 {name_block}
 - 本系統主要功能：預測香港各區停車場在指定時段的空位，並推薦較易泊的停車場
 
@@ -5867,7 +5939,12 @@ def answer_parking_info_with_llm(
     text = call_deepseek(prompt)
     if not text:
         return _fallback_parking_info_answer(
-            query, district_label, parks_df, fee_slot_label=fee_slot_label
+            query,
+            district_label,
+            parks_df,
+            fee_slot_label=fee_slot_label,
+            fee_availability=fee_availability,
+            scope_total=total,
         )
     try:
         if text.startswith("```"):
@@ -5879,12 +5956,22 @@ def answer_parking_info_with_llm(
         spoken = str(payload.get("spoken") or answer).strip()
         if not answer:
             return _fallback_parking_info_answer(
-                query, district_label, parks_df, fee_slot_label=fee_slot_label
+                query,
+                district_label,
+                parks_df,
+                fee_slot_label=fee_slot_label,
+                fee_availability=fee_availability,
+                scope_total=total,
             )
         return answer, spoken or answer
     except Exception:
         return _fallback_parking_info_answer(
-            query, district_label, parks_df, fee_slot_label=fee_slot_label
+            query,
+            district_label,
+            parks_df,
+            fee_slot_label=fee_slot_label,
+            fee_availability=fee_availability,
+            scope_total=total,
         )
 
 
@@ -5892,21 +5979,31 @@ def render_saved_info_answer(payload: dict, *, auto_speak: bool = False) -> None
     """重顯示已儲存的停車場資料／說明回覆。"""
     intent = dict(payload.get("intent") or {})
     fee_slot_label = payload.get("fee_slot_label")
+    fee_availability = bool(payload.get("fee_availability"))
+    scope_total = payload.get("scope_total")
     # 舊 session payload 無 wants_fee：有 fee_slot_label 即當明確問收費
     wants_fee = (
         bool(payload["wants_fee"])
         if "wants_fee" in payload
         else bool(fee_slot_label)
     )
-    if fee_slot_label:
+    if fee_availability:
+        intent["_fee_slot_label"] = "有顯示收費／收費資料"
+    elif fee_slot_label:
         intent["_fee_slot_label"] = fee_slot_label
     render_intent_summary(intent, info_mode=True)
     district_label = payload.get("district_label") or district_display_name(
         intent.get("district")
     )
     count = int(payload.get("count") or 0)
+    total = int(scope_total) if scope_total is not None else count
     nearby_suffix = "附近" if intent.get("geo_lat") is not None else ""
-    if wants_fee and fee_slot_label:
+    if fee_availability:
+        st.success(
+            f"「{district_label}」{nearby_suffix}有顯示收費的停車場"
+            f"（{count}／{total} 個）"
+        )
+    elif wants_fee and fee_slot_label:
         st.success(
             f"「{district_label}」{nearby_suffix}停車場收費"
             f"（{fee_slot_label}，共 {count} 個）"
@@ -5926,20 +6023,41 @@ def render_saved_info_answer(payload: dict, *, auto_speak: bool = False) -> None
         spoken,
         auto_speak=auto_speak,
         button_key="info_speech_toggle",
-        show_written=SHOW_WRITTEN_SUGGESTION,
+        show_written=SHOW_WRITTEN_INFO_ANSWER,
     )
     parks_df = parks_df_for_display(pd.DataFrame(payload.get("park_records") or []))
-    if not parks_df.empty and count <= 40:
+    if not parks_df.empty:
+        preview_n = min(len(parks_df), INFO_TABLE_PREVIEW_MAX)
+        preview_df = parks_df.head(preview_n)
         # 保留 latitude／longitude 畀地圖；表格顯示時隱藏
-        display_df = parks_df.drop(columns=list(_TABLE_HIDDEN_COLS), errors="ignore")
+        display_df = preview_df.drop(columns=list(_TABLE_HIDDEN_COLS), errors="ignore")
         st.dataframe(display_df, use_container_width=True, hide_index=True)
-        render_results_map(parks_df, intent=intent)
-        if fee_slot_label and "收費" in parks_df.columns:
+        render_results_map(preview_df, intent=intent)
+        if fee_availability:
+            st.caption(
+                "上表為有政府開放資料私家車收費規則的停車場"
+                + (
+                    f"（共 {count} 個，先顯示前 {preview_n} 個；範圍總數 {total}）。"
+                    if count > preview_n
+                    else f"（共 {count} 個；範圍總數 {total}）。"
+                )
+                + "想知某場幾錢可再問該區／該場收費。"
+            )
+        elif fee_slot_label and "收費" in parks_df.columns:
+            extra = (
+                f"名單較長，先顯示前 {preview_n} 個（共 {count} 個）。"
+                if count > preview_n
+                else ""
+            )
             st.caption(
                 f"收費為「{fee_slot_label}」時段（政府開放資料私家車規則；無資料則顯示未提供）。"
+                f"{extra}"
             )
-    elif count > 40:
-        st.caption(f"該範圍共有 {count} 個停車場，名單較長，以上方文字說明為準。")
+        elif count > preview_n:
+            st.caption(
+                f"該範圍共有 {count} 個停車場，名單較長，先顯示前 {preview_n} 個；"
+                "詳情見上方說明，亦可指定地區再問。"
+            )
     flush_deferred_speech_browser_ops()
     if need_rerun:
         st.rerun()
@@ -5961,8 +6079,10 @@ def run_parking_info_answer(intent: dict, query_text: str) -> None:
         district_label = geo_label or district or district_label
 
     # 結果表一律附上收費（預設用當刻／已指定時段）；成功橫幅／LLM 聚焦收費只喺明確問價時開啟
-    wants_fee = looks_like_fee_query(query_text)
+    fee_availability = looks_like_fee_availability_query(query_text)
+    wants_fee = looks_like_fee_query(query_text) or fee_availability
     fee_slot_label = None
+    scope_total = int(len(parks_df)) if parks_df is not None else 0
     if not parks_df.empty:
         day_cn, hour, minute, is_current = resolve_fee_query_slot(intent, query_text)
         parks_df = attach_fees_to_parks_df(parks_df, day_cn, hour, minute)
@@ -5984,10 +6104,13 @@ def run_parking_info_answer(intent: dict, query_text: str) -> None:
                 parks_df,
                 at_place_ids=at_ids,
             )
+        # 「有邊啲有顯示收費」→ 只保留有規則嘅車場作答
+        if fee_availability:
+            parks_df = filter_parks_with_fee(parks_df)
 
-    if match_type == "nearby" and parks_df.empty:
+    if match_type == "nearby" and scope_total == 0:
         intent_for_summary = dict(intent)
-        if wants_fee and fee_slot_label:
+        if wants_fee and fee_slot_label and not fee_availability:
             intent_for_summary["_fee_slot_label"] = fee_slot_label
         render_feedback_with_speech(
             f"「{district_label}」附近本系統沒有停車場紀錄。"
@@ -6007,18 +6130,26 @@ def run_parking_info_answer(intent: dict, query_text: str) -> None:
             query_text,
             district_label,
             parks_df,
-            fee_slot_label=fee_slot_label if wants_fee else None,
+            fee_slot_label=(
+                None
+                if fee_availability
+                else (fee_slot_label if wants_fee else None)
+            ),
+            fee_availability=fee_availability,
+            scope_total=scope_total,
         )
 
     payload = {
         "intent": intent,
         "district_label": district_label,
         "count": int(len(parks_df)),
+        "scope_total": scope_total,
         "park_records": parks_df_for_display(parks_df).to_dict(orient="records"),
         "written": written,
         "spoken": spoken,
-        "fee_slot_label": fee_slot_label,
+        "fee_slot_label": None if fee_availability else fee_slot_label,
         "wants_fee": wants_fee,
+        "fee_availability": fee_availability,
     }
     _push_search_history(query_text)
     st.session_state.last_info_answer = payload
