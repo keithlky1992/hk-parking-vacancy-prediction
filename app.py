@@ -46,6 +46,7 @@ from parking_result_utils import (
     park_name_matches_place_tokens,
     parks_present_in_baselines,
     pin_venue_parks_into_ranking,
+    query_specifies_non_half_hour_time,
     top_n_exceeds_available,
 )
 
@@ -6757,6 +6758,24 @@ def render_hard_to_park_unsupported(intent: dict, *, auto_speak: bool = True):
     )
 
 
+def render_non_half_hour_blocked(intent: dict, *, auto_speak: bool = True):
+    """時間唔係半小時單位：不執行預測，要求用半小時方式重問。"""
+    # 唔顯示被四捨五入後嘅鐘點，避免誤導（例如 4:45 → 4:30）
+    display_intent = {**intent, "hour": None, "minute": None}
+    render_feedback_with_speech(
+        "這樣是查詢不到的。本系統必須以**半小時**為單位查問"
+        "（例如：六點半、十二點、4:30、11:00），"
+        "不接受四點九、4:45、九點二十七分這類時間。請重新輸入查詢內容。",
+        spoken=(
+            "咁樣係查詢唔到。必須用半小時為單位嘅方式嚟查問，"
+            "例如六點半、十二點、四點半、十一點。"
+            "唔接受四點九、四點四十五分、九點二十七分呢類時間。請重新輸入。"
+        ),
+        intent=display_intent,
+        auto_speak=auto_speak,
+    )
+
+
 auto_submit = st.session_state.pop("auto_submit_query", False)
 should_query = submitted or auto_submit
 query_text = (user_query or "").strip()
@@ -6802,6 +6821,9 @@ if should_query and query_text:
     elif looks_like_hard_to_park_ranking_query(query_text):
         # 「冇咁容易泊／較難泊」：只提示可查較易泊，唔好誤顯示較易泊名單
         render_hard_to_park_unsupported(intent)
+    elif query_specifies_non_half_hour_time(query_text):
+        # 4:45／四點九等：唔好先四捨五入再當「已過去」
+        render_non_half_hour_blocked(intent)
     else:
         geo_error = None
         if not _is_all_hong_kong(intent.get("district")):

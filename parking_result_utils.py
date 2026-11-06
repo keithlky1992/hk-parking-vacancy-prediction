@@ -353,6 +353,120 @@ def looks_like_hard_to_park_ranking_query(query: str) -> bool:
     return any(re.search(p, q) for p in hard_patterns)
 
 
+_CN_DIGIT = {
+    "零": 0,
+    "〇": 0,
+    "○": 0,
+    "一": 1,
+    "二": 2,
+    "兩": 2,
+    "两": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+}
+
+
+def _cn_minute_token_to_int(token: str) -> int | None:
+    """中文分鐘詞 → 0–59；無法解析則 None。"""
+    token = (token or "").strip()
+    if not token:
+        return None
+    if token.isdigit():
+        value = int(token)
+        return value if 0 <= value <= 59 else None
+    if token in ("半",):
+        return 30
+    if token in ("正", "整"):
+        return 0
+    if token in ("一刻",):
+        return 15
+    if token in ("三刻",):
+        return 45
+    if token in ("廿", "二十"):
+        return 20
+    if token in ("卅", "三十"):
+        return 30
+    if token.startswith("廿") and len(token) == 2 and token[1] in _CN_DIGIT:
+        return 20 + _CN_DIGIT[token[1]]
+    if token.startswith("卅") and len(token) == 2 and token[1] in _CN_DIGIT:
+        return 30 + _CN_DIGIT[token[1]]
+    if token == "十":
+        return 10
+    if token.startswith("十") and len(token) == 2 and token[1] in _CN_DIGIT:
+        return 10 + _CN_DIGIT[token[1]]
+    if token.startswith("二十") and len(token) == 3 and token[2] in _CN_DIGIT:
+        return 20 + _CN_DIGIT[token[2]]
+    if token.startswith("三十") and len(token) == 3 and token[2] in _CN_DIGIT:
+        return 30 + _CN_DIGIT[token[2]]
+    if token.startswith("四十") and len(token) == 3 and token[2] in _CN_DIGIT:
+        return 40 + _CN_DIGIT[token[2]]
+    if token.startswith("五十") and len(token) == 3 and token[2] in _CN_DIGIT:
+        return 50 + _CN_DIGIT[token[2]]
+    if token in ("四十",):
+        return 40
+    if token in ("五十",):
+        return 50
+    if token in _CN_DIGIT:
+        return _CN_DIGIT[token]
+    return None
+
+
+def extract_explicit_clock_minute(query: str) -> int | None:
+    """若句子寫明具體分鐘，回傳 0–59；未寫分鐘（如「四點」）則 None。
+
+    「四點半／4:30／4:00」會回傳 30／30／0；「4:45／四點九／九點二十七分」回傳實際分鐘。
+    """
+    q = re.sub(r"\s+", "", query or "")
+    if not q:
+        return None
+
+    m = re.search(r"(?<!\d)([0-2]?\d)[:：]([0-5]?\d)", q)
+    if m:
+        minute = int(m.group(2))
+        return minute if 0 <= minute <= 59 else None
+
+    # 點半／時半
+    if re.search(r"[點时時]半", q):
+        return 30
+
+    # 點一刻／三刻
+    m = re.search(r"[點时時](一刻|三刻)", q)
+    if m:
+        return 15 if m.group(1) == "一刻" else 45
+
+    # 點 + 數字／中文分鐘（可選「分」）
+    m = re.search(
+        r"[點时時]([0-5]?\d|[一二兩三两四五六七八九十廿卅零〇○]+|[正整])分?",
+        q,
+    )
+    if not m:
+        return None
+    return _cn_minute_token_to_int(m.group(1))
+
+
+def is_half_hour_minute(minute: int | None) -> bool:
+    """分鐘是否為半小時單位（0 或 30）。"""
+    if minute is None:
+        return True
+    try:
+        return int(minute) in (0, 30)
+    except (TypeError, ValueError):
+        return False
+
+
+def query_specifies_non_half_hour_time(query: str) -> bool:
+    """用戶查詢時間唔係半小時單位（例如 4:45、四點九、九點二十七分）。"""
+    minute = extract_explicit_clock_minute(query)
+    if minute is None:
+        return False
+    return not is_half_hour_minute(minute)
+
+
 def build_fee_park_id_aliases(
     parks_df: pd.DataFrame,
     fee_ids: set[str] | frozenset[str],

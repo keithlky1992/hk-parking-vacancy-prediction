@@ -9,6 +9,7 @@ import pandas as pd
 from parking_result_utils import (
     build_equivalent_park_id_map,
     build_fee_park_id_aliases,
+    extract_explicit_clock_minute,
     fee_availability_mode,
     fee_coverage_counts,
     fee_value_missing,
@@ -23,6 +24,7 @@ from parking_result_utils import (
     order_parks_for_fee_display,
     parks_present_in_baselines,
     pin_venue_parks_into_ranking,
+    query_specifies_non_half_hour_time,
     top_n_exceeds_available,
 )
 
@@ -109,6 +111,38 @@ class FeeAvailabilityQueryTest(unittest.TestCase):
         self.assertFalse(looks_like_fee_availability_query("彩雲邨今晚收費幾錢"))
         self.assertFalse(looks_like_fee_availability_query("德福廣場時租"))
         self.assertIsNone(fee_availability_mode("德福廣場時租"))
+
+
+class NonHalfHourTimeTest(unittest.TestCase):
+    def test_rejects_non_half_hour_examples(self):
+        cases = {
+            "彩雲邨下晝4點45分邊度比較易泊": 45,
+            "四點九": 9,
+            "4:45": 45,
+            "四點四十五分": 45,
+            "12:05": 5,
+            "九點二十七分": 27,
+            "下晝四點一刻": 15,
+        }
+        for query, minute in cases.items():
+            with self.subTest(query=query):
+                self.assertEqual(extract_explicit_clock_minute(query), minute)
+                self.assertTrue(query_specifies_non_half_hour_time(query))
+
+    def test_allows_half_hour_examples(self):
+        ok_queries = [
+            "黃大仙下晝四點邊度比較易泊",
+            "六點半",
+            "十二點",
+            "4:30",
+            "11:00",
+            "下晝三點半邊度比較易泊",
+            "今晚八點",
+            "彩雲邨附近停車場收費如何",
+        ]
+        for query in ok_queries:
+            with self.subTest(query=query):
+                self.assertFalse(query_specifies_non_half_hour_time(query))
 
 
 class TopNShortfallTest(unittest.TestCase):
