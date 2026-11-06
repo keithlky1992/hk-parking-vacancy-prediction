@@ -836,6 +836,8 @@ def render_brand_header() -> None:
 
 def inject_layout_css() -> None:
     """統一間距與對齊，令標題／查詢列／結果區更整齊。"""
+    # 先掛預製擋查 MP3，之後查詢手勢先至即時播到
+    inject_feedback_mp3_bundle()
     st.markdown(
         """
 <style>
@@ -2011,18 +2013,117 @@ def inject_layout_css() -> None:
     });
   }
 
+  // 擋查固定講稿（同 Python SPOKEN_*）；喺查詢手勢內即播，唔等 server／Edge TTS
+  var FEEDBACK_SPOKEN = {
+    invalid_calendar_date: "你輸入嘅日期並唔存在。請重新輸入查詢內容，例如十一月三十號朝早六點半彩雲邨邊度較易泊。",
+    invalid_clock_time: "你輸入嘅時間並唔存在。請重新輸入查詢內容，例如元朗後日上晝八點半邊度較易泊。",
+    non_half_hour: "咁樣係查詢唔到。必須用半小時為單位嘅方式嚟查問，例如六點半、十二點、四點半、十一點。唔接受四點九、四點四十五分、九點二十七分呢類時間。請重新輸入。"
+  };
+
+  function getUserQueryTextCompact() {
+    var input = doc.querySelector(".st-key-user_query input")
+      || doc.querySelector('div[data-testid="stTextInput"] input');
+    return input ? String(input.value || "").replace(/\\s+/g, "") : "";
+  }
+
+  function detectBlockedFeedbackKey(q) {
+    if (!q) return null;
+    var dm = q.match(/(?:(\\d{4})年)?(\\d{1,2})月(\\d{1,2})[號号日]?/);
+    if (dm) {
+      var year = dm[1] ? parseInt(dm[1], 10) : (new Date()).getFullYear();
+      var month = parseInt(dm[2], 10);
+      var day = parseInt(dm[3], 10);
+      if (month < 1 || month > 12 || day < 1 || day > 31) return "invalid_calendar_date";
+      var dim = new Date(year, month, 0).getDate();
+      if (day > dim) return "invalid_calendar_date";
+    }
+    var cm = q.match(/(?:^|[^\\d])(\\d{1,3})[:：](\\d{1,3})(?!\\d)/);
+    if (cm) {
+      var h = parseInt(cm[1], 10), mi = parseInt(cm[2], 10);
+      if (h > 23 || mi > 59) return "invalid_clock_time";
+      if (mi !== 0 && mi !== 30) return "non_half_hour";
+    }
+    if (/(?:^|[^\\d])(\\d{1,3})[點时時](一刻|三刻)/.test(q)) {
+      var tick = q.match(/(?:^|[^\\d])(\\d{1,3})[點时時](一刻|三刻)/);
+      if (tick && parseInt(tick[1], 10) > 23) return "invalid_clock_time";
+      return "non_half_hour";
+    }
+    var half = q.match(/(?:^|[^\\d])(\\d{1,3})[點时時]半/);
+    if (half) {
+      if (parseInt(half[1], 10) > 23) return "invalid_clock_time";
+      return null;
+    }
+    var hm = q.match(/(?:^|[^\\d])(\\d{1,3})[點时時](\\d{1,3})分?/);
+    if (hm) {
+      var h2 = parseInt(hm[1], 10), mi2 = parseInt(hm[2], 10);
+      if (h2 > 23 || mi2 > 59) return "invalid_clock_time";
+      if (mi2 !== 0 && mi2 !== 30) return "non_half_hour";
+      return null;
+    }
+    var bare = q.match(/(?:^|[^\\d])(\\d{1,3})[點时時]/);
+    if (bare && parseInt(bare[1], 10) > 23) return "invalid_clock_time";
+    return null;
+  }
+
+  function speakBlockedFeedbackInGesture() {
+    var key = detectBlockedFeedbackKey(getUserQueryTextCompact());
+    if (!key) {
+      root.__hkParkingGestureSpokeFeedback = false;
+      return false;
+    }
+    var text = FEEDBACK_SPOKEN[key];
+    if (!text) return false;
+    root.__hkParkingGestureSpokeFeedback = true;
+    root.__hkParkingGestureSpokeText = text;
+    root.__hkParkingSpeechLastText = text;
+    var src = root.__hkParkingFeedbackMp3 && root.__hkParkingFeedbackMp3[key];
+    // 優先同一支已 unlock 嘅 Audio 播預製 MP3（撑過 Streamlit 重繪；Web Speech 易被打斷）
+    if (src && typeof root.__hkParkingPlayUnlockedMedia === "function") {
+      try {
+        root.__hkParkingPlayUnlockedMedia(src, {
+          onStart: function () { setSpeechSpeakingUi(true); },
+          onEnded: function () { setSpeechSpeakingUi(false); },
+          onError: function () {
+            try {
+              speech.speak(text, { immediate: true });
+              setSpeechSpeakingUi(true);
+            } catch (e2) {}
+          }
+        });
+        return true;
+      } catch (e) {}
+    }
+    try {
+      speech.speak(text, { immediate: true });
+      setSpeechSpeakingUi(true);
+    } catch (e) {
+      return false;
+    }
+    return true;
+  }
+
+  function onQuerySubmitGesture(fromClick) {
+    // click 唔好 stop：否則會切斷 pointerdown 已開始嘅擋查朗讀
+    if (!fromClick) {
+      stopSuggestionPlaybackOnly();
+    }
+    unlockSpeechNow();
+    if (root.__hkParkingQueryGestureLock) return;
+    root.__hkParkingQueryGestureLock = true;
+    root.setTimeout(function () { root.__hkParkingQueryGestureLock = false; }, 900);
+    speakBlockedFeedbackInGesture();
+  }
+
   function bindQueryStopSpeech() {
     doc.querySelectorAll('div[data-testid="stFormSubmitButton"] button').forEach(function (btn) {
       if (btn.dataset.stopSpeechBound) return;
       btn.dataset.stopSpeechBound = "1";
-      // 查詢掣手勢內解鎖 Media／TTS（先停舊播，再 unlock），結果頁自動朗讀先可喺 iOS／手機出聲
+      // 查詢掣手勢內：unlock + 若無效月日／鐘點即時朗讀（唔等結果頁）
       btn.addEventListener("pointerdown", function () {
-        stopSuggestionPlaybackOnly();
-        unlockSpeechNow();
+        onQuerySubmitGesture(false);
       }, true);
       btn.addEventListener("click", function () {
-        stopSuggestionPlaybackOnly();
-        unlockSpeechNow();
+        onQuerySubmitGesture(true);
       }, true);
     });
   }
@@ -2095,9 +2196,8 @@ def inject_layout_css() -> None:
     input.dataset.mzdBlurBound = "1";
     input.addEventListener("keydown", function (e) {
       if (e.key !== "Enter") return;
-      // Enter 送出唔經「查詢」掣 pointerdown；必須喺手勢內停舊播＋解鎖，結果頁先可自動朗讀
-      stopSuggestionPlaybackOnly();
-      unlockSpeechNow();
+      // Enter 送出唔經「查詢」掣 pointerdown；手勢內 unlock＋擋查即時朗讀
+      onQuerySubmitGesture(false);
       scheduleBlurUserQuery();
     });
   }
@@ -2171,6 +2271,42 @@ def inject_layout_css() -> None:
   }
   root.__hkParkingUiInterval = root.setInterval(runUiPolish, 400);
 })();
+</script>
+        """,
+        height=1,
+    )
+
+
+def inject_feedback_mp3_bundle() -> None:
+    """把擋查預製 MP3 掛到 parent（只載一次），畀查詢手勢內即時播放。"""
+    uris: dict[str, str] = {}
+    for key in (
+        "invalid_calendar_date",
+        "invalid_clock_time",
+        "non_half_hour",
+    ):
+        path = Path(__file__).resolve().parent / "assets" / "tts" / f"{key}.mp3"
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            continue
+        if raw:
+            uris[key] = (
+                "data:audio/mpeg;base64,"
+                + base64.b64encode(raw).decode("ascii")
+            )
+    if not uris:
+        return
+    payload = json.dumps(uris, ensure_ascii=False)
+    components.html(
+        f"""
+<script>
+(function () {{
+  var root = window.parent;
+  if (!root.__hkParkingFeedbackMp3) {{
+    try {{ root.__hkParkingFeedbackMp3 = {payload}; }} catch (e) {{}}
+  }}
+}})();
 </script>
         """,
         height=1,
@@ -3836,6 +3972,26 @@ def _synthesize_zh_hk_mp3_cached(text: str) -> bytes:
     return audio
 
 
+_FEEDBACK_MP3_BY_SPOKEN = {
+    SPOKEN_INVALID_CALENDAR_DATE: "invalid_calendar_date.mp3",
+    SPOKEN_INVALID_CLOCK_TIME: "invalid_clock_time.mp3",
+    SPOKEN_NON_HALF_HOUR: "non_half_hour.mp3",
+}
+
+
+def _load_bundled_feedback_mp3(text: str) -> bytes | None:
+    """擋查固定講稿：讀預製 MP3，唔經 Edge TTS（第一次自動播唔使等網絡）。"""
+    fname = _FEEDBACK_MP3_BY_SPOKEN.get((text or "").strip())
+    if not fname:
+        return None
+    path = Path(__file__).resolve().parent / "assets" / "tts" / fname
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    return data or None
+
+
 def synthesize_zh_hk_mp3(text: str) -> bytes | None:
     """用 Edge 粵語 Neural 聲線合成 MP3（手機 HTML5 Audio 播放較 speechSynthesis 可靠）。
 
@@ -3848,6 +4004,10 @@ def synthesize_zh_hk_mp3(text: str) -> bytes | None:
     # 避免極長稿拖垮 Cloud／base64
     if len(text) > 800:
         text = text[:800]
+
+    bundled = _load_bundled_feedback_mp3(text)
+    if bundled:
+        return bundled
 
     try:
         import edge_tts  # noqa: F401
@@ -4089,6 +4249,14 @@ def render_iframe_speech_player(
   function tryAutoSpeak() {{
     if (uiSpeaking) return;
     var parent = window.parent;
+    // 查詢手勢內已播過擋查提示：唔好再自動播一次（亦避免等 MP3 期間無聲）
+    try {{
+      if (parent && parent.__hkParkingGestureSpokeFeedback) {{
+        parent.__hkParkingGestureSpokeFeedback = false;
+        setUi(false);
+        return;
+      }}
+    }} catch (e) {{}}
     // 優先：排隊畀 parent keepalive 期間播（語音／iOS 最穩）
     if (audioSrc && parent && (
       typeof parent.__hkParkingQueueUnlockedMedia === "function"
