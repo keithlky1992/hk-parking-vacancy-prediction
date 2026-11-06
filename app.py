@@ -836,8 +836,6 @@ def render_brand_header() -> None:
 
 def inject_layout_css() -> None:
     """統一間距與對齊，令標題／查詢列／結果區更整齊。"""
-    # 先掛預製擋查 MP3，之後查詢手勢先至即時播到
-    inject_feedback_mp3_bundle()
     st.markdown(
         """
 <style>
@@ -1544,19 +1542,24 @@ def inject_layout_css() -> None:
       if (!sameSilent) {
         a.src = SILENT_WAV;
       }
-      var p = a.play();
-      if (p && typeof p.then === "function") {
-        p.then(function () {
-          root.__hkParkingMediaUnlocked = true;
-          startKeepaliveWatch();
-        }).catch(function () {
-          root.__hkParkingMediaUnlocked = true;
-          startKeepaliveWatch();
-        });
-      } else {
+      var markUnlockedAndFlush = function () {
         root.__hkParkingMediaUnlocked = true;
         startKeepaliveWatch();
+        // 擋查結果好快返：MP3 可能已排隊，unlock 完成先至可換 src
+        try { flushPendingUnlockedMedia(); } catch (e3) {}
+      };
+      var p = a.play();
+      if (p && typeof p.then === "function") {
+        p.then(markUnlockedAndFlush).catch(markUnlockedAndFlush);
+      } else {
+        markUnlockedAndFlush();
       }
+      // 防 silent play() 掛住：逾時仍標 unlocked 並 flush 排隊中嘅自動播
+      root.setTimeout(function () {
+        if (root.__hkParkingMediaUnlocked) return;
+        if (!root.__hkParkingMediaKeepalive && !root.__hkParkingMediaAudio) return;
+        markUnlockedAndFlush();
+      }, 450);
     } catch (e) {}
   }
 
@@ -1746,6 +1749,13 @@ def inject_layout_css() -> None:
       if (typeof cbs.onError === "function") cbs.onError();
       return false;
     }
+    // iOS：silent keepalive 嘅 play() 未 resolve 前唔好換 MP3 src，否則會丟手勢解鎖
+    // （擋查／規則攔截好快返結果時最易踩中；語音長等待通常已 unlocked）
+    if (!root.__hkParkingMediaUnlocked) {
+      root.__hkParkingPendingAutoSrc = src;
+      root.__hkParkingPendingAutoCbs = cbs;
+      return true;
+    }
     // 語音長等待：優先同一 HTML5 元素（keepalive → 換 MP3）
     if (root.__hkParkingMediaKeepalive || root.__hkParkingMediaUnlocked) {
       stopOscKeepalive();
@@ -1793,13 +1803,14 @@ def inject_layout_css() -> None:
   function flushPendingUnlockedMedia() {
     var src = root.__hkParkingPendingAutoSrc;
     if (!src) return false;
-    if (!(root.__hkParkingMediaKeepalive || root.__hkParkingMediaUnlocked || root.__hkParkingAudioCtxUnlocked)) {
-      // 語音查詢：再試救返 keepalive（曾經解鎖先有機會）
-      if (isVoiceQueryArmed()) reviveKeepaliveIfPossible();
-      if (!(root.__hkParkingMediaKeepalive || root.__hkParkingMediaUnlocked || root.__hkParkingAudioCtxUnlocked)) {
-        return false;
+    // 未完成 HTML5 unlock：保留排隊，等 unlock .then／timeout flush
+    if (!root.__hkParkingMediaUnlocked) {
+      if (isVoiceQueryArmed()) {
+        try { reviveKeepaliveIfPossible(); } catch (e) {}
       }
-    } else if (!root.__hkParkingMediaKeepalive && root.__hkParkingMediaUnlocked) {
+      return false;
+    }
+    if (!root.__hkParkingMediaKeepalive && root.__hkParkingMediaUnlocked) {
       reviveKeepaliveIfPossible();
     }
     root.__hkParkingPendingAutoSrc = null;
@@ -2013,116 +2024,19 @@ def inject_layout_css() -> None:
     });
   }
 
-  // 擋查固定講稿（同 Python SPOKEN_*）；喺查詢手勢內即播，唔等 server／Edge TTS
-  var FEEDBACK_SPOKEN = {
-    invalid_calendar_date: "你輸入嘅日期並唔存在。請重新輸入查詢內容，例如十一月三十號朝早六點半彩雲邨邊度較易泊。",
-    invalid_clock_time: "你輸入嘅時間並唔存在。請重新輸入查詢內容，例如元朗後日上晝八點半邊度較易泊。",
-    non_half_hour: "咁樣係查詢唔到。必須用半小時為單位嘅方式嚟查問，例如六點半、十二點、四點半、十一點。唔接受四點九、四點四十五分、九點二十七分呢類時間。請重新輸入。"
-  };
-
-  function getUserQueryTextCompact() {
-    var input = doc.querySelector(".st-key-user_query input")
-      || doc.querySelector('div[data-testid="stTextInput"] input');
-    return input ? String(input.value || "").replace(/\\s+/g, "") : "";
-  }
-
-  function detectBlockedFeedbackKey(q) {
-    if (!q) return null;
-    var dm = q.match(/(?:(\\d{4})年)?(\\d{1,2})月(\\d{1,2})[號号日]?/);
-    if (dm) {
-      var year = dm[1] ? parseInt(dm[1], 10) : (new Date()).getFullYear();
-      var month = parseInt(dm[2], 10);
-      var day = parseInt(dm[3], 10);
-      if (month < 1 || month > 12 || day < 1 || day > 31) return "invalid_calendar_date";
-      var dim = new Date(year, month, 0).getDate();
-      if (day > dim) return "invalid_calendar_date";
-    }
-    var cm = q.match(/(?:^|[^\\d])(\\d{1,3})[:：](\\d{1,3})(?!\\d)/);
-    if (cm) {
-      var h = parseInt(cm[1], 10), mi = parseInt(cm[2], 10);
-      if (h > 23 || mi > 59) return "invalid_clock_time";
-      if (mi !== 0 && mi !== 30) return "non_half_hour";
-    }
-    if (/(?:^|[^\\d])(\\d{1,3})[點时時](一刻|三刻)/.test(q)) {
-      var tick = q.match(/(?:^|[^\\d])(\\d{1,3})[點时時](一刻|三刻)/);
-      if (tick && parseInt(tick[1], 10) > 23) return "invalid_clock_time";
-      return "non_half_hour";
-    }
-    var half = q.match(/(?:^|[^\\d])(\\d{1,3})[點时時]半/);
-    if (half) {
-      if (parseInt(half[1], 10) > 23) return "invalid_clock_time";
-      return null;
-    }
-    var hm = q.match(/(?:^|[^\\d])(\\d{1,3})[點时時](\\d{1,3})分?/);
-    if (hm) {
-      var h2 = parseInt(hm[1], 10), mi2 = parseInt(hm[2], 10);
-      if (h2 > 23 || mi2 > 59) return "invalid_clock_time";
-      if (mi2 !== 0 && mi2 !== 30) return "non_half_hour";
-      return null;
-    }
-    var bare = q.match(/(?:^|[^\\d])(\\d{1,3})[點时時]/);
-    if (bare && parseInt(bare[1], 10) > 23) return "invalid_clock_time";
-    return null;
-  }
-
-  function speakBlockedFeedbackInGesture() {
-    var key = detectBlockedFeedbackKey(getUserQueryTextCompact());
-    if (!key) {
-      root.__hkParkingGestureSpokeFeedback = false;
-      return false;
-    }
-    var text = FEEDBACK_SPOKEN[key];
-    if (!text) return false;
-    root.__hkParkingGestureSpokeText = text;
-    root.__hkParkingSpeechLastText = text;
-    // 未確認起播前唔好標「已播」：否則結果頁會 skip，手勢又失敗 → 完全無聲
-    root.__hkParkingGestureSpokeFeedback = false;
-    var src = root.__hkParkingFeedbackMp3 && root.__hkParkingFeedbackMp3[key];
-    // 只喺手勢內用已 unlock Audio 播預製 MP3；唔用 Web Speech（重繪易切斷又誤標已播）
-    if (src && typeof root.__hkParkingPlayUnlockedMedia === "function") {
-      try {
-        root.__hkParkingPlayUnlockedMedia(src, {
-          onStart: function () {
-            root.__hkParkingGestureSpokeFeedback = true;
-            setSpeechSpeakingUi(true);
-          },
-          onEnded: function () { setSpeechSpeakingUi(false); },
-          onError: function () {
-            root.__hkParkingGestureSpokeFeedback = false;
-            setSpeechSpeakingUi(false);
-          }
-        });
-        return true;
-      } catch (e) {
-        root.__hkParkingGestureSpokeFeedback = false;
-      }
-    }
-    // 預製 MP3 未載入：交俾結果頁自動播（server 端讀檔即有 MP3）
-    return false;
-  }
-
-  function onQuerySubmitGesture(fromClick) {
-    // click 唔好 stop：否則會切斷 pointerdown 已開始嘅擋查朗讀
-    if (!fromClick) {
-      stopSuggestionPlaybackOnly();
-    }
-    unlockSpeechNow();
-    if (root.__hkParkingQueryGestureLock) return;
-    root.__hkParkingQueryGestureLock = true;
-    root.setTimeout(function () { root.__hkParkingQueryGestureLock = false; }, 900);
-    speakBlockedFeedbackInGesture();
-  }
-
   function bindQueryStopSpeech() {
     doc.querySelectorAll('div[data-testid="stFormSubmitButton"] button').forEach(function (btn) {
       if (btn.dataset.stopSpeechBound) return;
       btn.dataset.stopSpeechBound = "1";
-      // 查詢掣手勢內：unlock + 若無效月日／鐘點即時朗讀（唔等結果頁）
+      // 查詢掣手勢內只 unlock／keepalive；自動播等 MediaUnlocked 後由結果頁排隊播放
+      // （擋查太快時若喺 silent play() 未完成就換 MP3，iOS 會丟解鎖）
       btn.addEventListener("pointerdown", function () {
-        onQuerySubmitGesture(false);
+        stopSuggestionPlaybackOnly();
+        unlockSpeechNow();
       }, true);
       btn.addEventListener("click", function () {
-        onQuerySubmitGesture(true);
+        // 唔 stop：避免打斷 pointerdown 已開始嘅 unlock keepalive
+        unlockSpeechNow();
       }, true);
     });
   }
@@ -2195,8 +2109,9 @@ def inject_layout_css() -> None:
     input.dataset.mzdBlurBound = "1";
     input.addEventListener("keydown", function (e) {
       if (e.key !== "Enter") return;
-      // Enter 送出唔經「查詢」掣 pointerdown；手勢內 unlock＋擋查即時朗讀
-      onQuerySubmitGesture(false);
+      // Enter 送出唔經「查詢」掣 pointerdown；必須喺手勢內停舊播＋解鎖
+      stopSuggestionPlaybackOnly();
+      unlockSpeechNow();
       scheduleBlurUserQuery();
     });
   }
@@ -2270,42 +2185,6 @@ def inject_layout_css() -> None:
   }
   root.__hkParkingUiInterval = root.setInterval(runUiPolish, 400);
 })();
-</script>
-        """,
-        height=1,
-    )
-
-
-def inject_feedback_mp3_bundle() -> None:
-    """把擋查預製 MP3 掛到 parent（只載一次），畀查詢手勢內即時播放。"""
-    uris: dict[str, str] = {}
-    for key in (
-        "invalid_calendar_date",
-        "invalid_clock_time",
-        "non_half_hour",
-    ):
-        path = Path(__file__).resolve().parent / "assets" / "tts" / f"{key}.mp3"
-        try:
-            raw = path.read_bytes()
-        except OSError:
-            continue
-        if raw:
-            uris[key] = (
-                "data:audio/mpeg;base64,"
-                + base64.b64encode(raw).decode("ascii")
-            )
-    if not uris:
-        return
-    payload = json.dumps(uris, ensure_ascii=False)
-    components.html(
-        f"""
-<script>
-(function () {{
-  var root = window.parent;
-  if (!root.__hkParkingFeedbackMp3) {{
-    try {{ root.__hkParkingFeedbackMp3 = {payload}; }} catch (e) {{}}
-  }}
-}})();
 </script>
         """,
         height=1,
@@ -4248,23 +4127,7 @@ def render_iframe_speech_player(
   function tryAutoSpeak() {{
     if (uiSpeaking) return;
     var parent = window.parent;
-    // 手勢已真正起播擋查 MP3：skip。若只係「試過但失敗／被打斷」→ 繼續自動播
-    try {{
-      if (parent && parent.__hkParkingGestureSpokeFeedback) {{
-        var stillPlaying = false;
-        try {{
-          if (typeof parent.__hkParkingIsUnlockedMediaPlaying === "function") {{
-            stillPlaying = !!parent.__hkParkingIsUnlockedMediaPlaying();
-          }}
-        }} catch (e2) {{}}
-        parent.__hkParkingGestureSpokeFeedback = false;
-        if (stillPlaying) {{
-          setUi(true);
-          return;
-        }}
-      }}
-    }} catch (e) {{}}
-    // 優先：排隊畀 parent keepalive 期間播（語音／iOS 最穩）
+    // 優先：排隊畀 parent；未 MediaUnlocked 會留喺 queue，等 unlock flush
     if (audioSrc && parent && (
       typeof parent.__hkParkingQueueUnlockedMedia === "function"
       || typeof parent.__hkParkingPlayUnlockedMedia === "function"
