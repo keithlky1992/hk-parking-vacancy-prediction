@@ -31,6 +31,7 @@ from parking_result_utils import (
     parse_past_relative_calendar_date,
     parse_top_n_from_query,
     pin_venue_parks_into_ranking,
+    query_mentions_invalid_calendar_date,
     query_specifies_non_half_hour_time,
     relative_day_offset_from_query,
     resolve_yearless_calendar_date,
@@ -252,6 +253,39 @@ class PredictionHorizonTest(unittest.TestCase):
     def test_far_future_absolute_blocked(self):
         sep2027 = datetime(2027, 9, 30, tzinfo=ZoneInfo("Asia/Hong_Kong"))
         self.assertTrue(is_beyond_prediction_horizon(sep2027, today=self.today))
+
+
+class InvalidCalendarDateTest(unittest.TestCase):
+    def setUp(self):
+        self.today = datetime(2026, 11, 6, tzinfo=ZoneInfo("Asia/Hong_Kong"))
+
+    def test_november_31_rejected(self):
+        label = query_mentions_invalid_calendar_date(
+            "11月31號朝早六點半彩雲邨邊六個停車場比較易泊呢",
+            today=self.today,
+        )
+        self.assertEqual(label, "11月31號")
+
+    def test_february_30_rejected(self):
+        label = query_mentions_invalid_calendar_date(
+            "天水圍2月30日邊度易泊", today=self.today
+        )
+        self.assertEqual(label, "2月30號")
+
+    def test_valid_november_30_ok(self):
+        self.assertIsNone(
+            query_mentions_invalid_calendar_date(
+                "11月30號朝早六點半彩雲邨邊度較易泊",
+                today=self.today,
+            )
+        )
+
+    def test_no_absolute_date_ok(self):
+        self.assertIsNone(
+            query_mentions_invalid_calendar_date(
+                "天水圍聽日晚上八點邊度較易泊", today=self.today
+            )
+        )
 
 
 class CnCountAndTopNParseTest(unittest.TestCase):

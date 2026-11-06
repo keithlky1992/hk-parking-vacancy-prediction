@@ -50,6 +50,7 @@ from parking_result_utils import (
     MAX_PREDICTION_HORIZON_DAYS,
     parse_past_relative_calendar_date,
     parse_top_n_from_query,
+    query_mentions_invalid_calendar_date,
     query_specifies_non_half_hour_time,
     relative_day_offset_from_query,
     resolve_yearless_calendar_date,
@@ -7099,6 +7100,29 @@ def render_beyond_horizon_blocked(intent: dict, *, auto_speak: bool = True):
     )
 
 
+def render_invalid_calendar_date_blocked(
+    intent: dict, date_label: str, *, auto_speak: bool = True
+):
+    """無效月日（如 11月31號）：唔好讓 LLM 改寫成其他日子，要求重新輸入。"""
+    # 清掉估錯嘅 absolute_date／星期，避免意圖卡顯示「11月9日」
+    display_intent = {
+        **intent,
+        "day": None,
+        "absolute_date": None,
+        "day_next_week": False,
+    }
+    render_feedback_with_speech(
+        f"你輸入的日期 **{date_label}** 不存在。"
+        f"請重新輸入查詢內容（例如：11月30號朝早六點半彩雲邨邊度較易泊？）。",
+        spoken=(
+            f"你輸入嘅日期{date_label}並唔存在。"
+            "請重新輸入查詢內容，例如十一月三十號朝早六點半彩雲邨邊度較易泊。"
+        ),
+        intent=display_intent,
+        auto_speak=auto_speak,
+    )
+
+
 def render_hard_to_park_unsupported(intent: dict, *, auto_speak: bool = True):
     """用戶問較難／冇咁易泊：本系統只提供較易泊排名。"""
     district = (
@@ -7192,6 +7216,11 @@ if should_query and query_text:
     elif looks_like_hard_to_park_ranking_query(query_text):
         # 「冇咁容易泊／較難泊」：只提示可查較易泊，唔好誤顯示較易泊名單
         render_hard_to_park_unsupported(intent)
+    elif (
+        invalid_date_label := query_mentions_invalid_calendar_date(query_text)
+    ):
+        # 11月31號等：唔好交俾 LLM 改寫成其他日子再預測
+        render_invalid_calendar_date_blocked(intent, invalid_date_label)
     elif query_specifies_non_half_hour_time(query_text):
         # 4:45／四點九等：唔好先四捨五入再當「已過去」
         render_non_half_hour_blocked(intent)

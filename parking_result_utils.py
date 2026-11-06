@@ -85,6 +85,55 @@ def parse_past_relative_calendar_date(
     )
 
 
+def extract_mentioned_calendar_ymd(
+    query: str,
+) -> tuple[int | None, int, int] | None:
+    """句子若寫明月日（可選年份），回傳 (year|None, month, day)；否則 None。"""
+    q = (query or "").replace(" ", "")
+    if not q:
+        return None
+    m = re.search(
+        r"(?:(?P<year>\d{4})年)?(?P<month>\d{1,2})月(?P<day>\d{1,2})[號号日]?",
+        q,
+    )
+    if m:
+        year = int(m.group("year")) if m.group("year") else None
+        return year, int(m.group("month")), int(m.group("day"))
+    m2 = re.search(r"(?<!\d)(\d{1,2})[/\-.](\d{1,2})(?!\d)", q)
+    if not m2:
+        return None
+    return None, int(m2.group(1)), int(m2.group(2))
+
+
+def format_mentioned_calendar_ymd_label(
+    year: int | None, month: int, day: int
+) -> str:
+    """顯示用：2026年11月31號／11月31號。"""
+    if year is not None:
+        return f"{year}年{month}月{day}號"
+    return f"{month}月{day}號"
+
+
+def query_mentions_invalid_calendar_date(
+    query: str, today: datetime | None = None
+) -> str | None:
+    """若寫明無法成立嘅月日（如 11月31號），回傳該日子標籤；否則 None。"""
+    extracted = extract_mentioned_calendar_ymd(query)
+    if extracted is None:
+        return None
+    year, month, day = extracted
+    label = format_mentioned_calendar_ymd_label(year, month, day)
+    if not (1 <= month <= 12 and 1 <= day <= 31):
+        return label
+    base = today or datetime.now()
+    resolved = resolve_yearless_calendar_date(
+        month, day, today=base, year=year
+    )
+    if resolved is None:
+        return label
+    return None
+
+
 def resolve_yearless_calendar_date(
     month: int,
     day: int,
