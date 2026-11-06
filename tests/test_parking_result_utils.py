@@ -15,6 +15,7 @@ from parking_result_utils import (
     filter_parks_with_fee,
     filter_parks_without_fee,
     first_available_fee,
+    format_top_n_shortfall_notice,
     looks_like_fee_availability_query,
     looks_like_hard_to_park_ranking_query,
     merge_baseline_packs,
@@ -22,6 +23,7 @@ from parking_result_utils import (
     order_parks_for_fee_display,
     parks_present_in_baselines,
     pin_venue_parks_into_ranking,
+    top_n_exceeds_available,
 )
 
 
@@ -107,6 +109,24 @@ class FeeAvailabilityQueryTest(unittest.TestCase):
         self.assertFalse(looks_like_fee_availability_query("彩雲邨今晚收費幾錢"))
         self.assertFalse(looks_like_fee_availability_query("德福廣場時租"))
         self.assertIsNone(fee_availability_mode("德福廣場時租"))
+
+
+class TopNShortfallTest(unittest.TestCase):
+    def test_detects_when_request_exceeds_available(self):
+        self.assertTrue(top_n_exceeds_available(100, 9))
+        self.assertFalse(top_n_exceeds_available(100, 100))
+        self.assertFalse(top_n_exceeds_available(100, 120))
+        self.assertFalse(top_n_exceeds_available(100, 9, used_default=True))
+        self.assertFalse(top_n_exceeds_available(0, 9))
+
+    def test_shortfall_notice_mentions_requested_and_available(self):
+        written = format_top_n_shortfall_notice(100, 9, "啟德附近", style="written")
+        spoken = format_top_n_shortfall_notice(100, 9, "啟德附近", style="spoken")
+        self.assertIn("100", written)
+        self.assertIn("9", written)
+        self.assertIn("啟德附近", written)
+        self.assertIn("冇100個停車場咁多", spoken)
+        self.assertIn("9", spoken)
 
 
 class HardToParkRankingQueryTest(unittest.TestCase):

@@ -37,6 +37,7 @@ from parking_result_utils import (
     filter_parks_with_fee,
     filter_parks_without_fee,
     first_available_fee,
+    format_top_n_shortfall_notice,
     looks_like_fee_availability_query,
     looks_like_hard_to_park_ranking_query,
     merge_baseline_packs,
@@ -45,6 +46,7 @@ from parking_result_utils import (
     park_name_matches_place_tokens,
     parks_present_in_baselines,
     pin_venue_parks_into_ranking,
+    top_n_exceeds_available,
 )
 
 WEEKDAY_CN = {0: "週一", 1: "週二", 2: "週三", 3: "週四", 4: "週五", 5: "週六", 6: "週日"}
@@ -4151,12 +4153,15 @@ def render_saved_prediction(payload: dict, *, auto_speak: bool = False) -> None:
     asking_now = bool(payload.get("asking_now"))
     top_n_default = bool(payload.get("top_n_default"))
     place_ease = bool(payload.get("place_ease"))
+    top_n_shortfall = bool(payload.get("top_n_shortfall"))
+    requested_top_n = int(payload.get("requested_top_n") or top_n)
+    available_count = int(payload.get("available_count") or shown)
     time_str = format_time_12h(hour, minute)
     half_hour = to_half_hour_slot(hour, minute)
 
     render_intent_summary(
         intent,
-        resolved_top_n=top_n,
+        resolved_top_n=requested_top_n if top_n_shortfall else top_n,
         top_n_default=top_n_default,
     )
     if asking_now:
@@ -4164,6 +4169,15 @@ def render_saved_prediction(payload: dict, *, auto_speak: bool = False) -> None:
             f"我們的預測系統以半小時為單位。"
             f"你查詢的是「而家／現在」，因此顯示未來 1–30 分鐘內"
             f"下一個半小時（{time_str}）的預測結果。"
+        )
+    if top_n_shortfall:
+        st.warning(
+            format_top_n_shortfall_notice(
+                requested_top_n,
+                available_count,
+                district_label,
+                style="written",
+            )
         )
     if place_ease:
         st.caption("你問的是該地點本身容唔容易泊，因此只顯示該場所停車場。")
@@ -4180,6 +4194,11 @@ def render_saved_prediction(payload: dict, *, auto_speak: bool = False) -> None:
         st.success(
             f"{day} {time_str}「{district_label}」停車場空位預測"
             f"（共 {shown} 個）{ease}"
+        )
+    elif top_n_shortfall:
+        st.success(
+            f"{day} {time_str} {district_label} 較易泊車的停車場"
+            f"（共 {shown} 個）"
         )
     elif shown > top_n:
         st.success(
@@ -6266,6 +6285,7 @@ def run_vacancy_prediction(intent: dict, query_text: str):
         hour, minute = normalize_half_hour(hour, minute)
     half_hour = to_half_hour_slot(hour, minute)
     top_n, top_n_default = resolve_top_n(query_text, intent)
+    requested_top_n = top_n
     dow_num = DAY_TO_NUM.get(day, 0)
     dist_map: dict[str, float] = {}
     match_type = "all"
@@ -6446,6 +6466,18 @@ def run_vacancy_prediction(intent: dict, query_text: str):
     result_df = result_df[ordered]
 
     shown = len(result_df)
+    # 用戶明確要求 N 個，但範圍內可用車場少過 N → 提示並列出全部
+    available_count = int(len(pred_df)) if pred_df is not None else shown
+    top_n_shortfall = (not place_ease) and top_n_exceeds_available(
+        requested_top_n,
+        available_count,
+        used_default=top_n_default,
+    )
+    if top_n_shortfall:
+        # select_top_* 喺 top_n ≥ 池大小時已回傳全部；標題改用實際數量
+        available_count = shown
+        top_n = shown
+
     if place_ease:
         written = format_top_suggestion(result_df, hour, minute)
         spoken = format_spoken_place_ease(
@@ -6454,6 +6486,24 @@ def run_vacancy_prediction(intent: dict, query_text: str):
     else:
         written = format_top_suggestion(result_df, hour, minute)
         spoken = format_spoken_suggestion(result_df, hour, minute)
+
+    if top_n_shortfall:
+        notice_w = format_top_n_shortfall_notice(
+            requested_top_n,
+            available_count,
+            district_label,
+            style="written",
+        )
+        notice_s = format_top_n_shortfall_notice(
+            requested_top_n,
+            available_count,
+            district_label,
+            style="spoken",
+        )
+        written = f"{notice_w}\n\n{written}" if written else notice_w
+        spoken = prepare_spoken_text_for_tts(
+            f"{notice_s}{spoken}" if spoken else notice_s
+        )
 
     profile_df = pd.DataFrame()
     if not result_df.empty and "park_id" in result_df.columns:
@@ -6481,6 +6531,9 @@ def run_vacancy_prediction(intent: dict, query_text: str):
         "district_label": district_label,
         "top_n": top_n,
         "top_n_default": top_n_default,
+        "top_n_shortfall": top_n_shortfall,
+        "requested_top_n": requested_top_n,
+        "available_count": available_count,
         "shown": shown,
         "place_ease": place_ease,
         "result_records": result_df.to_dict(orient="records"),

@@ -93,6 +93,48 @@ def first_available_fee(values) -> str | None:
     return None
 
 
+def top_n_exceeds_available(
+    requested_top_n: int,
+    available_count: int,
+    *,
+    used_default: bool = False,
+) -> bool:
+    """用戶明確要求 N 個，但查詢範圍內可用車場少過 N。"""
+    if used_default:
+        return False
+    try:
+        req = int(requested_top_n)
+        avail = int(available_count)
+    except (TypeError, ValueError):
+        return False
+    return req > 0 and avail >= 0 and avail < req
+
+
+def format_top_n_shortfall_notice(
+    requested_top_n: int,
+    available_count: int,
+    place_label: str = "",
+    *,
+    style: str = "written",
+) -> str:
+    """要求數量超過實際可用時的提示（written／spoken）。"""
+    try:
+        req = int(requested_top_n)
+        avail = int(available_count)
+    except (TypeError, ValueError):
+        return ""
+    place = (place_label or "").strip() or "該範圍"
+    if style == "spoken":
+        return (
+            f"你想查詢嘅地方冇{req}個停車場咁多，"
+            f"「{place}」而家得{avail}個，以下係呢度全部停車場。"
+        )
+    return (
+        f"你想查詢嘅地方沒有 {req} 個停車場那麼多；"
+        f"「{place}」目前共有 {avail} 個，以下列出該範圍全部停車場。"
+    )
+
+
 def pin_venue_parks_into_ranking(
     at_place: pd.DataFrame,
     nearby_ranked: pd.DataFrame,
