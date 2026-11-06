@@ -1315,10 +1315,18 @@ def inject_layout_css() -> None:
       try {
         root.__hkParkingMediaAudio.style.cssText =
           "position:fixed;width:0;height:0;opacity:0;pointer-events:none;";
-        (root.document.body || root.document.documentElement)
-          .appendChild(root.__hkParkingMediaAudio);
       } catch (e) {}
     }
+    // Streamlit 重繪後 Audio 可能被移出 DOM；掛返 body 先保住 iOS 解鎖
+    try {
+      var mediaEl = root.__hkParkingMediaAudio;
+      var host = root.document.body || root.document.documentElement;
+      if (mediaEl && host && !mediaEl.isConnected) {
+        host.appendChild(mediaEl);
+      } else if (mediaEl && host && !mediaEl.parentNode) {
+        host.appendChild(mediaEl);
+      }
+    } catch (e) {}
     return root.__hkParkingMediaAudio;
   }
 
@@ -1419,7 +1427,8 @@ def inject_layout_css() -> None:
 
   function markVoiceQueryArmed() {
     root.__hkParkingVoiceQueryArmed = true;
-    root.__hkParkingVoiceQueryArmedUntil = Date.now() + 60000;
+    // 涵蓋 Edge TTS 冷啟動；太短會令第一次自動播喺 MP3 就緒前就放棄
+    root.__hkParkingVoiceQueryArmedUntil = Date.now() + 90000;
   }
 
   function clearVoiceQueryArmed() {
@@ -3784,9 +3793,29 @@ def stop_speech_zh_hk() -> None:
     )
 
 
-@st.cache_data(ttl=6 * 3600, show_spinner="正在產生語音…")
+# 擋查提示用固定講稿（書面仍顯示具體無效值），令 MP3 cache 可跨查詢共用，
+# 避免「76點／96點半」每次都冷啟動 Edge TTS → 手機第一次自動播失敗。
+SPOKEN_INVALID_CALENDAR_DATE = (
+    "你輸入嘅日期並唔存在。"
+    "請重新輸入查詢內容，例如十一月三十號朝早六點半彩雲邨邊度較易泊。"
+)
+SPOKEN_INVALID_CLOCK_TIME = (
+    "你輸入嘅時間並唔存在。"
+    "請重新輸入查詢內容，例如元朗後日上晝八點半邊度較易泊。"
+)
+SPOKEN_NON_HALF_HOUR = (
+    "咁樣係查詢唔到。必須用半小時為單位嘅方式嚟查問，"
+    "例如六點半、十二點、四點半、十一點。"
+    "唔接受四點九、四點四十五分、九點二十七分呢類時間。請重新輸入。"
+)
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
 def _synthesize_zh_hk_mp3_cached(text: str) -> bytes:
-    """只快取成功嘅 MP3。失敗要 raise，避免把 None／空音訊鎖死 6 小時。"""
+    """只快取成功嘅 MP3。失敗要 raise，避免把 None／空音訊鎖死 6 小時。
+
+    show_spinner=False：避免「正在產生語音」spinner 觸發前端重繪，打斷 iOS keepalive。
+    """
     import edge_tts
 
     async def _run() -> bytes:
@@ -4094,8 +4123,9 @@ def render_iframe_speech_player(
         }}
       }} catch (e) {{}}
       var delays = voiceArmed
-        ? [500, 1200, 2200, 4000, 7000, 11000, 16000]
-        : [700, 1400, 2200, 4000];
+        ? [500, 1200, 2200, 4000, 7000, 11000, 16000, 22000]
+        : [700, 1400, 2200, 4000, 7000];
+      var lastDelay = delays[delays.length - 1];
       delays.forEach(function (ms) {{
         setTimeout(function () {{
           if (started || parentPlayFailed || uiSpeaking || parentMediaPlaying()) {{
@@ -4105,7 +4135,7 @@ def render_iframe_speech_player(
             }}
             return;
           }}
-          // 只 revive／flush；唔呼叫 tryLocalAutoSpeak（避免 stopParent 切斷已開始嘅朗讀）
+          // 只 revive／flush；中途唔 tryLocalAutoSpeak（避免 stopParent 切斷已開始嘅朗讀）
           try {{
             if (voiceArmed && parent.__hkParkingReviveKeepalive) {{
               parent.__hkParkingReviveKeepalive();
@@ -4116,6 +4146,20 @@ def render_iframe_speech_player(
               parent.__hkParkingFlushPendingUnlockedMedia();
             }}
           }} catch (e) {{}}
+          // 最後一檔仍未起播：unlock 已失效時要退回本地／Web Speech，否則永遠無聲
+          if (ms === lastDelay) {{
+            setTimeout(function () {{
+              if (started || uiSpeaking || parentMediaPlaying()) {{
+                if (!started && parentMediaPlaying()) {{
+                  started = true;
+                  setUi(true);
+                }}
+                return;
+              }}
+              parentPlayFailed = true;
+              tryLocalAutoSpeak();
+            }}, 600);
+          }}
         }}, ms);
       }});
       return;
@@ -4157,7 +4201,8 @@ def inject_voice_auto_speak_prime() -> None:
     }
   } catch (e) {}
   // 只喺「尚未真正朗讀」時 flush／revive；朗讀中唔好改 src
-  [400, 1200, 2500, 5000, 9000].forEach(function (ms) {
+  // 涵蓋 Edge TTS 冷啟動（可十秒級），唔好喺 MP3 就緒前就放棄 keepalive
+  [400, 1200, 2500, 5000, 9000, 14000, 20000].forEach(function (ms) {
     root.setTimeout(function () {
       try {
         if (root.__hkParkingMediaPlayPending) return;
@@ -7118,10 +7163,7 @@ def render_invalid_calendar_date_blocked(
     render_feedback_with_speech(
         f"你輸入的日期 **{date_label}** 不存在。"
         f"請重新輸入查詢內容（例如：11月30號朝早六點半彩雲邨邊度較易泊？）。",
-        spoken=(
-            f"你輸入嘅日期{date_label}並唔存在。"
-            "請重新輸入查詢內容，例如十一月三十號朝早六點半彩雲邨邊度較易泊。"
-        ),
+        spoken=SPOKEN_INVALID_CALENDAR_DATE,
         intent=display_intent,
         auto_speak=auto_speak,
     )
@@ -7137,10 +7179,7 @@ def render_invalid_clock_time_blocked(
     render_feedback_with_speech(
         f"你輸入的時間 **{time_label}** 不存在。"
         f"請重新輸入查詢內容（例如：元朗後日上晝八點半邊度較易泊？）。",
-        spoken=(
-            f"你輸入嘅時間{time_label}並唔存在。"
-            "請重新輸入查詢內容，例如元朗後日上晝八點半邊度較易泊。"
-        ),
+        spoken=SPOKEN_INVALID_CLOCK_TIME,
         intent=display_intent,
         auto_speak=auto_speak,
     )
@@ -7178,11 +7217,7 @@ def render_non_half_hour_blocked(intent: dict | None = None, *, auto_speak: bool
         "這樣是查詢不到的。本系統必須以**半小時**為單位查問"
         "（例如：六點半、十二點、4:30、11:00），"
         "不接受四點九、4:45、九點二十七分這類時間。請重新輸入查詢內容。",
-        spoken=(
-            "咁樣係查詢唔到。必須用半小時為單位嘅方式嚟查問，"
-            "例如六點半、十二點、四點半、十一點。"
-            "唔接受四點九、四點四十五分、九點二十七分呢類時間。請重新輸入。"
-        ),
+        spoken=SPOKEN_NON_HALF_HOUR,
         intent=display_intent,
         auto_speak=auto_speak,
     )
