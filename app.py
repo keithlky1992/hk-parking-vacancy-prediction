@@ -4765,8 +4765,8 @@ def date_for_weekday_cn(
 def parse_absolute_date_from_query(query: str, today=None) -> datetime | None:
     """解析絕對日期（如「11月29號」「2026年11月29日」「11/29」）。
 
-    無年份時：一律用今年。若該日已過，保留為過去日期（由後續流程提示重新查詢），
-    不再自動跳去明年。
+    無年份時：今個月／上個月用今年；其餘更早月份用明年；今年較後月份仍用今年。
+    今個月內已過日子保留為過去（由後續流程提示重新查詢）。
     """
     today = (today or hong_kong_now()).replace(
         hour=0, minute=0, second=0, microsecond=0
@@ -5449,7 +5449,7 @@ def parse_query_with_llm(query: str):
   - 「琴日／昨日／前日／大前日」等已過去日子 → 仍填對應「週X」（系統會鎖定該過去日曆日並提示重新查詢）
   - 「星期日／週日／星期六」等直接寫星期 → 填對應「週X」
   - 「下星期二／下週三／下個星期一」等 → 填對應「週X」（系統會解成下一個日曆週，不是本週已過或今日）
-  - 「11月29號／2026年11月29日」等絕對日期 → 填該日對應「週X」（不要填成今天；系統會再以規則鎖定該日曆日；無年份且該日已過則當過去日）
+  - 「11月29號／2026年11月29日」等絕對日期 → 填該日對應「週X」（不要填成今天；系統會再以規則鎖定該日曆日；無年份時今個月／上個月用今年，更早月份用明年）
   - 「嚟緊」單獨或「嚟緊＋鐘點」：日期先填「{day_today}」（稍後會規則校正）
   - 如果句子沒有提到日期或星期，就填「{day_today}」
 - top_n: 要顯示幾個較易泊車的停車場（整數）。規則：
@@ -6674,7 +6674,7 @@ def needs_ambiguous_ampm_reentry(intent: dict, query_text: str) -> bool:
 def needs_past_time_followup(intent: dict, query_text: str) -> bool:
     """所指日子／時間已過去 → 不執行預測，要求重新輸入。
 
-    含：琴日／前日等、無年份但今年已過的月日、今日但鐘點已過。
+    含：琴日／前日等、無年份落喺今個月／上個月但已過嘅月日、今日但鐘點已過。
     """
     if is_now_query(query_text):
         return False

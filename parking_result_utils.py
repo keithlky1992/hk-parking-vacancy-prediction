@@ -65,7 +65,13 @@ def resolve_yearless_calendar_date(
 ) -> datetime | None:
     """月日（可選年份）→ 日曆日。
 
-    無年份時用 today 嘅年份；即使該日已過亦不跳明年（交由上層當過去查詢處理）。
+    無年份時：
+    - 今個月或上個月 → 今年（若今日係 1 月，上個月 12 月用去年）
+    - 今年較後嘅月份（例如今日 11 月查 12 月）→ 今年
+    - 其餘更早嘅月份 → 明年
+
+    例（今日 2026-11-06）：11/5→2026、10/1→2026、9/30→2027、1/3→2027。
+    今個月內已過嘅日子仍用今年，交由上層當過去查詢處理。
     """
     if not (1 <= month <= 12 and 1 <= day <= 31):
         return None
@@ -78,7 +84,20 @@ def resolve_yearless_calendar_date(
 
     if year is not None:
         return _safe(year, month, day)
-    return _safe(today.year, month, day)
+
+    this_month = today.month
+    prev_month = 12 if this_month == 1 else this_month - 1
+
+    if month == this_month:
+        y = today.year
+    elif month == prev_month:
+        y = today.year - 1 if this_month == 1 else today.year
+    elif month > this_month:
+        y = today.year
+    else:
+        y = today.year + 1
+
+    return _safe(y, month, day)
 
 
 def normalize_asr_query_text(query: str) -> tuple[str, bool]:

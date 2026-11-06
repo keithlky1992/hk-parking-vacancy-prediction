@@ -199,14 +199,34 @@ class PastRelativeAndYearlessDateTest(unittest.TestCase):
             parse_past_relative_calendar_date("天水圍聽日", self.today)
         )
 
-    def test_yearless_same_month_past_stays_this_year(self):
-        dt = resolve_yearless_calendar_date(11, 5, today=self.today)
-        self.assertEqual(dt.date(), datetime(2026, 11, 5).date())
-        self.assertLess(dt.date(), self.today.date())
+    def test_yearless_current_and_prev_month_use_this_year(self):
+        # 今日 11/6：今個月／上個月 → 2026（即使日子已過）
+        nov5 = resolve_yearless_calendar_date(11, 5, today=self.today)
+        self.assertEqual(nov5.date(), datetime(2026, 11, 5).date())
+        self.assertLess(nov5.date(), self.today.date())
+        oct1 = resolve_yearless_calendar_date(10, 1, today=self.today)
+        self.assertEqual(oct1.date(), datetime(2026, 10, 1).date())
 
-    def test_yearless_future_month_day_stays_this_year(self):
+    def test_yearless_earlier_months_use_next_year(self):
+        # 1–9 月（早於上個月）→ 2027
+        self.assertEqual(
+            resolve_yearless_calendar_date(9, 30, today=self.today).date(),
+            datetime(2027, 9, 30).date(),
+        )
+        self.assertEqual(
+            resolve_yearless_calendar_date(1, 3, today=self.today).date(),
+            datetime(2027, 1, 3).date(),
+        )
+
+    def test_yearless_later_month_this_year(self):
+        # 12 月仍係今年未到
         dt = resolve_yearless_calendar_date(12, 1, today=self.today)
         self.assertEqual(dt.date(), datetime(2026, 12, 1).date())
+
+    def test_yearless_january_previous_month_is_last_december(self):
+        jan = datetime(2027, 1, 10, tzinfo=ZoneInfo("Asia/Hong_Kong"))
+        dt = resolve_yearless_calendar_date(12, 25, today=jan)
+        self.assertEqual(dt.date(), datetime(2026, 12, 25).date())
 
     def test_explicit_year_honoured(self):
         dt = resolve_yearless_calendar_date(11, 5, today=self.today, year=2027)
