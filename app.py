@@ -1435,11 +1435,27 @@ def inject_layout_css() -> None:
     return true;
   }
 
+  function isRealSpeechAudioActive() {
+    // 正在播建議 MP3／解碼中：唔好 revive 靜音 loop（否則會改 src 切斷「你想…」）
+    if (root.__hkParkingMediaPlayPending) return true;
+    if (root.__hkParkingAudioCtxSource) return true;
+    if (root.__hkParkingMediaKeepalive) return false;
+    var a = root.__hkParkingMediaAudio;
+    if (!a) return false;
+    try {
+      return !a.paused && !a.ended;
+    } catch (e) {
+      return false;
+    }
+  }
+
   function reviveKeepaliveIfPossible() {
     // 語音結果頁：若曾經解鎖但 silent loop 斷咗，嘗試喺仍有 unlock 旗標時救返
     if (!(root.__hkParkingMediaUnlocked || root.__hkParkingAudioCtxUnlocked)) {
       return false;
     }
+    // 關鍵：朗讀已開始就絕對唔好把 src 改返 SILENT_WAV
+    if (isRealSpeechAudioActive()) return false;
     try {
       var a = ensureUnlockedMediaAudio();
       a.muted = false;
@@ -1747,7 +1763,8 @@ def inject_layout_css() -> None:
     try {
       // keepalive 靜音 loop 唔算「正在朗讀」
       if (root.__hkParkingMediaKeepalive) return false;
-      return !a.paused && !a.ended && a.currentTime > 0;
+      // 唔要求 currentTime > 0：剛起播嗰幾百 ms 仍係 0，否則重試會 stopParent 切斷「你想」
+      return !a.paused && !a.ended;
     } catch (e) {
       return false;
     }
@@ -4022,8 +4039,16 @@ def render_iframe_speech_player(
     return false;
   }}
 
+  var handedToParent = false;
+  var parentPlayFailed = false;
+
   function tryLocalAutoSpeak() {{
     if (uiSpeaking || parentMediaPlaying()) {{
+      if (parentMediaPlaying()) setUi(true);
+      return;
+    }}
+    // 已交俾 parent 播就唔好再 speakNow()：speakNow 會 stopParentMedia，切斷「你想…」
+    if (handedToParent && !parentPlayFailed) {{
       if (parentMediaPlaying()) setUi(true);
       return;
     }}
@@ -4039,7 +4064,6 @@ def render_iframe_speech_player(
       || typeof parent.__hkParkingPlayUnlockedMedia === "function"
     )) {{
       var started = false;
-      var failed = false;
       var cbs = {{
         onStart: function () {{
           started = true;
@@ -4047,11 +4071,14 @@ def render_iframe_speech_player(
         }},
         onEnded: function () {{ setUi(false); }},
         onError: function () {{
-          failed = true;
+          parentPlayFailed = true;
+          // 只有確認 parent 失敗先本地 fallback（唔好同 parent 搶播）
           if (!started) tryLocalAutoSpeak();
           else setUi(false);
         }}
       }};
+      handedToParent = true;
+      parentPlayFailed = false;
       if (typeof parent.__hkParkingQueueUnlockedMedia === "function") {{
         parent.__hkParkingQueueUnlockedMedia(audioSrc, cbs);
       }} else {{
@@ -4065,17 +4092,18 @@ def render_iframe_speech_player(
         }}
       }} catch (e) {{}}
       var delays = voiceArmed
-        ? [200, 600, 1200, 2000, 3500, 5500, 8000, 12000, 18000]
+        ? [500, 1200, 2200, 4000, 7000, 11000, 16000]
         : [700, 1400, 2200, 4000];
       delays.forEach(function (ms) {{
         setTimeout(function () {{
-          if (started || failed || uiSpeaking || parentMediaPlaying()) {{
+          if (started || parentPlayFailed || uiSpeaking || parentMediaPlaying()) {{
             if (!started && parentMediaPlaying()) {{
               started = true;
               setUi(true);
             }}
             return;
           }}
+          // 只 revive／flush；唔呼叫 tryLocalAutoSpeak（避免 stopParent 切斷已開始嘅朗讀）
           try {{
             if (voiceArmed && parent.__hkParkingReviveKeepalive) {{
               parent.__hkParkingReviveKeepalive();
@@ -4086,14 +4114,11 @@ def render_iframe_speech_player(
               parent.__hkParkingFlushPendingUnlockedMedia();
             }}
           }} catch (e) {{}}
-          if (started || parentMediaPlaying()) return;
-          // 最後手段：iframe 本地播（桌面／部分 Android 可用；iOS 多數仍要 parent）
-          if (voiceArmed && ms >= 8000) tryLocalAutoSpeak();
         }}, ms);
       }});
       return;
     }}
-    // 無 MP3：退回 Web Speech／本地播
+    // 無 MP3／無 parent API：退回 Web Speech／本地播
     tryLocalAutoSpeak();
   }}
 
@@ -4129,9 +4154,14 @@ def inject_voice_auto_speak_prime() -> None:
       root.__hkParkingReviveKeepalive();
     }
   } catch (e) {}
-  // 結果 iframe 稍後 queue 時多啲機會 flush
-  [300, 900, 2000, 4000, 7000].forEach(function (ms) {
+  // 只喺「尚未真正朗讀」時 flush／revive；朗讀中唔好改 src
+  [400, 1200, 2500, 5000, 9000].forEach(function (ms) {
     root.setTimeout(function () {
+      try {
+        if (root.__hkParkingMediaPlayPending) return;
+        var a = root.__hkParkingMediaAudio;
+        if (a && !root.__hkParkingMediaKeepalive && !a.paused && !a.ended) return;
+      } catch (e) {}
       try {
         if (root.__hkParkingReviveKeepalive) root.__hkParkingReviveKeepalive();
       } catch (e) {}
