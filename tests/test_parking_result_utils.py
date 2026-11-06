@@ -296,6 +296,14 @@ class InvalidClockTimeTest(unittest.TestCase):
         )
         self.assertEqual(label, "68點30分")
 
+    def test_hour_96_half_rejected(self):
+        self.assertEqual(
+            query_mentions_invalid_clock_time(
+                "元朗大後日朝早96點半邊度比較易泊車？"
+            ),
+            "96點半",
+        )
+
     def test_hour_25_colon_rejected(self):
         self.assertEqual(
             query_mentions_invalid_clock_time("天水圍25:00邊度較易泊"),
