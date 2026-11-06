@@ -1399,6 +1399,7 @@ def inject_layout_css() -> None:
 
   function stopUnlockedMedia() {
     root.__hkParkingMediaPlayPending = false;
+    root.__hkParkingMediaPlayPendingSince = 0;
     root.__hkParkingAudioCtxPlayGen = (root.__hkParkingAudioCtxPlayGen || 0) + 1;
     stopAudioContextSource();
     stopOscKeepalive();
@@ -1529,39 +1530,59 @@ def inject_layout_css() -> None:
     root.__hkParkingMediaBlobUrl = null;
   }
 
+  function dataUriToBlobUrl(dataUri) {
+    // 唔用 fetch(data:)：iOS 對大 MP3 data URI 有時會卡住，令 playPending 掛住、自動播無聲
+    var comma = dataUri.indexOf(",");
+    if (comma < 0) return null;
+    var meta = dataUri.slice(0, comma);
+    var data = dataUri.slice(comma + 1);
+    var mimeMatch = meta.match(/data:([^;]+)/);
+    var mime = (mimeMatch && mimeMatch[1]) || "audio/mpeg";
+    var binary;
+    try {
+      if (/;base64/i.test(meta)) binary = root.atob(data);
+      else binary = root.decodeURIComponent(data);
+    } catch (e) {
+      return null;
+    }
+    var len = binary.length;
+    var bytes = new Uint8Array(len);
+    for (var i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
+    revokeMediaBlobUrl();
+    root.__hkParkingMediaBlobUrl = root.URL.createObjectURL(
+      new root.Blob([bytes], { type: mime })
+    );
+    return root.__hkParkingMediaBlobUrl;
+  }
+
   function startHtml5Src(a, src, cbs, wasKeepalive) {
     var finishStart = function () {
       var p = a.play();
       if (p && typeof p.then === "function") {
         p.then(function () {
           root.__hkParkingMediaPlayPending = false;
+          root.__hkParkingMediaPlayPendingSince = 0;
           if (typeof cbs.onStart === "function") cbs.onStart();
         }).catch(function () {
           root.__hkParkingMediaPlayPending = false;
+          root.__hkParkingMediaPlayPendingSince = 0;
           if (typeof cbs.onError === "function") cbs.onError();
         });
       } else {
         root.__hkParkingMediaPlayPending = false;
+        root.__hkParkingMediaPlayPendingSince = 0;
         if (typeof cbs.onStart === "function") cbs.onStart();
       }
     };
-    // data URI 大 MP3 喺 iOS 常失敗 → 轉 blob URL
-    if (src && src.indexOf("data:audio/") === 0 && root.fetch && root.URL) {
-      root.fetch(src)
-        .then(function (res) { return res.blob(); })
-        .then(function (blob) {
-          revokeMediaBlobUrl();
-          root.__hkParkingMediaBlobUrl = root.URL.createObjectURL(blob);
-          a.src = root.__hkParkingMediaBlobUrl;
-          try { a.load(); } catch (e) {}
-          finishStart();
-        })
-        .catch(function () {
-          a.src = src;
-          try { a.load(); } catch (e) {}
-          finishStart();
-        });
-      return;
+    // data URI 大 MP3 → 同步轉 blob URL（避免 iOS fetch 掛起）
+    if (src && src.indexOf("data:audio/") === 0 && root.URL) {
+      var blobUrl = dataUriToBlobUrl(src);
+      if (blobUrl) {
+        a.src = blobUrl;
+        try { a.load(); } catch (e) {}
+        finishStart();
+        return;
+      }
     }
     a.src = src;
     try { a.load(); } catch (e) {}
@@ -1576,6 +1597,7 @@ def inject_layout_css() -> None:
       root.__hkParkingMediaKeepalive = false;
       stopKeepaliveWatch();
       root.__hkParkingMediaPlayPending = true;
+      root.__hkParkingMediaPlayPendingSince = Date.now();
       try { a.loop = false; } catch (e) {}
       // keepalive 中唔好先 pause：iOS 會當解鎖失效
       if (!wasKeepalive) {
@@ -1585,11 +1607,13 @@ def inject_layout_css() -> None:
       a.volume = 1;
       a.onended = function () {
         root.__hkParkingMediaPlayPending = false;
+        root.__hkParkingMediaPlayPendingSince = 0;
         revokeMediaBlobUrl();
         if (typeof cbs.onEnded === "function") cbs.onEnded();
       };
       a.onerror = function () {
         root.__hkParkingMediaPlayPending = false;
+        root.__hkParkingMediaPlayPendingSince = 0;
         revokeMediaBlobUrl();
         if (typeof cbs.onError === "function") cbs.onError();
       };
@@ -1597,6 +1621,7 @@ def inject_layout_css() -> None:
       return true;
     } catch (e) {
       root.__hkParkingMediaPlayPending = false;
+      root.__hkParkingMediaPlayPendingSince = 0;
       if (typeof cbs.onError === "function") cbs.onError();
       return false;
     }
@@ -1623,7 +1648,15 @@ def inject_layout_css() -> None:
   }
 
   function isUnlockedMediaPlaying() {
-    if (root.__hkParkingMediaPlayPending) return true;
+    // playPending 逾時當失敗（大 data URI／decode 卡住時唔好永遠擋住自動播 fallback）
+    if (root.__hkParkingMediaPlayPending) {
+      var since = root.__hkParkingMediaPlayPendingSince || 0;
+      if (since && (Date.now() - since) > 8000) {
+        root.__hkParkingMediaPlayPending = false;
+      } else {
+        return true;
+      }
+    }
     if (root.__hkParkingAudioCtxSource) return true;
     var a = root.__hkParkingMediaAudio;
     if (!a) return false;
@@ -3591,19 +3624,9 @@ def stop_speech_zh_hk() -> None:
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner="正在產生語音…")
-def synthesize_zh_hk_mp3(text: str) -> bytes | None:
-    """用 Edge 粵語 Neural 聲線合成 MP3（手機 HTML5 Audio 播放較 speechSynthesis 可靠）。"""
-    text = (text or "").strip()
-    if not text:
-        return None
-    # 避免極長稿拖垮 Cloud／base64
-    if len(text) > 800:
-        text = text[:800]
-
-    try:
-        import edge_tts
-    except ImportError:
-        return None
+def _synthesize_zh_hk_mp3_cached(text: str) -> bytes:
+    """只快取成功嘅 MP3。失敗要 raise，避免把 None／空音訊鎖死 6 小時。"""
+    import edge_tts
 
     async def _run() -> bytes:
         communicate = edge_tts.Communicate(
@@ -3617,10 +3640,37 @@ def synthesize_zh_hk_mp3(text: str) -> bytes | None:
                 chunks.append(chunk["data"])
         return b"".join(chunks)
 
-    try:
-        return asyncio.run(_run())
-    except Exception:
+    audio = asyncio.run(_run())
+    if not audio:
+        raise RuntimeError("edge_tts returned empty audio")
+    return audio
+
+
+def synthesize_zh_hk_mp3(text: str) -> bytes | None:
+    """用 Edge 粵語 Neural 聲線合成 MP3（手機 HTML5 Audio 播放較 speechSynthesis 可靠）。
+
+    注意：唔好把失敗結果寫入 cache_data。否則某一句（例如「下晝四點…」）
+    第一次合成失敗後，之後幾小時自動朗讀都會無 MP3，手機只能手動撳播放。
+    """
+    text = (text or "").strip()
+    if not text:
         return None
+    # 避免極長稿拖垮 Cloud／base64
+    if len(text) > 800:
+        text = text[:800]
+
+    try:
+        import edge_tts  # noqa: F401
+    except ImportError:
+        return None
+
+    # 短暫網路／冷啟動失敗時再試一次（成功結果仍由 cache 加速）
+    for _ in range(2):
+        try:
+            return _synthesize_zh_hk_mp3_cached(text)
+        except Exception:
+            continue
+    return None
 
 
 def render_iframe_speech_player(spoken: str, *, auto_speak: bool = False) -> None:
