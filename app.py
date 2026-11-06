@@ -3453,6 +3453,24 @@ def format_time_spoken_yue(hour: int, minute: int = 0) -> str:
     return f"{period}{h_spoken}點半"
 
 
+def format_date_spoken_yue(date_part: datetime) -> str:
+    """口語日期，例如 2026年11月6日星期五。"""
+    wd = WEEKDAY_SHORT[date_part.weekday()]
+    return f"{date_part.year}年{date_part.month}月{date_part.day}日星期{wd}"
+
+
+def format_query_when_spoken_yue(
+    date_part: datetime | None,
+    hour: int,
+    minute: int = 0,
+) -> str:
+    """朗讀用「邊年邊月邊日＋咩時間」；缺日期則只讀鐘點。"""
+    time_spoken = format_time_spoken_yue(hour, minute)
+    if date_part is None:
+        return time_spoken
+    return f"{format_date_spoken_yue(date_part)}{time_spoken}"
+
+
 def _join_names_spoken_yue(names: list[str]) -> str:
     """口語連接停車場名稱。"""
     if len(names) == 1:
@@ -3497,24 +3515,25 @@ def format_spoken_suggestion(
     minute: int = 0,
     *,
     max_ranks: int = SPEAK_DEFAULT_TOP_N,
+    query_date: datetime | None = None,
 ) -> str:
-    """粵語口語建議（畀司機聽）。未指定數量時預設讀頭 SPEAK_DEFAULT_TOP_N 名。"""
+    """粵語口語建議（畀司機聽）。開頭先講年月日同時間；未指定數量時預設讀頭 SPEAK_DEFAULT_TOP_N 名。"""
     groups = _suggestion_rank_groups(result_df, max_ranks=max_ranks)
     if not groups:
         return ""
 
-    time_spoken = format_time_spoken_yue(hour, minute)
+    when = format_query_when_spoken_yue(query_date, hour, minute)
     total = sum(len(names) for _, names, _ in groups)
 
     if total == 1:
         _, names, vacancy = groups[0]
         raw = (
-            f"建議你喺{time_spoken}去{names[0]}，"
+            f"{when}。建議你去{names[0]}，"
             f"預計大約有{vacancy}個空位。"
         )
         return prepare_spoken_text_for_tts(raw)
 
-    parts = [f"建議你喺{time_spoken}優先考慮以下停車場。"]
+    parts = [f"{when}。建議你優先考慮以下停車場。"]
     for rank, names, vacancy in groups:
         rank_yue = _rank_spoken_yue(rank)
         if len(names) == 1:
@@ -5301,16 +5320,18 @@ def format_spoken_place_ease(
     place_label: str,
     hour: int,
     minute: int = 0,
+    *,
+    query_date: datetime | None = None,
 ) -> str:
-    """「某地容唔容易泊」專用粵語稿。"""
-    time_spoken = format_time_spoken_yue(hour, minute)
+    """「某地容唔容易泊」專用粵語稿；開頭先講年月日同時間。"""
+    when = format_query_when_spoken_yue(query_date, hour, minute)
     place = (place_label or "該處").strip() or "該處"
     if result_df is None or result_df.empty:
-        raw = f"{place}喺{time_spoken}暫時冇可用嘅空位預測。"
+        raw = f"{when}。{place}暫時冇可用嘅空位預測。"
         return prepare_spoken_text_for_tts(raw)
 
     rows = result_df.head(5)
-    parts = [f"關於{place}喺{time_spoken}泊車。"]
+    parts = [f"{when}。關於{place}泊車。"]
     vacancies = []
     for _, row in rows.iterrows():
         name = str(row.get("名稱") or "停車場")
@@ -6359,6 +6380,7 @@ def run_vacancy_prediction(intent: dict, query_text: str):
         dt = next_half_hour_datetime(now)
         hour, minute = dt.hour, dt.minute
         day = WEEKDAY_CN[dt.weekday()]
+        query_date = dt.replace(second=0, microsecond=0)
     else:
         hour = int(raw_hour)
         minute = (
@@ -6367,6 +6389,20 @@ def run_vacancy_prediction(intent: dict, query_text: str):
             else int(raw_minute)
         )
         hour, minute = normalize_half_hour(hour, minute)
+        query_date = resolve_intent_calendar_date(
+            day,
+            now,
+            next_week=bool(intent.get("day_next_week")),
+            absolute_date=intent.get("absolute_date"),
+        )
+        if query_date is not None:
+            query_date = query_date.replace(
+                hour=hour, minute=minute, second=0, microsecond=0
+            )
+        else:
+            query_date = now.replace(
+                hour=hour, minute=minute, second=0, microsecond=0
+            )
     half_hour = to_half_hour_slot(hour, minute)
     top_n, top_n_default = resolve_top_n(query_text, intent)
     requested_top_n = top_n
@@ -6569,14 +6605,28 @@ def run_vacancy_prediction(intent: dict, query_text: str):
             result_df, hour, minute, max_ranks=speak_n
         )
         spoken = format_spoken_place_ease(
-            result_df, place_label, hour, minute
+            result_df,
+            place_label,
+            hour,
+            minute,
+            query_date=query_date,
         )
     else:
         written = format_top_suggestion(
             result_df, hour, minute, max_ranks=speak_n
         )
         spoken = format_spoken_suggestion(
-            result_df, hour, minute, max_ranks=speak_n
+            result_df,
+            hour,
+            minute,
+            max_ranks=speak_n,
+            query_date=query_date,
+        )
+
+    if not (spoken or "").strip():
+        when = format_query_when_spoken_yue(query_date, hour, minute)
+        spoken = prepare_spoken_text_for_tts(
+            f"{when}。{district_label}暫時冇可用嘅預測結果。"
         )
 
     if top_n_shortfall:
@@ -6593,9 +6643,16 @@ def run_vacancy_prediction(intent: dict, query_text: str):
             style="spoken",
         )
         written = f"{notice_w}\n\n{written}" if written else notice_w
-        spoken = prepare_spoken_text_for_tts(
-            f"{notice_s}{spoken}" if spoken else notice_s
-        )
+        # 保留開頭「年月日＋時間」，提示插喺第一句之後
+        if spoken and "。" in spoken:
+            lead, rest = spoken.split("。", 1)
+            spoken = prepare_spoken_text_for_tts(
+                f"{lead}。{notice_s}{rest}"
+            )
+        else:
+            spoken = prepare_spoken_text_for_tts(
+                f"{notice_s}{spoken}" if spoken else notice_s
+            )
 
     profile_df = pd.DataFrame()
     if not result_df.empty and "park_id" in result_df.columns:
