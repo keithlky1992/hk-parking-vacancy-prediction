@@ -2073,33 +2073,32 @@ def inject_layout_css() -> None:
     }
     var text = FEEDBACK_SPOKEN[key];
     if (!text) return false;
-    root.__hkParkingGestureSpokeFeedback = true;
     root.__hkParkingGestureSpokeText = text;
     root.__hkParkingSpeechLastText = text;
+    // 未確認起播前唔好標「已播」：否則結果頁會 skip，手勢又失敗 → 完全無聲
+    root.__hkParkingGestureSpokeFeedback = false;
     var src = root.__hkParkingFeedbackMp3 && root.__hkParkingFeedbackMp3[key];
-    // 優先同一支已 unlock 嘅 Audio 播預製 MP3（撑過 Streamlit 重繪；Web Speech 易被打斷）
+    // 只喺手勢內用已 unlock Audio 播預製 MP3；唔用 Web Speech（重繪易切斷又誤標已播）
     if (src && typeof root.__hkParkingPlayUnlockedMedia === "function") {
       try {
         root.__hkParkingPlayUnlockedMedia(src, {
-          onStart: function () { setSpeechSpeakingUi(true); },
+          onStart: function () {
+            root.__hkParkingGestureSpokeFeedback = true;
+            setSpeechSpeakingUi(true);
+          },
           onEnded: function () { setSpeechSpeakingUi(false); },
           onError: function () {
-            try {
-              speech.speak(text, { immediate: true });
-              setSpeechSpeakingUi(true);
-            } catch (e2) {}
+            root.__hkParkingGestureSpokeFeedback = false;
+            setSpeechSpeakingUi(false);
           }
         });
         return true;
-      } catch (e) {}
+      } catch (e) {
+        root.__hkParkingGestureSpokeFeedback = false;
+      }
     }
-    try {
-      speech.speak(text, { immediate: true });
-      setSpeechSpeakingUi(true);
-    } catch (e) {
-      return false;
-    }
-    return true;
+    // 預製 MP3 未載入：交俾結果頁自動播（server 端讀檔即有 MP3）
+    return false;
   }
 
   function onQuerySubmitGesture(fromClick) {
@@ -4249,12 +4248,20 @@ def render_iframe_speech_player(
   function tryAutoSpeak() {{
     if (uiSpeaking) return;
     var parent = window.parent;
-    // 查詢手勢內已播過擋查提示：唔好再自動播一次（亦避免等 MP3 期間無聲）
+    // 手勢已真正起播擋查 MP3：skip。若只係「試過但失敗／被打斷」→ 繼續自動播
     try {{
       if (parent && parent.__hkParkingGestureSpokeFeedback) {{
+        var stillPlaying = false;
+        try {{
+          if (typeof parent.__hkParkingIsUnlockedMediaPlaying === "function") {{
+            stillPlaying = !!parent.__hkParkingIsUnlockedMediaPlaying();
+          }}
+        }} catch (e2) {{}}
         parent.__hkParkingGestureSpokeFeedback = false;
-        setUi(false);
-        return;
+        if (stillPlaying) {{
+          setUi(true);
+          return;
+        }}
       }}
     }} catch (e) {{}}
     // 優先：排隊畀 parent keepalive 期間播（語音／iOS 最穩）
