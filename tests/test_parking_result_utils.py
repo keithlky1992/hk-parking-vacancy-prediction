@@ -32,6 +32,7 @@ from parking_result_utils import (
     parse_top_n_from_query,
     pin_venue_parks_into_ranking,
     query_mentions_invalid_calendar_date,
+    query_mentions_invalid_clock_time,
     query_specifies_non_half_hour_time,
     relative_day_offset_from_query,
     resolve_yearless_calendar_date,
@@ -286,6 +287,36 @@ class InvalidCalendarDateTest(unittest.TestCase):
                 "天水圍聽日晚上八點邊度較易泊", today=self.today
             )
         )
+
+
+class InvalidClockTimeTest(unittest.TestCase):
+    def test_hour_68_rejected(self):
+        label = query_mentions_invalid_clock_time(
+            "我想知道元朗後日上畫68點30分邊度比較易泊車"
+        )
+        self.assertEqual(label, "68點30分")
+
+    def test_hour_25_colon_rejected(self):
+        self.assertEqual(
+            query_mentions_invalid_clock_time("天水圍25:00邊度較易泊"),
+            "25:00",
+        )
+
+    def test_minute_99_rejected(self):
+        self.assertEqual(
+            query_mentions_invalid_clock_time("彩雲邨12點99分邊度易泊"),
+            "12點99分",
+        )
+
+    def test_valid_times_ok(self):
+        for query in (
+            "元朗後日上晝八點半邊度較易泊",
+            "元朗後日上晝8點30分邊度較易泊",
+            "天水圍今晚8:30邊度較易泊",
+            "4:45彩雲邨",  # 合法鐘點，交俾非半小時檢查
+        ):
+            with self.subTest(query=query):
+                self.assertIsNone(query_mentions_invalid_clock_time(query))
 
 
 class CnCountAndTopNParseTest(unittest.TestCase):

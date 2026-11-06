@@ -709,6 +709,63 @@ def query_specifies_non_half_hour_time(query: str) -> bool:
     return not is_half_hour_minute(minute)
 
 
+def query_mentions_invalid_clock_time(query: str) -> str | None:
+    """若寫明無法成立嘅鐘點（如 68點30分、25:00），回傳該時間標籤；否則 None。
+
+    只檢查阿拉伯數字鐘點；合法範圍 hour 0–23、minute 0–59。
+    """
+    q = re.sub(r"\s+", "", query or "")
+    if not q:
+        return None
+
+    def _invalid(hour: int, minute: int | None, label: str) -> str | None:
+        if not (0 <= hour <= 23):
+            return label
+        if minute is not None and not (0 <= minute <= 59):
+            return label
+        return None
+
+    m = re.search(r"(?<!\d)(\d{1,3})[:：](\d{1,3})(?!\d)", q)
+    if m:
+        hour, minute = int(m.group(1)), int(m.group(2))
+        return _invalid(hour, minute, f"{hour}:{minute:02d}")
+
+    m = re.search(r"(?<!\d)(\d{1,3})[點时時]半", q)
+    if m:
+        hour = int(m.group(1))
+        return _invalid(hour, 30, f"{hour}點半")
+
+    m = re.search(r"(?<!\d)(\d{1,3})[點时時](一刻|三刻)", q)
+    if m:
+        hour = int(m.group(1))
+        minute = 15 if m.group(2) == "一刻" else 45
+        return _invalid(hour, minute, f"{hour}點{m.group(2)}")
+
+    m = re.search(r"(?<!\d)(\d{1,3})[點时時](\d{1,3})分?", q)
+    if m:
+        hour, minute = int(m.group(1)), int(m.group(2))
+        return _invalid(hour, minute, f"{hour}點{minute}分")
+
+    m = re.search(
+        r"(?<!\d)(\d{1,3})[點时時]"
+        r"([一二兩三两四五六七八九十廿卅零〇○]+|[正整])分?",
+        q,
+    )
+    if m:
+        hour = int(m.group(1))
+        minute = _cn_minute_token_to_int(m.group(2))
+        if minute is None:
+            return f"{hour}點{m.group(2)}"
+        return _invalid(hour, minute, f"{hour}點{minute}分")
+
+    m = re.search(r"(?<!\d)(\d{1,3})[點时時]", q)
+    if m:
+        hour = int(m.group(1))
+        return _invalid(hour, None, f"{hour}點")
+
+    return None
+
+
 def build_fee_park_id_aliases(
     parks_df: pd.DataFrame,
     fee_ids: set[str] | frozenset[str],

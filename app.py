@@ -51,6 +51,7 @@ from parking_result_utils import (
     parse_past_relative_calendar_date,
     parse_top_n_from_query,
     query_mentions_invalid_calendar_date,
+    query_mentions_invalid_clock_time,
     query_specifies_non_half_hour_time,
     relative_day_offset_from_query,
     resolve_yearless_calendar_date,
@@ -7123,6 +7124,23 @@ def render_invalid_calendar_date_blocked(
     )
 
 
+def render_invalid_clock_time_blocked(
+    intent: dict, time_label: str, *, auto_speak: bool = True
+):
+    """無效鐘點（如 68點30分）：唔好讓 LLM 改寫成其他時間，要求重新輸入。"""
+    display_intent = {**intent, "hour": None, "minute": None}
+    render_feedback_with_speech(
+        f"你輸入的時間 **{time_label}** 不存在。"
+        f"請重新輸入查詢內容（例如：元朗後日上晝八點半邊度較易泊？）。",
+        spoken=(
+            f"你輸入嘅時間{time_label}並唔存在。"
+            "請重新輸入查詢內容，例如元朗後日上晝八點半邊度較易泊。"
+        ),
+        intent=display_intent,
+        auto_speak=auto_speak,
+    )
+
+
 def render_hard_to_park_unsupported(intent: dict, *, auto_speak: bool = True):
     """用戶問較難／冇咁易泊：本系統只提供較易泊排名。"""
     district = (
@@ -7221,6 +7239,11 @@ if should_query and query_text:
     ):
         # 11月31號等：唔好交俾 LLM 改寫成其他日子再預測
         render_invalid_calendar_date_blocked(intent, invalid_date_label)
+    elif (
+        invalid_time_label := query_mentions_invalid_clock_time(query_text)
+    ):
+        # 68點30分等：唔好交俾 LLM 改寫成其他時間再預測
+        render_invalid_clock_time_blocked(intent, invalid_time_label)
     elif query_specifies_non_half_hour_time(query_text):
         # 4:45／四點九等：唔好先四捨五入再當「已過去」
         render_non_half_hour_blocked(intent)
