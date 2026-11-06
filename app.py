@@ -46,6 +46,7 @@ from parking_result_utils import (
     park_name_matches_place_tokens,
     parks_present_in_baselines,
     pin_venue_parks_into_ranking,
+    parse_top_n_from_query,
     query_specifies_non_half_hour_time,
     top_n_exceeds_available,
 )
@@ -54,22 +55,6 @@ WEEKDAY_CN = {0: "週一", 1: "週二", 2: "週三", 3: "週四", 4: "週五", 5
 WEEKDAY_SHORT = {0: "一", 1: "二", 2: "三", 3: "四", 4: "五", 5: "六", 6: "日"}
 DAY_TO_NUM = {"週一": 0, "週二": 1, "週三": 2, "週四": 3, "週五": 4, "週六": 5, "週日": 6}
 
-# 「邊兩個／哪三個」等中文數字
-CN_NUM = {
-    "一": 1,
-    "壹": 1,
-    "二": 2,
-    "兩": 2,
-    "两": 2,
-    "三": 3,
-    "四": 4,
-    "五": 5,
-    "六": 6,
-    "七": 7,
-    "八": 8,
-    "九": 9,
-    "十": 10,
-}
 NUM_CN = {1: "一", 2: "兩", 3: "三", 4: "四", 5: "五", 6: "六", 7: "七", 8: "八", 9: "九", 10: "十"}
 DEFAULT_TOP_N = 10
 # 未指定顯示數量時，朗讀只讀頭幾名（畫面仍可顯示 DEFAULT_TOP_N）
@@ -2908,25 +2893,6 @@ def call_deepseek(prompt: str) -> str:
     except Exception as e:
         st.error(f"DeepSeek API 錯誤：{e}")
         return ""
-
-def parse_top_n_from_query(query: str):
-    """從查詢解析要顯示幾個停車場；找不到則回傳 None。"""
-    # 「邊兩個／哪三個／哪4個」等
-    m = re.search(r"[邊哪]([一二两三兩四五六七八九十壹\d]+)個", query)
-    if m:
-        token = m.group(1)
-        if token.isdigit():
-            n = int(token)
-            return n if n > 0 else None
-        if token in CN_NUM:
-            return CN_NUM[token]
-
-    # 「邊個／哪個」（未指明數量，視為 1）
-    if re.search(r"[邊哪]個", query):
-        return 1
-
-    return None
-
 
 def ordinal(n: int) -> str:
     """將正整數轉成 1st / 2nd / 3rd …"""

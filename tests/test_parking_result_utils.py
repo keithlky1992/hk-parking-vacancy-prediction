@@ -9,6 +9,7 @@ import pandas as pd
 from parking_result_utils import (
     build_equivalent_park_id_map,
     build_fee_park_id_aliases,
+    cn_count_token_to_int,
     extract_explicit_clock_minute,
     fee_availability_mode,
     fee_coverage_counts,
@@ -23,6 +24,7 @@ from parking_result_utils import (
     normalize_park_name_basic,
     order_parks_for_fee_display,
     parks_present_in_baselines,
+    parse_top_n_from_query,
     pin_venue_parks_into_ranking,
     query_specifies_non_half_hour_time,
     top_n_exceeds_available,
@@ -161,6 +163,41 @@ class TopNShortfallTest(unittest.TestCase):
         self.assertIn("啟德附近", written)
         self.assertIn("冇100個停車場咁多", spoken)
         self.assertIn("9", spoken)
+
+
+class CnCountAndTopNParseTest(unittest.TestCase):
+    def test_cn_count_token_to_int(self):
+        cases = {
+            "17": 17,
+            "十七": 17,
+            "十": 10,
+            "十一": 11,
+            "廿": 20,
+            "廿一": 21,
+            "二十": 20,
+            "三十二": 32,
+            "兩": 2,
+            "九十九": 99,
+        }
+        for token, expected in cases.items():
+            with self.subTest(token=token):
+                self.assertEqual(cn_count_token_to_int(token), expected)
+
+    def test_parse_top_n_arabic_and_chinese_seventeen(self):
+        self.assertEqual(
+            parse_top_n_from_query("啟德邊17個停車場比較易泊"),
+            17,
+        )
+        self.assertEqual(
+            parse_top_n_from_query("啟德邊十七個停車場比較易泊"),
+            17,
+        )
+
+    def test_parse_top_n_common_forms(self):
+        self.assertEqual(parse_top_n_from_query("邊三個好泊"), 3)
+        self.assertEqual(parse_top_n_from_query("哪兩個停車場"), 2)
+        self.assertEqual(parse_top_n_from_query("邊個最易泊"), 1)
+        self.assertIsNone(parse_top_n_from_query("天水圍今晚邊度較易泊"))
 
 
 class HardToParkRankingQueryTest(unittest.TestCase):

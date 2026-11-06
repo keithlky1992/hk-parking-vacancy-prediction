@@ -358,6 +358,7 @@ _CN_DIGIT = {
     "〇": 0,
     "○": 0,
     "一": 1,
+    "壹": 1,
     "二": 2,
     "兩": 2,
     "两": 2,
@@ -369,6 +370,82 @@ _CN_DIGIT = {
     "八": 8,
     "九": 9,
 }
+
+# 「邊十七個／哪廿一個」等顯示數量用；含粵語廿／卅
+_CN_COUNT_CHARS = r"一二两三兩四五六七八九十廿卅零〇○壹\d"
+
+
+def cn_count_token_to_int(token: str) -> int | None:
+    """中文／阿拉伯數量詞 → 正整數（約 1–99）；無法解析則 None。
+
+    支援：17、十七、廿、廿一、三十、三十二 等；唔處理「半／正」等時間用語。
+    """
+    token = (token or "").strip()
+    if not token:
+        return None
+    if token.isdigit():
+        n = int(token)
+        return n if n > 0 else None
+
+    if token in _CN_DIGIT and _CN_DIGIT[token] > 0:
+        return _CN_DIGIT[token]
+    if token == "十":
+        return 10
+    if token in ("廿", "二十"):
+        return 20
+    if token in ("卅", "三十"):
+        return 30
+
+    # 十一～十九
+    if token.startswith("十") and len(token) == 2 and token[1] in _CN_DIGIT:
+        ones = _CN_DIGIT[token[1]]
+        return 10 + ones if ones > 0 else None
+
+    # 廿一～廿九／卅一～卅九
+    if token.startswith("廿") and len(token) == 2 and token[1] in _CN_DIGIT:
+        ones = _CN_DIGIT[token[1]]
+        return 20 + ones if ones > 0 else None
+    if token.startswith("卅") and len(token) == 2 and token[1] in _CN_DIGIT:
+        ones = _CN_DIGIT[token[1]]
+        return 30 + ones if ones > 0 else None
+
+    # X十／X十Y（二～九）
+    for tens_char, tens_val in (
+        ("二", 20),
+        ("兩", 20),
+        ("两", 20),
+        ("三", 30),
+        ("四", 40),
+        ("五", 50),
+        ("六", 60),
+        ("七", 70),
+        ("八", 80),
+        ("九", 90),
+    ):
+        prefix = tens_char + "十"
+        if token == prefix:
+            return tens_val
+        if token.startswith(prefix) and len(token) == len(prefix) + 1:
+            ones = _CN_DIGIT.get(token[-1])
+            if ones and ones > 0:
+                return tens_val + ones
+
+    return None
+
+
+def parse_top_n_from_query(query: str) -> int | None:
+    """從查詢解析要顯示幾個停車場；找不到則回傳 None。"""
+    m = re.search(rf"[邊哪]([{_CN_COUNT_CHARS}]+)個", query or "")
+    if m:
+        n = cn_count_token_to_int(m.group(1))
+        if n is not None and n > 0:
+            return n
+
+    # 「邊個／哪個」（未指明數量，視為 1）
+    if re.search(r"[邊哪]個", query or ""):
+        return 1
+
+    return None
 
 
 def _cn_minute_token_to_int(token: str) -> int | None:
