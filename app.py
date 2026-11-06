@@ -72,6 +72,8 @@ CN_NUM = {
 }
 NUM_CN = {1: "一", 2: "兩", 3: "三", 4: "四", 5: "五", 6: "六", 7: "七", 8: "八", 9: "九", 10: "十"}
 DEFAULT_TOP_N = 10
+# 未指定顯示數量時，朗讀只讀頭幾名（畫面仍可顯示 DEFAULT_TOP_N）
+SPEAK_DEFAULT_TOP_N = 3
 # 預測 shrinkage：同星期樣本少時向平日／週末均值收斂，仍保留星期差異
 BASELINE_PRIOR_K = 3.0
 SEARCH_HISTORY_MAX = 8
@@ -3274,7 +3276,39 @@ RANK_SPOKEN_YUE = {
     "3rd": "第三",
     "4th": "第四",
     "5th": "第五",
+    "6th": "第六",
+    "7th": "第七",
+    "8th": "第八",
+    "9th": "第九",
+    "10th": "第十",
 }
+# 名次粵語「第 N」（排名用「二」唔用「兩」）
+_RANK_NUM_CN = {
+    1: "一",
+    2: "二",
+    3: "三",
+    4: "四",
+    5: "五",
+    6: "六",
+    7: "七",
+    8: "八",
+    9: "九",
+    10: "十",
+}
+
+
+def _rank_spoken_yue(rank: str) -> str:
+    """1st／2nd… → 第一／第二…；超出對照表時動態組「第N」。"""
+    key = str(rank)
+    if key in RANK_SPOKEN_YUE:
+        return RANK_SPOKEN_YUE[key]
+    m = re.match(r"^(\d+)", key)
+    if not m:
+        return key
+    n = int(m.group(1))
+    if n in _RANK_NUM_CN:
+        return f"第{_RANK_NUM_CN[n]}"
+    return f"第{n}"
 
 # 香港人慣常逐字母讀嘅英文縮寫（大小寫不拘）。其餘英文詞會讀成詞，唔拆字母。
 SPELL_OUT_LATIN_ACRONYMS = frozenset(
@@ -3376,10 +3410,17 @@ def prepare_spoken_text_for_tts(text: str) -> str:
 
 def _suggestion_rank_groups(
     result_df: pd.DataFrame,
+    max_ranks: int = SPEAK_DEFAULT_TOP_N,
 ) -> list[tuple[str, list[str], int]]:
-    """最多前三名（含同分）→ [(名次, 名稱列表, 預測空位), ...]。"""
+    """最多前 max_ranks 名（含同分）→ [(名次, 名稱列表, 預測空位), ...]。"""
     if result_df is None or result_df.empty:
         return []
+    try:
+        limit = int(max_ranks)
+    except (TypeError, ValueError):
+        limit = SPEAK_DEFAULT_TOP_N
+    if limit < 1:
+        limit = SPEAK_DEFAULT_TOP_N
     work = result_df
     rank_col = ""
     # 地標置頂後可能未有／弄亂名次欄 → 自動補密集聚名，避免 iloc 爆
@@ -3397,7 +3438,7 @@ def _suggestion_rank_groups(
             continue
         if rank not in unique_ranks:
             unique_ranks.append(rank)
-    selected_ranks = unique_ranks[:3]
+    selected_ranks = unique_ranks[:limit]
     groups: list[tuple[str, list[str], int]] = []
     for rank in selected_ranks:
         group = work[work[rank_col] == rank]
@@ -3455,9 +3496,15 @@ def _join_names_spoken_yue(names: list[str]) -> str:
     return "、".join(names[:-1]) + f"，同埋{names[-1]}"
 
 
-def format_top_suggestion(result_df: pd.DataFrame, hour: int, minute: int = 0) -> str:
-    """依最多前三名（1st／2nd／3rd，各名次含全部分同分）產生建議文案。"""
-    groups = _suggestion_rank_groups(result_df)
+def format_top_suggestion(
+    result_df: pd.DataFrame,
+    hour: int,
+    minute: int = 0,
+    *,
+    max_ranks: int = SPEAK_DEFAULT_TOP_N,
+) -> str:
+    """依最多前 max_ranks 名（各名次含全部分同分）產生建議文案。"""
+    groups = _suggestion_rank_groups(result_df, max_ranks=max_ranks)
     if not groups:
         return ""
 
@@ -3478,9 +3525,15 @@ def format_top_suggestion(result_df: pd.DataFrame, hour: int, minute: int = 0) -
     return "\n".join(lines)
 
 
-def format_spoken_suggestion(result_df: pd.DataFrame, hour: int, minute: int = 0) -> str:
-    """粵語口語建議（畀司機聽）。"""
-    groups = _suggestion_rank_groups(result_df)
+def format_spoken_suggestion(
+    result_df: pd.DataFrame,
+    hour: int,
+    minute: int = 0,
+    *,
+    max_ranks: int = SPEAK_DEFAULT_TOP_N,
+) -> str:
+    """粵語口語建議（畀司機聽）。未指定數量時預設讀頭 SPEAK_DEFAULT_TOP_N 名。"""
+    groups = _suggestion_rank_groups(result_df, max_ranks=max_ranks)
     if not groups:
         return ""
 
@@ -3497,7 +3550,7 @@ def format_spoken_suggestion(result_df: pd.DataFrame, hour: int, minute: int = 0
 
     parts = [f"建議你喺{time_spoken}優先考慮以下停車場。"]
     for rank, names, vacancy in groups:
-        rank_yue = RANK_SPOKEN_YUE.get(rank, rank)
+        rank_yue = _rank_spoken_yue(rank)
         if len(names) == 1:
             parts.append(
                 f"{rank_yue}：{names[0]}，預計大約有{vacancy}個空位。"
@@ -6529,14 +6582,22 @@ def run_vacancy_prediction(intent: dict, query_text: str):
         available_count = shown
         top_n = shown
 
+    # 有指明數量 → 朗讀該數量；未指明 → 只朗讀頭 SPEAK_DEFAULT_TOP_N 名
+    speak_n = SPEAK_DEFAULT_TOP_N if top_n_default else int(top_n)
     if place_ease:
-        written = format_top_suggestion(result_df, hour, minute)
+        written = format_top_suggestion(
+            result_df, hour, minute, max_ranks=speak_n
+        )
         spoken = format_spoken_place_ease(
             result_df, place_label, hour, minute
         )
     else:
-        written = format_top_suggestion(result_df, hour, minute)
-        spoken = format_spoken_suggestion(result_df, hour, minute)
+        written = format_top_suggestion(
+            result_df, hour, minute, max_ranks=speak_n
+        )
+        spoken = format_spoken_suggestion(
+            result_df, hour, minute, max_ranks=speak_n
+        )
 
     if top_n_shortfall:
         notice_w = format_top_n_shortfall_notice(
