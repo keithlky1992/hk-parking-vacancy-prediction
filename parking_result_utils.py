@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import re
+from datetime import datetime, timedelta
 from typing import Callable
 
 import pandas as pd
@@ -11,6 +12,73 @@ import pandas as pd
 FEE_MISSING_TOKENS = frozenset(
     {"", "未提供", "—", "-", "–", "n/a", "na", "none", "null", "nan"}
 )
+
+# 由遠至近／較具體先匹配；負數＝已過去（琴日／前日等）
+RELATIVE_DAY_OFFSET_PATTERNS: tuple[tuple[str, int], ...] = (
+    (r"大前日|大前天", -3),
+    (r"前日|前天", -2),
+    (r"琴日|噚日|尋日|昨日|昨天", -1),
+    (r"大後日|大後晚", 3),
+    (r"後日|後晚|後天", 2),
+    (r"聽日|聽晚|聽朝|明天|明晚|明日|明早", 1),
+    (r"今日|今晚|今天|今夜|今朝|今早|今晨", 0),
+)
+
+# 剝離相對日期用語時共用（含過去）
+RELATIVE_DAY_STRIP_RE = (
+    r"大前日|大前天|前日|前天|琴日|噚日|尋日|昨日|昨天|"
+    r"大後晚|大後日|後晚|後日|後天|聽朝|聽晚|聽日|"
+    r"今晚|今夜|今日|今天|今朝|今早|今晨|明早|明晚|明天|明日"
+)
+
+
+def relative_day_offset_from_query(query: str) -> int | None:
+    """粵語／中文相對日子 → 日偏移；無法判斷則 None。"""
+    q = (query or "").replace(" ", "")
+    if not q:
+        return None
+    for pattern, offset in RELATIVE_DAY_OFFSET_PATTERNS:
+        if re.search(pattern, q):
+            return offset
+    return None
+
+
+def parse_past_relative_calendar_date(
+    query: str, today: datetime | None = None
+) -> datetime | None:
+    """琴日／前日／大前日等 → 該日 00:00；非過去相對日子則 None。"""
+    offset = relative_day_offset_from_query(query)
+    if offset is None or offset >= 0:
+        return None
+    base = today or datetime.now()
+    return (base + timedelta(days=offset)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+
+
+def resolve_yearless_calendar_date(
+    month: int,
+    day: int,
+    *,
+    today: datetime,
+    year: int | None = None,
+) -> datetime | None:
+    """月日（可選年份）→ 日曆日。
+
+    無年份時用 today 嘅年份；即使該日已過亦不跳明年（交由上層當過去查詢處理）。
+    """
+    if not (1 <= month <= 12 and 1 <= day <= 31):
+        return None
+
+    def _safe(y: int, mo: int, d: int) -> datetime | None:
+        try:
+            return datetime(y, mo, d, tzinfo=getattr(today, "tzinfo", None))
+        except ValueError:
+            return None
+
+    if year is not None:
+        return _safe(year, month, day)
+    return _safe(today.year, month, day)
 
 
 def normalize_asr_query_text(query: str) -> tuple[str, bool]:

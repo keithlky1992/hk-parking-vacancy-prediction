@@ -46,8 +46,12 @@ from parking_result_utils import (
     park_name_matches_place_tokens,
     parks_present_in_baselines,
     pin_venue_parks_into_ranking,
+    parse_past_relative_calendar_date,
     parse_top_n_from_query,
     query_specifies_non_half_hour_time,
+    relative_day_offset_from_query,
+    resolve_yearless_calendar_date,
+    RELATIVE_DAY_STRIP_RE,
     top_n_exceeds_available,
 )
 
@@ -3059,11 +3063,7 @@ def has_explicit_clock_time(query: str) -> bool:
     """查詢是否有具體鐘點（不含「後晚／聽晚」等相對日期用語）。"""
     q = query.replace(" ", "")
     # 先去掉相對日期與「而家／現在」，避免誤判
-    q = re.sub(
-        r"大後日|大後晚|後日|後晚|後天|聽日|聽晚|明天|明晚|明日|今日|今晚|今天|今夜",
-        "",
-        q,
-    )
+    q = re.sub(RELATIVE_DAY_STRIP_RE, "", q)
     q = re.sub(r"嚟緊|黎緊|即將|就嚟|快將|快到", "", q)
     q = re.sub(r"而家|依家|現在|目前|即刻|此刻|呢一刻|right\s*now|\bnow\b", "", q, flags=re.I)
     if re.search(r"\d{1,2}[:：]\d{1,2}", q):
@@ -4706,7 +4706,11 @@ def query_implies_next_week_weekday(query: str) -> bool:
 
 
 def resolve_relative_day(query: str, today=None):
-    """從查詢解析相對日期（粵語），回傳「週一」…「週日」；無法判斷則回傳 None。"""
+    """從查詢解析相對日期（粵語），回傳「週一」…「週日」；無法判斷則回傳 None。
+
+    過去相對日子（琴日／前日等）亦會回傳對應星期；實際日曆日應另以
+    parse_past_relative_calendar_date／absolute_date 鎖定，避免被推去下一週。
+    """
     today = today or hong_kong_now()
     q = query.replace(" ", "")
 
@@ -4715,16 +4719,9 @@ def resolve_relative_day(query: str, today=None):
     if m:
         return _DAY_CHAR_TO_CN.get(m.group(1))
 
-    # 由遠至近／較具體先匹配，避免「後日」被「日」誤傷
-    relative_offsets = [
-        (r"大後日|大後晚", 3),
-        (r"後日|後晚|後天", 2),
-        (r"聽日|聽晚|明天|明晚|明日", 1),
-        (r"今日|今晚|今天|今夜", 0),
-    ]
-    for pattern, offset in relative_offsets:
-        if re.search(pattern, q):
-            return WEEKDAY_CN[(today + timedelta(days=offset)).weekday()]
+    offset = relative_day_offset_from_query(q)
+    if offset is not None:
+        return WEEKDAY_CN[(today + timedelta(days=offset)).weekday()]
 
     # 直接寫星期
     for name in WEEKDAY_CN.values():
@@ -4768,7 +4765,8 @@ def date_for_weekday_cn(
 def parse_absolute_date_from_query(query: str, today=None) -> datetime | None:
     """解析絕對日期（如「11月29號」「2026年11月29日」「11/29」）。
 
-    無年份時：若今年該日未過用今年，已過則用明年。
+    無年份時：一律用今年。若該日已過，保留為過去日期（由後續流程提示重新查詢），
+    不再自動跳去明年。
     """
     today = (today or hong_kong_now()).replace(
         hour=0, minute=0, second=0, microsecond=0
@@ -4792,24 +4790,9 @@ def parse_absolute_date_from_query(query: str, today=None) -> datetime | None:
             return None
         month, day = int(m2.group(1)), int(m2.group(2))
 
-    if not (1 <= month <= 12 and 1 <= day <= 31):
-        return None
-
-    def _safe(y: int, mo: int, d: int) -> datetime | None:
-        try:
-            return datetime(y, mo, d, tzinfo=today.tzinfo)
-        except ValueError:
-            return None
-
-    if year is not None:
-        return _safe(year, month, day)
-
-    candidate = _safe(today.year, month, day)
-    if candidate is None:
-        return None
-    if candidate.date() < today.date():
-        candidate = _safe(today.year + 1, month, day)
-    return candidate
+    return resolve_yearless_calendar_date(
+        month, day, today=today, year=year
+    )
 
 
 def absolute_date_from_intent(intent: dict | None, today=None) -> datetime | None:
@@ -4910,6 +4893,28 @@ def intent_query_datetime(
     return date_part.replace(hour=h, minute=m, second=0, microsecond=0)
 
 
+def is_past_intent_calendar_date(
+    day_cn: str | None = None,
+    today=None,
+    *,
+    next_week: bool = False,
+    absolute_date=None,
+    intent: dict | None = None,
+) -> bool:
+    """意圖所指日曆日是否早於今天（唔使有鐘點）。"""
+    today = today or hong_kong_now()
+    date_part = resolve_intent_calendar_date(
+        day_cn,
+        today,
+        next_week=next_week,
+        absolute_date=absolute_date,
+        intent=intent,
+    )
+    if date_part is None:
+        return False
+    return date_part.date() < today.date()
+
+
 def is_past_intent_datetime(
     day_cn: str,
     hour,
@@ -4921,6 +4926,13 @@ def is_past_intent_datetime(
 ) -> bool:
     """意圖所指日期時間是否已過去（相對香港時間）。"""
     today = today or hong_kong_now()
+    if is_past_intent_calendar_date(
+        day_cn,
+        today,
+        next_week=next_week,
+        absolute_date=absolute_date,
+    ):
+        return True
     when = intent_query_datetime(
         day_cn,
         hour,
@@ -5157,8 +5169,7 @@ def extract_place_mention_from_query(query: str) -> str | None:
     cut = q
     # 去掉相對／絕對日期、時段、鐘點
     cut = re.sub(
-        r"(大後晚|大後日|後晚|後日|後天|聽朝|聽晚|聽日|今晚|今夜|今日|今天|今朝|今早|"
-        r"明早|明晚|明天|明日|今早|今晨|"
+        rf"({RELATIVE_DAY_STRIP_RE}|"
         r"下(?:個)?星期[一二三四五六日天]|下(?:個)?週[一二三四五六日]|"
         r"星期[一二三四五六日天]|週[一二三四五六日]|"
         r"下晝|上晝|下午|上午|早上|朝早|夜晚|晚上|傍晚|凌晨|清晨|中午|午晝|深夜)",
@@ -5435,9 +5446,10 @@ def parse_query_with_llm(query: str):
   - 「今日／今晚／今天」→ {day_today}
   - 「聽日／聽晚／明天／明晚」→ {day_tomorrow}
   - 「後日／後晚／後天」→ {day_after}
+  - 「琴日／昨日／前日／大前日」等已過去日子 → 仍填對應「週X」（系統會鎖定該過去日曆日並提示重新查詢）
   - 「星期日／週日／星期六」等直接寫星期 → 填對應「週X」
   - 「下星期二／下週三／下個星期一」等 → 填對應「週X」（系統會解成下一個日曆週，不是本週已過或今日）
-  - 「11月29號／2026年11月29日」等絕對日期 → 填該日對應「週X」（不要填成今天；系統會再以規則鎖定該日曆日）
+  - 「11月29號／2026年11月29日」等絕對日期 → 填該日對應「週X」（不要填成今天；系統會再以規則鎖定該日曆日；無年份且該日已過則當過去日）
   - 「嚟緊」單獨或「嚟緊＋鐘點」：日期先填「{day_today}」（稍後會規則校正）
   - 如果句子沒有提到日期或星期，就填「{day_today}」
 - top_n: 要顯示幾個較易泊車的停車場（整數）。規則：
@@ -5512,8 +5524,10 @@ def parse_query_with_llm(query: str):
     elif looks_like_parking_info_query(query):
         intent["query_type"] = "info"
 
-    # 規則覆寫日期：絕對日期（11月29號）優先於相對日期（後晚／聽日）
+    # 規則覆寫日期：絕對日期（11月29號）優先；過去相對日子（琴日等）要鎖定 absolute_date
     abs_dt = parse_absolute_date_from_query(query, today)
+    if abs_dt is None:
+        abs_dt = parse_past_relative_calendar_date(query, today)
     if abs_dt is not None:
         intent["absolute_date"] = abs_dt.strftime("%Y-%m-%d")
         intent["day"] = WEEKDAY_CN[abs_dt.weekday()]
@@ -6658,9 +6672,15 @@ def needs_ambiguous_ampm_reentry(intent: dict, query_text: str) -> bool:
 
 
 def needs_past_time_followup(intent: dict, query_text: str) -> bool:
-    """所指日期時間已過去 → 不執行預測，要求重新輸入。"""
+    """所指日子／時間已過去 → 不執行預測，要求重新輸入。
+
+    含：琴日／前日等、無年份但今年已過的月日、今日但鐘點已過。
+    """
     if is_now_query(query_text):
         return False
+    # 句子明確講過去相對日子 → 一律當已過（即使 LLM 漏填 absolute_date）
+    if parse_past_relative_calendar_date(query_text) is not None:
+        return True
     day = intent.get("day", WEEKDAY_CN[hong_kong_now().weekday()])
     return is_past_intent_datetime(
         day,
@@ -6695,8 +6715,10 @@ def render_fee_missing_time_blocked(
     intent: dict, query_text: str, *, auto_speak: bool = True
 ):
     """收費查詢指定非今日日子但未指明時間：要求重新輸入。"""
-    abs_dt = parse_absolute_date_from_query(query_text) or absolute_date_from_intent(
-        intent
+    abs_dt = (
+        parse_absolute_date_from_query(query_text)
+        or absolute_date_from_intent(intent)
+        or parse_past_relative_calendar_date(query_text)
     )
     day = (
         (WEEKDAY_CN[abs_dt.weekday()] if abs_dt is not None else None)
@@ -6749,15 +6771,29 @@ def render_ambiguous_ampm_blocked(intent: dict, *, auto_speak: bool = True):
 
 
 def render_past_time_blocked(intent: dict, *, auto_speak: bool = True):
-    """查詢時間已過：顯示意圖並要求重新輸入完整查詢。"""
+    """查詢日子／時間已過：顯示意圖並要求重新輸入完整查詢。"""
     day = intent.get("day", WEEKDAY_CN[hong_kong_now().weekday()])
-    when = (
-        f"{format_intent_date(day, next_week=bool(intent.get('day_next_week')), absolute_date=intent.get('absolute_date'))} "
-        f"{format_intent_time(intent.get('hour'), intent.get('minute'))}"
+    date_label = format_intent_date(
+        day,
+        next_week=bool(intent.get("day_next_week")),
+        absolute_date=intent.get("absolute_date"),
     )
+    time_label = format_intent_time(intent.get("hour"), intent.get("minute"))
+    if time_label == "未指定":
+        when = date_label
+        written = (
+            f"你想查詢的是 **{when}**，但該日子已過去。請重新輸入查詢內容。"
+        )
+        spoken = f"你想查嘅係{when}，但該日子已經過去。請重新輸入查詢內容。"
+    else:
+        when = f"{date_label} {time_label}"
+        written = (
+            f"你想查詢的是 **{when}**，但該時間已過去。請重新輸入查詢內容。"
+        )
+        spoken = f"你想查嘅係{when}，但該時間已經過去。請重新輸入查詢內容。"
     render_feedback_with_speech(
-        f"你想查詢的是 **{when}**，但該時間已過去。請重新輸入查詢內容。",
-        spoken=f"你想查嘅係{when}，但該時間已經過去。請重新輸入查詢內容。",
+        written,
+        spoken=spoken,
         intent=intent,
         auto_speak=auto_speak,
     )
@@ -6869,12 +6905,18 @@ if should_query and query_text:
                 render_fee_missing_time_blocked(intent, query_text)
             else:
                 run_parking_info_answer(intent, query_text)
+        elif needs_past_time_followup(intent, query_text):
+            # 過去日子優先於「未提供時間／曖昧上下午」，直接要求重新查詢
+            past_rel = parse_past_relative_calendar_date(query_text)
+            if past_rel is not None and not intent.get("absolute_date"):
+                intent["absolute_date"] = past_rel.strftime("%Y-%m-%d")
+                intent["day"] = WEEKDAY_CN[past_rel.weekday()]
+                intent["day_next_week"] = False
+            render_past_time_blocked(intent)
         elif needs_missing_time_reentry(intent, query_text):
             render_missing_time_blocked(intent)
         elif needs_ambiguous_ampm_reentry(intent, query_text):
             render_ambiguous_ampm_blocked(intent)
-        elif needs_past_time_followup(intent, query_text):
-            render_past_time_blocked(intent)
         else:
             run_vacancy_prediction(intent, query_text)
 elif should_query:

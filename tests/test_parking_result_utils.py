@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import unittest
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -24,9 +26,12 @@ from parking_result_utils import (
     normalize_park_name_basic,
     order_parks_for_fee_display,
     parks_present_in_baselines,
+    parse_past_relative_calendar_date,
     parse_top_n_from_query,
     pin_venue_parks_into_ranking,
     query_specifies_non_half_hour_time,
+    relative_day_offset_from_query,
+    resolve_yearless_calendar_date,
     top_n_exceeds_available,
 )
 
@@ -163,6 +168,49 @@ class TopNShortfallTest(unittest.TestCase):
         self.assertIn("啟德附近", written)
         self.assertIn("冇100個停車場咁多", spoken)
         self.assertIn("9", spoken)
+
+
+class PastRelativeAndYearlessDateTest(unittest.TestCase):
+    def setUp(self):
+        self.today = datetime(2026, 11, 6, 17, 50, tzinfo=ZoneInfo("Asia/Hong_Kong"))
+
+    def test_relative_past_offsets(self):
+        self.assertEqual(relative_day_offset_from_query("天水圍琴日邊啲易泊"), -1)
+        self.assertEqual(relative_day_offset_from_query("天水圍昨日邊啲易泊"), -1)
+        self.assertEqual(relative_day_offset_from_query("天水圍前日邊啲易泊"), -2)
+        self.assertEqual(relative_day_offset_from_query("天水圍大前日邊啲易泊"), -3)
+        self.assertEqual(relative_day_offset_from_query("天水圍聽日邊啲易泊"), 1)
+        self.assertIsNone(relative_day_offset_from_query("天水圍邊啲易泊"))
+
+    def test_parse_past_relative_calendar_date(self):
+        self.assertEqual(
+            parse_past_relative_calendar_date("天水圍琴日兩點半", self.today).date(),
+            datetime(2026, 11, 5).date(),
+        )
+        self.assertEqual(
+            parse_past_relative_calendar_date("天水圍前日", self.today).date(),
+            datetime(2026, 11, 4).date(),
+        )
+        self.assertEqual(
+            parse_past_relative_calendar_date("天水圍大前日", self.today).date(),
+            datetime(2026, 11, 3).date(),
+        )
+        self.assertIsNone(
+            parse_past_relative_calendar_date("天水圍聽日", self.today)
+        )
+
+    def test_yearless_same_month_past_stays_this_year(self):
+        dt = resolve_yearless_calendar_date(11, 5, today=self.today)
+        self.assertEqual(dt.date(), datetime(2026, 11, 5).date())
+        self.assertLess(dt.date(), self.today.date())
+
+    def test_yearless_future_month_day_stays_this_year(self):
+        dt = resolve_yearless_calendar_date(12, 1, today=self.today)
+        self.assertEqual(dt.date(), datetime(2026, 12, 1).date())
+
+    def test_explicit_year_honoured(self):
+        dt = resolve_yearless_calendar_date(11, 5, today=self.today, year=2027)
+        self.assertEqual(dt.date(), datetime(2027, 11, 5).date())
 
 
 class CnCountAndTopNParseTest(unittest.TestCase):
