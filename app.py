@@ -46,6 +46,8 @@ from parking_result_utils import (
     park_name_matches_place_tokens,
     parks_present_in_baselines,
     pin_venue_parks_into_ranking,
+    is_beyond_prediction_horizon,
+    MAX_PREDICTION_HORIZON_DAYS,
     parse_past_relative_calendar_date,
     parse_top_n_from_query,
     query_specifies_non_half_hour_time,
@@ -6748,6 +6750,27 @@ def needs_past_time_followup(intent: dict, query_text: str) -> bool:
     )
 
 
+def needs_beyond_horizon_followup(intent: dict, query_text: str) -> bool:
+    """所指日子超過可預測範圍（今日起計 MAX_PREDICTION_HORIZON_DAYS 日）→ 要求重新輸入。"""
+    if is_now_query(query_text):
+        return False
+    today = hong_kong_now()
+    day = intent.get("day", WEEKDAY_CN[today.weekday()])
+    date_part = resolve_intent_calendar_date(
+        day,
+        today,
+        next_week=bool(intent.get("day_next_week")),
+        absolute_date=intent.get("absolute_date"),
+    )
+    if date_part is None:
+        return False
+    return is_beyond_prediction_horizon(
+        date_part,
+        today=today,
+        horizon_days=MAX_PREDICTION_HORIZON_DAYS,
+    )
+
+
 def render_missing_time_blocked(intent: dict, *, auto_speak: bool = True):
     """未來日期但未指明時間：顯示意圖並要求重新輸入完整查詢。"""
     day = intent.get("day", WEEKDAY_CN[hong_kong_now().weekday()])
@@ -6851,6 +6874,29 @@ def render_past_time_blocked(intent: dict, *, auto_speak: bool = True):
     render_feedback_with_speech(
         written,
         spoken=spoken,
+        intent=intent,
+        auto_speak=auto_speak,
+    )
+
+
+def render_beyond_horizon_blocked(intent: dict, *, auto_speak: bool = True):
+    """查詢日子超過可預測範圍：顯示意圖並要求重新輸入。"""
+    day = intent.get("day", WEEKDAY_CN[hong_kong_now().weekday()])
+    date_label = format_intent_date(
+        day,
+        next_week=bool(intent.get("day_next_week")),
+        absolute_date=intent.get("absolute_date"),
+    )
+    time_label = format_intent_time(intent.get("hour"), intent.get("minute"))
+    when = date_label if time_label == "未指定" else f"{date_label} {time_label}"
+    n = MAX_PREDICTION_HORIZON_DAYS
+    render_feedback_with_speech(
+        f"你想查詢的是 **{when}**，但本系統只提供未來 **{n} 日內** 的空位預測。"
+        f"請重新輸入查詢內容（例如：天水圍大後日下午三點邊度較易泊？）。",
+        spoken=(
+            f"你想查嘅係{when}，但本系統只提供未來{n}日內嘅空位預測。"
+            "請重新輸入查詢內容，例如天水圍大後日下午三點邊度較易泊。"
+        ),
         intent=intent,
         auto_speak=auto_speak,
     )
@@ -6970,6 +7016,9 @@ if should_query and query_text:
                 intent["day"] = WEEKDAY_CN[past_rel.weekday()]
                 intent["day_next_week"] = False
             render_past_time_blocked(intent)
+        elif needs_beyond_horizon_followup(intent, query_text):
+            # 超過未來 14 日：唔進入預測（即使未填時間／曖昧上下午）
+            render_beyond_horizon_blocked(intent)
         elif needs_missing_time_reentry(intent, query_text):
             render_missing_time_blocked(intent)
         elif needs_ambiguous_ampm_reentry(intent, query_text):

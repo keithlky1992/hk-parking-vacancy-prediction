@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from parking_result_utils import (
+    MAX_PREDICTION_HORIZON_DAYS,
     build_equivalent_park_id_map,
     build_fee_park_id_aliases,
     cn_count_token_to_int,
@@ -20,6 +21,7 @@ from parking_result_utils import (
     filter_parks_without_fee,
     first_available_fee,
     format_top_n_shortfall_notice,
+    is_beyond_prediction_horizon,
     looks_like_fee_availability_query,
     looks_like_hard_to_park_ranking_query,
     merge_baseline_packs,
@@ -231,6 +233,25 @@ class PastRelativeAndYearlessDateTest(unittest.TestCase):
     def test_explicit_year_honoured(self):
         dt = resolve_yearless_calendar_date(11, 5, today=self.today, year=2027)
         self.assertEqual(dt.date(), datetime(2027, 11, 5).date())
+
+
+class PredictionHorizonTest(unittest.TestCase):
+    def setUp(self):
+        self.today = datetime(2026, 11, 6, tzinfo=ZoneInfo("Asia/Hong_Kong"))
+
+    def test_within_14_days_allowed(self):
+        self.assertEqual(MAX_PREDICTION_HORIZON_DAYS, 14)
+        # 今日＋14 日仍可查
+        ok = datetime(2026, 11, 20, tzinfo=ZoneInfo("Asia/Hong_Kong"))
+        self.assertFalse(is_beyond_prediction_horizon(ok, today=self.today))
+
+    def test_day_15_blocked(self):
+        too_far = datetime(2026, 11, 21, tzinfo=ZoneInfo("Asia/Hong_Kong"))
+        self.assertTrue(is_beyond_prediction_horizon(too_far, today=self.today))
+
+    def test_far_future_absolute_blocked(self):
+        sep2027 = datetime(2027, 9, 30, tzinfo=ZoneInfo("Asia/Hong_Kong"))
+        self.assertTrue(is_beyond_prediction_horizon(sep2027, today=self.today))
 
 
 class CnCountAndTopNParseTest(unittest.TestCase):

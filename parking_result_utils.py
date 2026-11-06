@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import re
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Callable
 
 import pandas as pd
@@ -12,6 +12,35 @@ import pandas as pd
 FEE_MISSING_TOKENS = frozenset(
     {"", "未提供", "—", "-", "–", "n/a", "na", "none", "null", "nan"}
 )
+
+# 空位預測可查嘅最遠未來日數（含今日起計第 N 日）；再遠就要求重新輸入
+MAX_PREDICTION_HORIZON_DAYS = 14
+
+
+def is_beyond_prediction_horizon(
+    target: datetime | date,
+    *,
+    today: datetime | date,
+    horizon_days: int = MAX_PREDICTION_HORIZON_DAYS,
+) -> bool:
+    """目標日曆日是否超過可預測範圍（今日起計 horizon_days 日之後）。"""
+    try:
+        horizon = int(horizon_days)
+    except (TypeError, ValueError):
+        horizon = MAX_PREDICTION_HORIZON_DAYS
+    if horizon < 0:
+        horizon = 0
+
+    if isinstance(today, datetime):
+        today_d = today.date()
+    else:
+        today_d = today
+    if isinstance(target, datetime):
+        target_d = target.date()
+    else:
+        target_d = target
+
+    return target_d > today_d + timedelta(days=horizon)
 
 # 由遠至近／較具體先匹配；負數＝已過去（琴日／前日等）
 RELATIVE_DAY_OFFSET_PATTERNS: tuple[tuple[str, int], ...] = (
