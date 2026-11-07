@@ -13,7 +13,7 @@ Can we predict whether a car park will have private-car vacancies (classificatio
 - ~587 car parks territory-wide; historical vacancy snapshots from mid-Oct 2026
 - Baseline and Gradient Boosting models implemented
 - Streamlit app「咪再兜」with recommendation query
-- Report outline drafted
+- Final report and presentation under `report/` and `presentation/`
 
 ## Supabase
 
@@ -64,11 +64,11 @@ python scripts/build_vacancy_baselines.py
 - `explore_api_zh.ipynb`: EDA＋對齊咪再兜 baseline／推薦流程（中文版；全港 district）
 - `explore_api_en.ipynb`: Same notebook in English（英文版）
 - `parking.db`: 本機備份（可選）
-- `report_outline.md`: 報告大綱
+- `report/`: 最終報告（docx／pdf）同圖表
+- `presentation/`: 最終簡報（pptx）同講稿
 
 ## Next Steps
 
 - Free Supabase disk（歷史 raw 曾令 DB 唯讀），再建 `vacancy_baselines` 表並 `--write-supabase`
 - Scheduled cloud collection（Edge Function / Cron，唔靠本機常開）
 - Persist trained models（Supabase Storage）
-- Complete final report and presentation

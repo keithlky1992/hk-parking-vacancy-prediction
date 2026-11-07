@@ -8,6 +8,21 @@
 .tmp_*
 *.tmp
 .cursor/
+.mplconfig/
+logs/
+*.log
+.ipynb_checkpoints/
+
+# Report / presentation working drafts
+report/figures/cap_*.png
+report/figures/ppt_preview/
+report/figures/ref_layout/
+report/media/
+report/_report_preview.html
+report/*_preview.html
+
+# Export cache (baselines parquet stays tracked)
+data/carparks_export.json
 
 # Database (rebuild via collect.ipynb)
 parking.db
@@ -21,6 +36,7 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
+.venv_*/
 venv/
 
 # OS / editor
