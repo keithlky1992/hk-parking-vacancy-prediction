@@ -10,6 +10,7 @@ import io
 import os
 import json
 import re
+import time
 import wave
 import numpy as np
 import requests
@@ -2024,18 +2025,103 @@ def inject_layout_css() -> None:
     });
   }
 
+  // 擋查提示：必須喺 pointerdown 手勢內「同步」speechSynthesis.speak（唔可 setTimeout）
+  var FEEDBACK_SPOKEN = {
+    invalid_calendar_date: "你輸入嘅日期並唔存在。請重新輸入查詢內容，例如十一月三十號朝早六點半彩雲邨邊度較易泊。",
+    invalid_clock_time: "你輸入嘅時間並唔存在。請重新輸入查詢內容，例如元朗後日上晝八點半邊度較易泊。",
+    non_half_hour: "咁樣係查詢唔到。必須用半小時為單位嘅方式嚟查問，例如六點半、十二點、四點半、十一點。唔接受四點九、四點四十五分、九點二十七分呢類時間。請重新輸入。"
+  };
+
+  function getUserQueryTextCompact() {
+    var input = doc.querySelector(".st-key-user_query input")
+      || doc.querySelector('div[data-testid="stTextInput"] input');
+    return input ? String(input.value || "").replace(/\\s+/g, "") : "";
+  }
+
+  function detectBlockedFeedbackKey(q) {
+    if (!q) return null;
+    var dm = q.match(/(?:(\\d{4})年)?(\\d{1,2})月(\\d{1,2})[號号日]?/);
+    if (dm) {
+      var year = dm[1] ? parseInt(dm[1], 10) : (new Date()).getFullYear();
+      var month = parseInt(dm[2], 10);
+      var day = parseInt(dm[3], 10);
+      if (month < 1 || month > 12 || day < 1 || day > 31) return "invalid_calendar_date";
+      if (day > new Date(year, month, 0).getDate()) return "invalid_calendar_date";
+    }
+    var cm = q.match(/(?:^|[^\\d])(\\d{1,3})[:：](\\d{1,3})(?!\\d)/);
+    if (cm) {
+      var h = parseInt(cm[1], 10), mi = parseInt(cm[2], 10);
+      if (h > 23 || mi > 59) return "invalid_clock_time";
+      if (mi !== 0 && mi !== 30) return "non_half_hour";
+    }
+    if (/(?:^|[^\\d])(\\d{1,3})[點时時](一刻|三刻)/.test(q)) {
+      var tick = q.match(/(?:^|[^\\d])(\\d{1,3})[點时時](一刻|三刻)/);
+      if (tick && parseInt(tick[1], 10) > 23) return "invalid_clock_time";
+      return "non_half_hour";
+    }
+    var half = q.match(/(?:^|[^\\d])(\\d{1,3})[點时時]半/);
+    if (half) {
+      if (parseInt(half[1], 10) > 23) return "invalid_clock_time";
+      return null;
+    }
+    var hm = q.match(/(?:^|[^\\d])(\\d{1,3})[點时時](\\d{1,3})分?/);
+    if (hm) {
+      var h2 = parseInt(hm[1], 10), mi2 = parseInt(hm[2], 10);
+      if (h2 > 23 || mi2 > 59) return "invalid_clock_time";
+      if (mi2 !== 0 && mi2 !== 30) return "non_half_hour";
+      return null;
+    }
+    var bare = q.match(/(?:^|[^\\d])(\\d{1,3})[點时時]/);
+    if (bare && parseInt(bare[1], 10) > 23) return "invalid_clock_time";
+    return null;
+  }
+
+  function speakBlockedFeedbackSyncInGesture() {
+    var key = detectBlockedFeedbackKey(getUserQueryTextCompact());
+    if (!key) {
+      root.__hkParkingGestureSpokeFeedback = false;
+      return false;
+    }
+    var text = FEEDBACK_SPOKEN[key];
+    var synth = root.speechSynthesis;
+    var Utterance = root.SpeechSynthesisUtterance;
+    if (!text || !synth || !Utterance) return false;
+    try { synth.cancel(); } catch (e) {}
+    var u = new Utterance(text);
+    u.lang = "zh-HK";
+    u.rate = 0.95;
+    try {
+      var list = synth.getVoices() || [];
+      var voice = list.find(function (v) { return (v.lang || "").toLowerCase().startsWith("zh-hk"); })
+        || list.find(function (v) { return (v.lang || "").toLowerCase().includes("hk"); })
+        || list.find(function (v) { return (v.lang || "").toLowerCase().startsWith("zh"); })
+        || null;
+      if (voice) u.voice = voice;
+    } catch (e2) {}
+    u.onend = function () { setSpeechSpeakingUi(false); };
+    u.onerror = function () {
+      root.__hkParkingGestureSpokeFeedback = false;
+      setSpeechSpeakingUi(false);
+    };
+    // 關鍵：同步 speak，留喺用戶手勢 call stack（iOS 先肯出聲）
+    synth.speak(u);
+    root.__hkParkingSpeechLastText = text;
+    root.__hkParkingGestureSpokeFeedback = true;
+    setSpeechSpeakingUi(true);
+    return true;
+  }
+
   function bindQueryStopSpeech() {
     doc.querySelectorAll('div[data-testid="stFormSubmitButton"] button').forEach(function (btn) {
       if (btn.dataset.stopSpeechBound) return;
       btn.dataset.stopSpeechBound = "1";
-      // 查詢掣手勢內只 unlock／keepalive；自動播等 MediaUnlocked 後由結果頁排隊播放
-      // （擋查太快時若喺 silent play() 未完成就換 MP3，iOS 會丟解鎖）
+      // pointerdown：unlock + 擋查同步朗讀；click 唔好 stop（唔好切斷朗讀／keepalive）
       btn.addEventListener("pointerdown", function () {
         stopSuggestionPlaybackOnly();
         unlockSpeechNow();
+        speakBlockedFeedbackSyncInGesture();
       }, true);
       btn.addEventListener("click", function () {
-        // 唔 stop：避免打斷 pointerdown 已開始嘅 unlock keepalive
         unlockSpeechNow();
       }, true);
     });
@@ -2109,9 +2195,10 @@ def inject_layout_css() -> None:
     input.dataset.mzdBlurBound = "1";
     input.addEventListener("keydown", function (e) {
       if (e.key !== "Enter") return;
-      // Enter 送出唔經「查詢」掣 pointerdown；必須喺手勢內停舊播＋解鎖
+      // Enter 送出唔經「查詢」掣；手勢內 unlock + 擋查同步朗讀
       stopSuggestionPlaybackOnly();
       unlockSpeechNow();
+      speakBlockedFeedbackSyncInGesture();
       scheduleBlurUserQuery();
     });
   }
@@ -4127,6 +4214,20 @@ def render_iframe_speech_player(
   function tryAutoSpeak() {{
     if (uiSpeaking) return;
     var parent = window.parent;
+    // 查詢手勢已用 speechSynthesis 同步播擋查：唔好再疊 MP3（若已被重繪取消則繼續播）
+    try {{
+      if (parent && parent.speechSynthesis && (parent.speechSynthesis.speaking || parent.speechSynthesis.pending)) {{
+        setUi(true);
+        return;
+      }}
+      if (parent && parent.__hkParkingGestureSpokeFeedback) {{
+        parent.__hkParkingGestureSpokeFeedback = false;
+        if (parent.speechSynthesis && (parent.speechSynthesis.speaking || parent.speechSynthesis.pending)) {{
+          setUi(true);
+          return;
+        }}
+      }}
+    }} catch (e) {{}}
     // 優先：排隊畀 parent；未 MediaUnlocked 會留喺 queue，等 unlock flush
     if (audioSrc && parent && (
       typeof parent.__hkParkingQueueUnlockedMedia === "function"
@@ -6548,20 +6649,19 @@ def run_parking_info_answer(intent: dict, query_text: str) -> None:
         )
         return
 
-    with st.spinner("正在根據本系統資料整理回覆..."):
-        written, spoken = answer_parking_info_with_llm(
-            query_text,
-            district_label,
-            parks_df,
-            fee_slot_label=(
-                None
-                if fee_availability
-                else (fee_slot_label if wants_fee else None)
-            ),
-            fee_availability=fee_availability,
-            fee_availability_mode=avail_mode,
-            scope_total=scope_total,
-        )
+    written, spoken = answer_parking_info_with_llm(
+        query_text,
+        district_label,
+        parks_df,
+        fee_slot_label=(
+            None
+            if fee_availability
+            else (fee_slot_label if wants_fee else None)
+        ),
+        fee_availability=fee_availability,
+        fee_availability_mode=avail_mode,
+        scope_total=scope_total,
+    )
 
     payload = {
         "intent": intent,
@@ -6698,8 +6798,7 @@ def run_vacancy_prediction(intent: dict, query_text: str):
 
     # 非全港：先用靜態清單篩附近，再載入 baseline 摘要（方案 1）
     if _is_all_hong_kong(district):
-        with st.spinner("正在載入全港空位預測基準…"):
-            baselines = load_park_baselines()
+        baselines = load_park_baselines()
         park_info = (
             load_carparks_meta()
             .drop_duplicates(subset=["park_id"])
@@ -6725,9 +6824,8 @@ def run_vacancy_prediction(intent: dict, query_text: str):
             for pid, dist in zip(nearby["park_id"], nearby["distance_km"])
         }
         target_park_ids = [str(p) for p in nearby["park_id"].tolist()]
-        with st.spinner(f"正在載入「{district_label}」附近預測基準…"):
-            park_key = tuple(sorted(target_park_ids))
-            baselines = load_park_baselines(park_key)
+        park_key = tuple(sorted(target_park_ids))
+        baselines = load_park_baselines(park_key)
         park_info = nearby.set_index("park_id", drop=False)
         if park_info.empty:
             render_feedback_with_speech(
@@ -7297,23 +7395,39 @@ if should_query and query_text:
     else:
         st.session_state.pop("_voice_auto_speak_this_query", None)
 
-    # 無效月日／鐘點／非半小時：規則可即判，唔好等 LLM（縮短等待，保住手機 unlock）
+    # 無效月日／鐘點／非半小時：規則可即判，唔好等 LLM
     early_invalid_date = query_mentions_invalid_calendar_date(query_text)
     early_invalid_time = (
         None
         if early_invalid_date
         else query_mentions_invalid_clock_time(query_text)
     )
-    if early_invalid_date:
-        render_invalid_calendar_date_blocked(None, early_invalid_date)
-    elif early_invalid_time:
-        render_invalid_clock_time_blocked(None, early_invalid_time)
-    elif query_specifies_non_half_hour_time(query_text):
-        # 4:45／四點九等：唔好先四捨五入再當「已過去」
-        render_non_half_hour_blocked(None)
+    early_non_half = (
+        False
+        if (early_invalid_date or early_invalid_time)
+        else query_specifies_non_half_hour_time(query_text)
+    )
+    if early_invalid_date or early_invalid_time or early_non_half:
+        # 擋查返得太快時 iOS unlock 未企穩；稍等令 silent play resolve（同語音長等待效果）
+        # 前端 pointerdown 亦會同步 speechSynthesis 作第一層出聲
+        time.sleep(0.65)
+        if early_invalid_date:
+            render_invalid_calendar_date_blocked(None, early_invalid_date)
+        elif early_invalid_time:
+            render_invalid_clock_time_blocked(None, early_invalid_time)
+        else:
+            render_non_half_hour_blocked(None)
     else:
-        with st.spinner("AI 正在理解你的問題..."):
+        # 只喺運算期間顯示一次；結果／朗讀喺 spinner 外渲染，避免收起時打斷 iOS 自動播
+        with st.spinner("請稍等，資料運作中......"):
             intent = parse_query_with_llm(query_text)
+            geo_error = None
+            if (
+                intent_is_parking_related(intent)
+                and not looks_like_hard_to_park_ranking_query(query_text)
+                and not _is_all_hong_kong(intent.get("district"))
+            ):
+                geo_error = attach_geocode_to_intent(intent)
 
         if not intent_is_parking_related(intent):
             render_feedback_with_speech(
@@ -7330,41 +7444,36 @@ if should_query and query_text:
         elif looks_like_hard_to_park_ranking_query(query_text):
             # 「冇咁容易泊／較難泊」：只提示可查較易泊，唔好誤顯示較易泊名單
             render_hard_to_park_unsupported(intent)
-        else:
-            geo_error = None
-            if not _is_all_hong_kong(intent.get("district")):
-                with st.spinner("正在用 Google Maps 搜尋地點..."):
-                    geo_error = attach_geocode_to_intent(intent)
-            if geo_error:
-                render_feedback_with_speech(
-                    geo_error,
-                    spoken=_plain_for_speech(geo_error),
-                    intent=intent,
-                    info_mode=not intent_wants_prediction(intent),
-                    auto_speak=True,
-                )
-            elif not intent_wants_prediction(intent):
-                if needs_fee_missing_time_reentry(intent, query_text):
-                    render_fee_missing_time_blocked(intent, query_text)
-                else:
-                    run_parking_info_answer(intent, query_text)
-            elif needs_past_time_followup(intent, query_text):
-                # 過去日子優先於「未提供時間／曖昧上下午」，直接要求重新查詢
-                past_rel = parse_past_relative_calendar_date(query_text)
-                if past_rel is not None and not intent.get("absolute_date"):
-                    intent["absolute_date"] = past_rel.strftime("%Y-%m-%d")
-                    intent["day"] = WEEKDAY_CN[past_rel.weekday()]
-                    intent["day_next_week"] = False
-                render_past_time_blocked(intent)
-            elif needs_beyond_horizon_followup(intent, query_text):
-                # 超過未來 14 日：唔進入預測（即使未填時間／曖昧上下午）
-                render_beyond_horizon_blocked(intent)
-            elif needs_missing_time_reentry(intent, query_text):
-                render_missing_time_blocked(intent)
-            elif needs_ambiguous_ampm_reentry(intent, query_text):
-                render_ambiguous_ampm_blocked(intent)
+        elif geo_error:
+            render_feedback_with_speech(
+                geo_error,
+                spoken=_plain_for_speech(geo_error),
+                intent=intent,
+                info_mode=not intent_wants_prediction(intent),
+                auto_speak=True,
+            )
+        elif not intent_wants_prediction(intent):
+            if needs_fee_missing_time_reentry(intent, query_text):
+                render_fee_missing_time_blocked(intent, query_text)
             else:
-                run_vacancy_prediction(intent, query_text)
+                run_parking_info_answer(intent, query_text)
+        elif needs_past_time_followup(intent, query_text):
+            # 過去日子優先於「未提供時間／曖昧上下午」，直接要求重新查詢
+            past_rel = parse_past_relative_calendar_date(query_text)
+            if past_rel is not None and not intent.get("absolute_date"):
+                intent["absolute_date"] = past_rel.strftime("%Y-%m-%d")
+                intent["day"] = WEEKDAY_CN[past_rel.weekday()]
+                intent["day_next_week"] = False
+            render_past_time_blocked(intent)
+        elif needs_beyond_horizon_followup(intent, query_text):
+            # 超過未來 14 日：唔進入預測（即使未填時間／曖昧上下午）
+            render_beyond_horizon_blocked(intent)
+        elif needs_missing_time_reentry(intent, query_text):
+            render_missing_time_blocked(intent)
+        elif needs_ambiguous_ampm_reentry(intent, query_text):
+            render_ambiguous_ampm_blocked(intent)
+        else:
+            run_vacancy_prediction(intent, query_text)
 elif should_query:
     render_feedback_with_speech(
         "請先輸入查詢內容。",
