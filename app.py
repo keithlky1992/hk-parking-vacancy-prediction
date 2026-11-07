@@ -7418,7 +7418,8 @@ if should_query and query_text:
         else:
             render_non_half_hour_blocked(None)
     else:
-        # 只喺運算期間顯示一次；結果／朗讀喺 spinner 外渲染，避免收起時打斷 iOS 自動播
+        # 持續顯示直至語音／地圖／表／圖等結果都渲染完；收起後再救返自動播
+        voice_armed = bool(st.session_state.get("_voice_auto_speak_this_query"))
         with st.spinner("請稍等，資料運作中......"):
             intent = parse_query_with_llm(query_text)
             geo_error = None
@@ -7429,51 +7430,53 @@ if should_query and query_text:
             ):
                 geo_error = attach_geocode_to_intent(intent)
 
-        if not intent_is_parking_related(intent):
-            render_feedback_with_speech(
-                "你的查詢似乎與停車場／泊車無關。"
-                "請重新輸入與停車場空位有關的問題"
-                "（例如：天水圍今晚八點邊度較易泊？）。",
-                spoken=(
-                    "你嘅查詢似乎同停車場或者泊車無關。"
-                    "請重新輸入同停車場空位有關嘅問題，"
-                    "例如天水圍今晚八點邊度較易泊。"
-                ),
-                auto_speak=True,
-            )
-        elif looks_like_hard_to_park_ranking_query(query_text):
-            # 「冇咁容易泊／較難泊」：只提示可查較易泊，唔好誤顯示較易泊名單
-            render_hard_to_park_unsupported(intent)
-        elif geo_error:
-            render_feedback_with_speech(
-                geo_error,
-                spoken=_plain_for_speech(geo_error),
-                intent=intent,
-                info_mode=not intent_wants_prediction(intent),
-                auto_speak=True,
-            )
-        elif not intent_wants_prediction(intent):
-            if needs_fee_missing_time_reentry(intent, query_text):
-                render_fee_missing_time_blocked(intent, query_text)
+            if not intent_is_parking_related(intent):
+                render_feedback_with_speech(
+                    "你的查詢似乎與停車場／泊車無關。"
+                    "請重新輸入與停車場空位有關的問題"
+                    "（例如：天水圍今晚八點邊度較易泊？）。",
+                    spoken=(
+                        "你嘅查詢似乎同停車場或者泊車無關。"
+                        "請重新輸入同停車場空位有關嘅問題，"
+                        "例如天水圍今晚八點邊度較易泊。"
+                    ),
+                    auto_speak=True,
+                )
+            elif looks_like_hard_to_park_ranking_query(query_text):
+                # 「冇咁容易泊／較難泊」：只提示可查較易泊，唔好誤顯示較易泊名單
+                render_hard_to_park_unsupported(intent)
+            elif geo_error:
+                render_feedback_with_speech(
+                    geo_error,
+                    spoken=_plain_for_speech(geo_error),
+                    intent=intent,
+                    info_mode=not intent_wants_prediction(intent),
+                    auto_speak=True,
+                )
+            elif not intent_wants_prediction(intent):
+                if needs_fee_missing_time_reentry(intent, query_text):
+                    render_fee_missing_time_blocked(intent, query_text)
+                else:
+                    run_parking_info_answer(intent, query_text)
+            elif needs_past_time_followup(intent, query_text):
+                # 過去日子優先於「未提供時間／曖昧上下午」，直接要求重新查詢
+                past_rel = parse_past_relative_calendar_date(query_text)
+                if past_rel is not None and not intent.get("absolute_date"):
+                    intent["absolute_date"] = past_rel.strftime("%Y-%m-%d")
+                    intent["day"] = WEEKDAY_CN[past_rel.weekday()]
+                    intent["day_next_week"] = False
+                render_past_time_blocked(intent)
+            elif needs_beyond_horizon_followup(intent, query_text):
+                # 超過未來 14 日：唔進入預測（即使未填時間／曖昧上下午）
+                render_beyond_horizon_blocked(intent)
+            elif needs_missing_time_reentry(intent, query_text):
+                render_missing_time_blocked(intent)
+            elif needs_ambiguous_ampm_reentry(intent, query_text):
+                render_ambiguous_ampm_blocked(intent)
             else:
-                run_parking_info_answer(intent, query_text)
-        elif needs_past_time_followup(intent, query_text):
-            # 過去日子優先於「未提供時間／曖昧上下午」，直接要求重新查詢
-            past_rel = parse_past_relative_calendar_date(query_text)
-            if past_rel is not None and not intent.get("absolute_date"):
-                intent["absolute_date"] = past_rel.strftime("%Y-%m-%d")
-                intent["day"] = WEEKDAY_CN[past_rel.weekday()]
-                intent["day_next_week"] = False
-            render_past_time_blocked(intent)
-        elif needs_beyond_horizon_followup(intent, query_text):
-            # 超過未來 14 日：唔進入預測（即使未填時間／曖昧上下午）
-            render_beyond_horizon_blocked(intent)
-        elif needs_missing_time_reentry(intent, query_text):
-            render_missing_time_blocked(intent)
-        elif needs_ambiguous_ampm_reentry(intent, query_text):
-            render_ambiguous_ampm_blocked(intent)
-        else:
-            run_vacancy_prediction(intent, query_text)
+                run_vacancy_prediction(intent, query_text)
+        if voice_armed:
+            inject_voice_auto_speak_prime()
 elif should_query:
     render_feedback_with_speech(
         "請先輸入查詢內容。",
